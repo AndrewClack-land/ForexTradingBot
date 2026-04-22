@@ -1,0 +1,6 @@
+pandas
+pyarrow
+aiogram
+python-dotenv
+MetaTrader5
+psutil

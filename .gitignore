@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.venv/
+
+ai_data/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+*.csv
+*.json
+.env
