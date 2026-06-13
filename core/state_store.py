@@ -39,6 +39,10 @@ def save_active_trades(active_trades: Dict[str, Any], path: Path) -> None:
             # Partial-close state — persisted so restarts don't re-close already-closed slices
             "volume_per_tp": [float(v) for v in (getattr(tr, "volume_per_tp", []) or [])],
             "volume_remaining": float(getattr(tr, "volume_remaining", 0.0) or 0.0),
+
+            # Split-mode legs — CRITICAL: without this, bot loses split mode on restart
+            # and tries to manage SL/TP manually instead of letting the broker handle them.
+            "split_position_ids": list(getattr(tr, "split_position_ids", []) or []),
         }
 
     tmp = path.with_suffix(".tmp")
@@ -77,6 +81,7 @@ def load_active_trades(path: Path) -> Dict[str, Any]:
             tr.mt5_position_id = d.get("mt5_position_id")
             tr.volume_per_tp = [float(v) for v in (d.get("volume_per_tp") or [])]
             tr.volume_remaining = float(d.get("volume_remaining") or 0.0)
+            tr.split_position_ids = [int(x) for x in (d.get("split_position_ids") or [])]
             restored[symbol] = tr
         except Exception:
             continue

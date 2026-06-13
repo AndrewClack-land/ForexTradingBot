@@ -73,10 +73,22 @@ class AILive:
             sig["ai_p_tp"] = round(p_tp, 3)
             sig["ai_stats_closed"] = closed
 
-            if closed >= int(self.cfg.min_closed_per_symbol) and p_tp < float(self.cfg.min_p_tp):
+            # Порог = break-even winrate + запас.
+            # BE winrate = 1 / (1 + RR): минимальный винрейт при котором сетап в 0.
+            # Отклоняем только если статистика достаточна и p(TP) ниже порога.
+            if rr_numeric_f > 0:
+                be_p = 1.0 / (1.0 + rr_numeric_f)
+                effective_threshold = be_p + float(self.cfg.min_edge_above_be)
+            else:
+                effective_threshold = float(self.cfg.min_p_tp)
+
+            if closed >= int(self.cfg.min_closed_per_symbol) and p_tp < effective_threshold:
                 return {
                     "signal": "AI_REJECT",
-                    "reason": f"pTP<{self.cfg.min_p_tp:.2f} (pTP={p_tp:.2f}, n={closed})",
+                    "reason": (
+                        f"pTP={p_tp:.2f} < BE+edge={effective_threshold:.2f}"
+                        f" (RR={rr_numeric_f:.2f}, n={closed})"
+                    ),
                     "ai_p_tp": round(p_tp, 3),
                 }
 

@@ -163,7 +163,8 @@ class TelegramBot:
             disable_web_page_preview=True,
         )
 
-    async def _handle_events(self, app, symbol: str, sig: Dict[str, Any]) -> None:
+    async def _handle_events(self, app, symbol: str, sig: Dict[str, Any], *,
+                             meta: Optional[Dict[str, Any]] = None) -> None:
         events: List[Dict[str, Any]] = sig.get("events") or []
         if not events:
             return
@@ -175,7 +176,7 @@ class TelegramBot:
                 tp_price = e.get("tp_price")
                 if tp_price is None:
                     continue
-                await self._reply(app, symbol, f"✅Тп {idx}: {_fmt_price(symbol, float(tp_price))}")
+                await self._reply(app, symbol, f"✅Тп {idx}: {_fmt_price(symbol, float(tp_price))}", meta=meta)
 
     async def _handle_exit(self, app, symbol: str, sig: Dict[str, Any]) -> None:
         st = sig.get("signal")
@@ -203,7 +204,7 @@ class TelegramBot:
                 traceback.print_exc()
 
         elif st == "EXIT_TP":
-            await self._handle_events(app, symbol, sig)
+            await self._handle_events(app, symbol, sig, meta=sig)
 
             px = sig.get("exit_price")
             if px is not None:
@@ -309,6 +310,39 @@ class TelegramBot:
                             f"♻️ {symbol}: позиция закрыта брокером{px_str}",
                             meta=sig,
                         )
+                        try:
+                            with self.profiler.section("journal_ingest"):
+                                self.journal.ingest_signal(
+                                    symbol=symbol,
+                                    sig=sig,
+                                    telegram_chat_id=self.channel_id,
+                                    telegram_message_id=None,
+                                    features=None,
+                                )
+                        except Exception:
+                            traceback.print_exc()
+                        continue
+
+                    if st == "EXIT_TIME":
+                        px = sig.get("exit_price")
+                        px_str = f" @ {_fmt_price(symbol, float(px))}" if px is not None else ""
+                        await self._reply(
+                            app,
+                            symbol,
+                            f"⏱ {symbol}: позиция закрыта по времени{px_str}",
+                            meta=sig,
+                        )
+                        try:
+                            with self.profiler.section("journal_ingest"):
+                                self.journal.ingest_signal(
+                                    symbol=symbol,
+                                    sig=sig,
+                                    telegram_chat_id=self.channel_id,
+                                    telegram_message_id=None,
+                                    features=None,
+                                )
+                        except Exception:
+                            traceback.print_exc()
                         continue
 
                 except Exception:

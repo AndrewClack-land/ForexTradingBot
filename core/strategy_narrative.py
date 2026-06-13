@@ -22,6 +22,11 @@ ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.000
 ORDERBLOCK_MAX_AGE_BARS = int(getattr(_cfg, "ORDERBLOCK_MAX_AGE_BARS", 240))
 HTF_SCORE_MARGIN = int(getattr(_cfg, "HTF_SCORE_MARGIN", 1))
 
+# M15 EMA trend filter
+EMA_FAST = 72
+EMA_SLOW = 89
+MIN_BARS_FOR_EMA = 100
+
 Side = Literal["LONG", "SHORT", "NEUTRAL"]
 
 
@@ -144,16 +149,18 @@ class NarrativeStrategy:
         self.ts_sweep_atr_k = 0.10
 
         # Rejection Block (15M)
-        self.rb_pivot_lookback_left = 1
-        self.rb_box_length = 12
-        self.rb_body_rule = "CLASSIC"  # HARD_BOTH | HARD_RIGHT | HARD_LEFT | CLASSIC
+        self.rb_pivot_lookback_left = 6
+        self.rb_box_length = 18
+        # HARD_RIGHT: confirm candle body must stay below/above pivot body (stricter than CLASSIC midpoint)
+        self.rb_body_rule = "HARD_RIGHT"
 
         self.rb_use_wick_to_body_filter = False
         self.rb_wick_to_body_ratio = 3.0
-        self.rb_min_wick_intrusion_pct = 15.0
+        self.rb_min_wick_intrusion_pct = 5.0
 
-        self.rb_require_confirm_bearish_body = False
-        self.rb_require_confirm_bullish_body = False
+        # Require bearish/bullish close on confirmation candle before entry
+        self.rb_require_confirm_bearish_body = True
+        self.rb_require_confirm_bullish_body = True
 
         # HTF context config
         self.htf_fractal_limit = 20
@@ -181,10 +188,10 @@ class NarrativeStrategy:
         self.entry_range_fallback_atr_k = 0.15     # fallback range around price
         self.entry_range_m1_atr_k = 0.25           # NEW: tighter localization around 1M close
 
-        # Stop logic
+        # Stop logic — raised min_risk to avoid micro-stops on noise/spread
         self.stop_buffer_atr_k = 0.05
-        self.min_risk_atr_k = 0.25
-        self.max_risk_atr_k = 3.0
+        self.min_risk_atr_k = 0.40
+        self.max_risk_atr_k = 2.0
 
         self.use_prev_candle_stop_floor = True
 
@@ -544,6 +551,15 @@ class NarrativeStrategy:
 
         isPivotHigh = (h1 > h0) and (h1 == hh)
         isPivotLow = (l1 < l0) and (l1 == ll)
+
+        # Box-length freshness: pivot must be the dominant extreme over rb_box_length bars.
+        # Prevents signals on stale pivots already tested within the broader window.
+        box_len = int(self.rb_box_length)
+        box_start = max(0, i1 - box_len + 1)
+        box_max_high = float(df_15m["high"].iloc[box_start:i1 + 1].max())
+        box_min_low  = float(df_15m["low"].iloc[box_start:i1 + 1].min())
+        isPivotHigh = isPivotHigh and (h1 == box_max_high)
+        isPivotLow  = isPivotLow  and (l1 == box_min_low)
 
         rule = str(self.rb_body_rule or "").upper()
 
@@ -945,6 +961,14 @@ class NarrativeStrategy:
 
         return None
 
+    _TP1_PCT: Dict[str, float] = {
+        "EURUSD": 0.0015,
+        "GBPUSD": 0.0015,
+        "USDCAD": 0.0015,
+        "GOLD":   0.0045,
+        "XAUUSD": 0.0045,
+    }
+
     def calc_stop_and_tps(
         self,
         entry_price: float,
@@ -952,6 +976,7 @@ class NarrativeStrategy:
         df_1H: pd.DataFrame,
         df_4H: pd.DataFrame,
         custom_stop: Optional[float] = None,
+        symbol: str = "",
     ) -> tuple[float, List[float]]:
         atr1 = self._atr(df_1H, 14)
         atr1 = max(float(atr1), 1e-9)
@@ -1009,11 +1034,104 @@ class NarrativeStrategy:
             tps.append(float(tp))
 
         tps = sorted(tps) if side == "LONG" else sorted(tps, reverse=True)
+
+        tp1_pct = self._TP1_PCT.get(symbol.upper())
+        if tp1_pct is not None:
+            tp1_val = (entry_price * (1 + tp1_pct)) if side == "LONG" else (entry_price * (1 - tp1_pct))
+            tps[0] = float(tp1_val)
+            tps = sorted(tps) if side == "LONG" else sorted(tps, reverse=True)
+
         return float(stop), tps
+
+    # ================== M15 EMA TREND FILTER ==================
+
+    @staticmethod
+    def calc_m15_ema_trend(df_15m: pd.DataFrame) -> Tuple[str, str]:
+        """
+        Determines local trend direction on M15 using EMA72 and EMA89 as a dynamic
+        support/resistance zone. Returns (m15_trend, description_text).
+
+        Rules:
+          bullish : price above EMA zone — close > EMA72 AND close > EMA89 AND EMA72 > EMA89
+          bearish : price below EMA zone — close < EMA72 AND close < EMA89 AND EMA72 < EMA89
+          neutral : price inside or between the EMAs
+        """
+        if df_15m is None or df_15m.empty:
+            return (
+                "neutral",
+                "M15 trend: neutral. Insufficient M15 data for EMA calculation.",
+            )
+
+        if "close" not in df_15m.columns:
+            return (
+                "neutral",
+                "M15 trend: neutral. Missing 'close' column in M15 data.",
+            )
+
+        if len(df_15m) < MIN_BARS_FOR_EMA:
+            return (
+                "neutral",
+                f"M15 trend: neutral. Insufficient M15 data for EMA calculation "
+                f"(have {len(df_15m)} bars, need at least {MIN_BARS_FOR_EMA}).",
+            )
+
+        close = df_15m["close"].astype(float)
+        ema72 = close.ewm(span=EMA_FAST, adjust=False).mean()
+        ema89 = close.ewm(span=EMA_SLOW, adjust=False).mean()
+
+        last_close = float(close.iloc[-1])
+        last_ema72 = float(ema72.iloc[-1])
+        last_ema89 = float(ema89.iloc[-1])
+
+        if not pd.notna(last_ema72) or not pd.notna(last_ema89):
+            return (
+                "neutral",
+                "M15 trend: neutral. EMA values could not be calculated.",
+            )
+
+        ema_aligned_bull = last_ema72 > last_ema89
+        ema_aligned_bear = last_ema72 < last_ema89
+
+        # Price above both EMAs — bullish only when EMA cross is confirmed
+        if last_close > last_ema72 and last_close > last_ema89:
+            if ema_aligned_bull:
+                return (
+                    "bullish",
+                    f"M15 trend: bullish. Price ({last_close:.5f}) above "
+                    f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72>EMA89 confirmed.",
+                )
+            return (
+                "neutral",
+                f"M15 trend: neutral (early bullish). Price ({last_close:.5f}) above "
+                f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72<EMA89 (transition).",
+            )
+
+        # Price below both EMAs — bearish only when EMA cross is confirmed
+        if last_close < last_ema72 and last_close < last_ema89:
+            if ema_aligned_bear:
+                return (
+                    "bearish",
+                    f"M15 trend: bearish. Price ({last_close:.5f}) below "
+                    f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72<EMA89 confirmed.",
+                )
+            return (
+                "neutral",
+                f"M15 trend: neutral (early bearish). Price ({last_close:.5f}) below "
+                f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72>EMA89 (transition).",
+            )
+
+        # Price inside EMA zone → neutral
+        return (
+            "neutral",
+            (
+                f"M15 trend: neutral. Price ({last_close:.5f}) inside "
+                f"EMA72/EMA89 zone ({last_ema72:.5f}/{last_ema89:.5f})."
+            ),
+        )
 
     # ================== MAIN SIGNAL ==================
 
-    def generate_signal(self, data: Dict[str, pd.DataFrame]) -> Dict[str, Any]:
+    def generate_signal(self, data: Dict[str, pd.DataFrame], symbol: str = "") -> Dict[str, Any]:
         df_4H = data.get("4H")
         df_1H = data.get("1H")
         df_15M = data.get("15M")
@@ -1025,6 +1143,14 @@ class NarrativeStrategy:
         ctx = self._last_htf_context
         if side_bias == "NEUTRAL":
             return {"signal": "NO_TREND", "narrative": narrative_text}
+
+        m15_trend, m15_trend_text = self.calc_m15_ema_trend(df_15M)
+
+        # Block entry when M15 EMA trend directly opposes HTF bias
+        if m15_trend == "bearish" and side_bias == "LONG":
+            return {"signal": "WAIT_M15_EMA", "narrative": narrative_text, "m15_trend": m15_trend_text, "m15_trend_raw": m15_trend}
+        if m15_trend == "bullish" and side_bias == "SHORT":
+            return {"signal": "WAIT_M15_EMA", "narrative": narrative_text, "m15_trend": m15_trend_text, "m15_trend_raw": m15_trend}
 
         vc_dir, vc_text = self.volume_confirmation(df_1H)
         if vc_dir == "BEAR" and side_bias == "LONG":
@@ -1059,6 +1185,7 @@ class NarrativeStrategy:
             df_1H,
             df_4H,
             custom_stop=getattr(entry, "stop_override", None),
+            symbol=symbol,
         )
         rr_text = f"1:{float(self.rr_min):.2f}"
 
@@ -1090,6 +1217,8 @@ class NarrativeStrategy:
             "vc": vc_text,
             "trigger_reason": entry.reason,
             "m1_localized": False,
+            "m15_trend": m15_trend_text,
+            "m15_trend_raw": m15_trend,
         }
 
         if entry.zone_low is not None and entry.zone_high is not None:

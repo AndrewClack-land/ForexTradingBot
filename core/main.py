@@ -125,6 +125,10 @@ class Core:
         self.log_tick = LOG_TICK
         self.risk_rules = RiskRules()
 
+        # Grace period after startup: block all MT5 closes for 90s to let state sync
+        self._startup_time: float = time.time()
+        self._startup_grace_sec: float = 90.0
+
         # cooldown per symbol after a failed entry attempt (prevents infinite retries)
         self._entry_cooldowns: Dict[str, float] = {}
         self._entry_cooldown_sec: float = 300.0   # 5 min — generic execution error
@@ -203,6 +207,12 @@ class Core:
                 return True, name
         return False, "OFF"
 
+    @staticmethod
+    def _is_friday_weekend_close() -> bool:
+        """True on Friday at or after 22:00 UTC+3 (Europe/Moscow, no DST)."""
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        return now.weekday() == 4 and now.hour >= 22
+
     def _get_symbols(self) -> list[str]:
         return self.scanner.scan()
 
@@ -227,6 +237,7 @@ class Core:
         allowed, session_name = self._session_allowance()
         self.global_context["session"] = session_name
         self.global_context["session_allowed"] = allowed
+        self.global_context["friday_close"] = self._is_friday_weekend_close()
 
     def _apply_session_filter(self, symbol: str, sig: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(sig, dict):
@@ -245,6 +256,12 @@ class Core:
         return new_sig
 
     def _apply_global_filters(self, symbol: str, sig: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(sig, dict) and sig.get("signal") == "ENTER":
+            if self.global_context.get("friday_close"):
+                new_sig = dict(sig)
+                new_sig["signal"] = "WAIT_SESSION"
+                new_sig["info"] = "Заблокировано: закрытие перед выходными (пятница 22:00 UTC+3)"
+                return new_sig
         return sig
 
     def _log_signal(self, symbol: str, sig: Dict[str, Any]) -> None:
@@ -253,11 +270,17 @@ class Core:
         important = sig.get("signal") in {"ENTER", "EXIT_SL", "EXIT_TP"}
         if not (self.log_tick or important):
             return
+        m15_raw = sig.get("m15_trend_raw")
+        m15_part = f" | m15_ema={m15_raw}" if m15_raw else ""
+        vc = sig.get("vc")
+        vc_part = f" | block=VC({vc})" if vc else ""
         info = (
             f"[Ticker] {symbol} {sig.get('signal')}"
             f" | side={sig.get('side')}"
             f" | session={self.global_context.get('session')}"
             f" | trigger={sig.get('trigger_reason')}"
+            f"{m15_part}"
+            f"{vc_part}"
             f" | narrative={sig.get('narrative')}"
         )
         print(info)
@@ -425,6 +448,14 @@ class Core:
                         manage["signal"] = raw_manage["signal"]
                         manage["exit_price"] = raw_manage.get("exit_price", manage.get("exit_price"))
 
+                    # Block all MT5 closes during startup grace period.
+                    _in_grace = (time.time() - self._startup_time) < self._startup_grace_sec
+                    if _in_grace and self.mt5_executor:
+                        manage.pop("events", None)
+                        if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
+                            print(f"[Core] {symbol} startup grace ({self._startup_grace_sec:.0f}s) — skipping close")
+                            manage["signal"] = "HOLD"
+
                     # Process all trade events: TP partial closes.
                     # Iterate the full list — do NOT break early so every event is handled.
                     for ev in (manage.get("events") or []):
@@ -456,6 +487,15 @@ class Core:
                                         )
                                     except Exception as exc:
                                         manage.setdefault("execution_error", str(exc))
+
+                    # Friday weekend close: hard rule — force exit all positions at 22:00 UTC+3.
+                    # Placed after TP partial-close events and after grace period so it always fires.
+                    if self.global_context.get("friday_close") and manage.get("signal") not in ("EXIT_BROKER",):
+                        manage = dict(manage)
+                        manage["signal"] = "EXIT_TIME"
+                        manage["info"] = "Закрытие перед выходными (пятница 22:00 UTC+3)"
+                        manage["exit_price"] = float(last_price)
+                        print(f"[Core] {symbol} пятница 22:00 UTC+3 — принудительное закрытие позиции")
 
                     if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
@@ -490,7 +530,7 @@ class Core:
 
                 # new signal
                 with prof.section("strategy"):
-                    raw_sig = self.strategy.generate_signal(data)
+                    raw_sig = self.strategy.generate_signal(data, symbol=symbol)
                 with prof.section("ai_filter"):
                     sig = self.ai.on_signal(symbol, raw_sig, data, self.active_trades)
 

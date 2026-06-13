@@ -127,9 +127,14 @@ class Core:
         self.log_tick = LOG_TICK
         self.risk_rules = RiskRules()
 
+        # Grace period after startup: block MT5 closes for 90s to let state sync
+        self._startup_time: float = time.time()
+        self._startup_grace_sec: float = 90.0
+
         # cooldown per symbol after a failed entry attempt (prevents infinite retries)
         self._entry_cooldowns: Dict[str, float] = {}
         self._entry_cooldown_sec: float = 300.0  # 5 minutes
+        self._stale_cooldown_sec: float = 60.0   # shorter cooldown for stale-price rejections
 
         self.mt5_executor: MT5Executor | None = None
         if MT5_EXECUTION_ENABLED:
@@ -162,51 +167,82 @@ class Core:
         if not positions:
             return
 
-        hydrated = 0
-        relinked = 0
+        # Group positions by symbol so we can properly rebuild split_position_ids
+        from collections import defaultdict
+        by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         for pos in positions:
             symbol = pos.get("symbol")
-            if not symbol or symbol not in self.universe:
-                continue
-            ticket = pos.get("ticket")
-            volume = float(pos.get("volume", 0.0) or 0.0)
+            if symbol and symbol in self.universe:
+                by_symbol[symbol].append(pos)
+
+        hydrated = 0
+        relinked = 0
+        for symbol, sym_positions in by_symbol.items():
+            first = sym_positions[0]
+            all_tickets = [int(p["ticket"]) for p in sym_positions if p.get("ticket")]
+            total_volume = round(sum(float(p.get("volume", 0.0) or 0.0) for p in sym_positions), 2)
+            is_split = len(all_tickets) > 1
+
             trade = self.active_trades.get(symbol)
             if trade:
                 updated = False
-                if ticket and trade.mt5_position_id != ticket:
-                    trade.mt5_position_id = ticket
-                    trade.mt5_ticket = ticket
-                    updated = True
-                if volume and abs(float(trade.volume or 0.0) - volume) > 1e-6:
-                    trade.volume = volume
+                existing_split = list(getattr(trade, "split_position_ids", []) or [])
+                if is_split:
+                    # Rebuild split_position_ids — critical after restart so bot tracks all legs
+                    if set(all_tickets) != set(existing_split):
+                        trade.split_position_ids = all_tickets
+                        trade.mt5_position_id = all_tickets[0]
+                        trade.mt5_ticket = all_tickets[0]
+                        updated = True
+                else:
+                    ticket = all_tickets[0] if all_tickets else None
+                    if ticket and trade.mt5_position_id != ticket:
+                        trade.mt5_position_id = ticket
+                        trade.mt5_ticket = ticket
+                        updated = True
+                if abs(float(trade.volume or 0.0) - total_volume) > 1e-6:
+                    trade.volume = total_volume
                     updated = True
                 if updated:
                     relinked += 1
+                    print(
+                        f"[Core] relinked {symbol}: split_ids={all_tickets}, vol={total_volume}"
+                        if is_split else
+                        f"[Core] relinked {symbol}: ticket={all_tickets[0] if all_tickets else None}, vol={total_volume}"
+                    )
                 continue
 
-            tp = float(pos.get("tp", 0.0) or 0.0)
-            tp_prices = [tp] if tp > 0 else []
-            narrative = pos.get("comment") or "Hydrated from MT5"
+            # Position(s) not in active_trades — hydrate from MT5
+            tp_prices = sorted({float(p.get("tp", 0.0) or 0.0) for p in sym_positions} - {0.0})
+            narrative = first.get("comment") or "Hydrated from MT5"
             trade = ActiveTrade(
-                side=str(pos.get("side", "LONG")).upper(),
-                entry=float(pos.get("entry_price", 0.0) or 0.0),
-                stop=float(pos.get("stop", 0.0) or 0.0),
+                side=str(first.get("side", "LONG")).upper(),
+                entry=float(first.get("entry_price", 0.0) or 0.0),
+                stop=float(first.get("stop", 0.0) or 0.0),
                 tp_prices=tp_prices,
                 tf="15m",
                 narrative=narrative,
                 symbol=symbol,
             )
-            trade.volume = volume
-            trade.mt5_ticket = ticket
-            trade.mt5_position_id = ticket
-            trade.ts_open = float(pos.get("time", time.time()) or time.time())
+            trade.volume = total_volume
+            trade.volume_remaining = total_volume
+            trade.mt5_ticket = all_tickets[0] if all_tickets else None
+            trade.mt5_position_id = all_tickets[0] if all_tickets else None
+            if is_split:
+                trade.split_position_ids = all_tickets
+            trade.ts_open = float(first.get("time", time.time()) or time.time())
             trade.last_price_ts = time.time()
             self.active_trades[symbol] = trade
             hydrated += 1
+            print(
+                f"[Core] hydrated {symbol} (split {len(all_tickets)} legs, vol={total_volume}, tps={tp_prices})"
+                if is_split else
+                f"[Core] hydrated {symbol} (vol={total_volume}, tp={tp_prices})"
+            )
 
         if hydrated or relinked:
             save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
-            print(f"[Core] hydrated {hydrated} trade(s) and relinked {relinked} from MT5")
+            print(f"[Core] hydration done: {hydrated} new, {relinked} relinked")
 
 
     @staticmethod
@@ -228,6 +264,12 @@ class Core:
             if self._time_in_window(now, start, end):
                 return True, name
         return False, "OFF"
+
+    @staticmethod
+    def _is_friday_weekend_close() -> bool:
+        """True on Friday at or after 22:00 UTC+3 (Europe/Moscow, no DST)."""
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        return now.weekday() == 4 and now.hour >= 22
 
     def _get_symbols(self) -> list[str]:
         return self.scanner.scan()
@@ -252,6 +294,7 @@ class Core:
         allowed, session_name = self._session_allowance()
         self.global_context["session"] = session_name
         self.global_context["session_allowed"] = allowed
+        self.global_context["friday_close"] = self._is_friday_weekend_close()
 
     def _apply_session_filter(self, symbol: str, sig: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(sig, dict):
@@ -270,6 +313,12 @@ class Core:
         return new_sig
 
     def _apply_global_filters(self, symbol: str, sig: Dict[str, Any]) -> Dict[str, Any]:
+        if isinstance(sig, dict) and sig.get("signal") == "ENTER":
+            if self.global_context.get("friday_close"):
+                new_sig = dict(sig)
+                new_sig["signal"] = "WAIT_SESSION"
+                new_sig["info"] = "Заблокировано: закрытие перед выходными (пятница 22:00 UTC+3)"
+                return new_sig
         return sig
 
     def _log_signal(self, symbol: str, sig: Dict[str, Any]) -> None:
@@ -280,11 +329,17 @@ class Core:
         important = signal_type not in {"HOLD", None}
         if not (self.log_tick or important):
             return
+        m15_raw = sig.get("m15_trend_raw")
+        m15_part = f" | m15_ema={m15_raw}" if m15_raw else ""
+        vc = sig.get("vc")
+        vc_part = f" | block=VC({vc})" if vc else ""
         info = (
             f"[Ticker] {symbol} {signal_type}"
             f" | side={sig.get('side')}"
             f" | session={self.global_context.get('session')}"
             f" | trigger={sig.get('trigger_reason')}"
+            f"{m15_part}"
+            f"{vc_part}"
             f" | narrative={sig.get('narrative')}"
         )
         if signal_type == "EXECUTION_ERROR" and sig.get("execution_error"):
@@ -390,7 +445,12 @@ class Core:
                 df_5M = data.get("5M")
                 df_15M = data.get("15M")
 
-                if df_1M is not None and not df_1M.empty:
+                # MT5 live BID tick is primary — TV/bridge candles are fallback only.
+                # This eliminates TV↔broker divergence for all SL/TP checks.
+                _mt5_live = self.mt5_executor.get_current_price(symbol, None) if self.mt5_executor else None
+                if _mt5_live is not None:
+                    last_price = _mt5_live
+                elif df_1M is not None and not df_1M.empty:
                     last_price = float(df_1M["close"].iloc[-1])
                 elif df_5M is not None and not df_5M.empty:
                     last_price = float(df_5M["close"].iloc[-1])
@@ -420,6 +480,8 @@ class Core:
                                     "tf": trade.tf,
                                     "narrative": trade.narrative,
                                     "events": [{"type": "BROKER_CLOSE", "info": "All split TP legs closed in MT5"}],
+                                    "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
+                                    "telegram_message_id": getattr(trade, "telegram_message_id", None),
                                 }
                                 results[symbol] = manage
                                 del self.active_trades[symbol]
@@ -444,6 +506,8 @@ class Core:
                                     "events": [
                                         {"type": "BROKER_CLOSE", "info": "Position disappeared from MT5"}
                                     ],
+                                    "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
+                                    "telegram_message_id": getattr(trade, "telegram_message_id", None),
                                 }
                                 results[symbol] = manage
                                 del self.active_trades[symbol]
@@ -455,13 +519,10 @@ class Core:
                         raw_manage = self._check_active_trade(symbol, last_price, trade)
 
                     # In split mode the broker owns each leg's SL and TP.
-                    # The bot must NOT override those by sending redundant close orders
-                    # based on the TV/bridge price feed (which can diverge from the real
-                    # MT5 price).  EXIT_SL and EXIT_TP from _check_active_trade are
-                    # suppressed here; the bot will catch the real close via EXIT_BROKER
-                    # on the next tick when all split_position_ids disappear from MT5.
-                    # EXIT_TIME (forced time-based close) is kept — it sends explicit
-                    # close_trade() calls which is the correct way to force-exit.
+                    # EXIT_SL, EXIT_TP, and EXIT_TIME are all suppressed — the bot waits
+                    # for EXIT_BROKER (all split_position_ids disappear from MT5) instead
+                    # of sending redundant close orders that would fill at market price
+                    # rather than the exact TP/SL levels set on each leg.
                     _is_split_active = bool(getattr(trade, "split_position_ids", []))
                     if _is_split_active and raw_manage.get("signal") in ("EXIT_SL", "EXIT_TP"):
                         raw_manage = dict(raw_manage)
@@ -472,7 +533,10 @@ class Core:
                         manage = self.ai.on_signal(symbol, raw_manage, data, self.active_trades)
 
                     risk_action = self.risk_rules.check_trade(trade, last_price=last_price)
-                    if risk_action:
+                    # In split mode the broker manages each leg's TP/SL automatically.
+                    # EXIT_TIME would force-close still-open legs that haven't reached TP yet,
+                    # turning a winning trade into a loss. Let broker handle the exit instead.
+                    if risk_action and not _is_split_active:
                         manage = dict(manage)
                         manage.update(risk_action)
 
@@ -484,6 +548,14 @@ class Core:
                     if raw_manage.get("signal") in ("EXIT_SL", "EXIT_TP"):
                         manage["signal"] = raw_manage["signal"]
                         manage["exit_price"] = raw_manage.get("exit_price", manage.get("exit_price"))
+
+                    # Block all MT5 closes during startup grace period.
+                    _in_grace = (time.time() - self._startup_time) < self._startup_grace_sec
+                    if _in_grace and self.mt5_executor:
+                        manage.pop("events", None)
+                        if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
+                            print(f"[Core] {symbol} startup grace ({self._startup_grace_sec:.0f}s) — skipping close")
+                            manage["signal"] = "HOLD"
 
                     # Process TP partial closes
                     for ev in (manage.get("events") or []):
@@ -520,6 +592,15 @@ class Core:
                                         )
                                     except Exception as exc:
                                         manage.setdefault("execution_error", str(exc))
+
+                    # Friday weekend close: hard rule — force exit all positions at 22:00 UTC+3.
+                    # Placed after TP partial-close events and after grace period so it always fires.
+                    if self.global_context.get("friday_close") and manage.get("signal") not in ("EXIT_BROKER",):
+                        manage = dict(manage)
+                        manage["signal"] = "EXIT_TIME"
+                        manage["info"] = "Закрытие перед выходными (пятница 22:00 UTC+3)"
+                        manage["exit_price"] = float(last_price)
+                        print(f"[Core] {symbol} пятница 22:00 UTC+3 — принудительное закрытие позиции")
 
                     if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
@@ -564,7 +645,7 @@ class Core:
                     continue
 
                 with prof.section("strategy"):
-                    raw_sig = self.strategy.generate_signal(data)
+                    raw_sig = self.strategy.generate_signal(data, symbol=symbol)
                 if DEBUG_RAW_SIGNALS and raw_sig.get("signal") != "NO_TRIGGER":
                     print(f"[RAW_SIG] {symbol} {raw_sig}")
                 with prof.section("ai_filter"):
@@ -594,6 +675,20 @@ class Core:
                         results[symbol] = sig
                         self._log_signal(symbol, sig)
                         continue
+
+                    # Anti-hedging guard: block entry if opposite MT5 position is open
+                    if self.mt5_executor:
+                        import MetaTrader5 as _mt5
+                        _open_pos = _mt5.positions_get(symbol=symbol) or []
+                        _expected_type = _mt5.POSITION_TYPE_BUY if side == "LONG" else _mt5.POSITION_TYPE_SELL
+                        _opposite = [p for p in _open_pos if p.magic == self.mt5_executor.settings.magic and p.type != _expected_type]
+                        if _opposite:
+                            sig["signal"] = "SKIP_HEDGE"
+                            sig["info"] = f"Opposite MT5 position still open ({len(_opposite)} legs)"
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            print(f"[Core] {symbol} anti-hedge block: {len(_opposite)} opposite leg(s) still open in MT5")
+                            continue
 
                     tp_prices = sig.get("tp_prices") or [sig.get("tp_price")]
                     tp_prices = [float(x) for x in tp_prices if x is not None]
@@ -627,6 +722,14 @@ class Core:
                                     raise RuntimeError(f"No tick for {symbol}")
                                 actual_entry = float(tick.ask if new_trade.side == "LONG" else tick.bid)
                                 total_vol = self.mt5_executor._calc_volume(symbol, actual_entry, new_trade.stop)
+                                # Sort TPs nearest-first: leg-0 (largest volume at 4+ TPs)
+                                # targets the nearest TP, not the furthest.
+                                tp_prices = (
+                                    sorted(tp_prices)
+                                    if new_trade.side == "LONG"
+                                    else sorted(tp_prices, reverse=True)
+                                )
+                                new_trade.tp_prices = tp_prices
                                 vols = _compute_tp_volumes(total_vol, len(tp_prices))
                                 legs = self.mt5_executor.execute_split_entry(
                                     symbol,
@@ -707,13 +810,15 @@ class Core:
                             )
                             self._entry_cooldowns.pop(symbol, None)
                         except Exception as exc:
-                            # Set cooldown to prevent retry every tick
-                            self._entry_cooldowns[symbol] = time.time() + self._entry_cooldown_sec
+                            err_str = str(exc)
+                            is_stale = "Stale signal rejected" in err_str
+                            cooldown_sec = self._stale_cooldown_sec if is_stale else self._entry_cooldown_sec
+                            self._entry_cooldowns[symbol] = time.time() + cooldown_sec
                             sig["signal"] = "EXECUTION_ERROR"
-                            sig["execution_error"] = str(exc)
+                            sig["execution_error"] = err_str
                             results[symbol] = sig
                             self._log_signal(symbol, sig)
-                            print(f"[Core] Execution failed for {symbol}: {exc}. Cooldown {self._entry_cooldown_sec:.0f}s")
+                            print(f"[Core] Execution failed for {symbol}: {exc}. Cooldown {cooldown_sec:.0f}s")
                             continue
 
                     self.active_trades[symbol] = new_trade
