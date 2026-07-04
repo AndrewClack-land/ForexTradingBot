@@ -103,6 +103,11 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
+# ================== FRIDAY WEEKEND CLOSE ==================
+# On Friday at/after this hour (Europe/Moscow, UTC+3 no DST) the bot blocks
+# new entries and force-closes all open positions before the weekend.
+FRIDAY_CLOSE_HOUR = _env_int("FRIDAY_CLOSE_HOUR") or 21
+
 # ================== SESSIONS / FILTERS ==================
 SESSION_WINDOWS = {
     "ASIA":   ("00:00", "08:00"),

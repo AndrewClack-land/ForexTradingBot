@@ -36,6 +36,7 @@ from config import (
     PARTIAL_TP_MODE,
     MOVE_BE_AFTER_TP1,
     SIGNAL_ON_CLOSED_BARS,
+    FRIDAY_CLOSE_HOUR,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -392,9 +393,9 @@ class Core:
 
     @staticmethod
     def _is_friday_weekend_close() -> bool:
-        """True on Friday at or after 22:00 UTC+3 (Europe/Moscow, no DST)."""
+        """True on Friday at or after FRIDAY_CLOSE_HOUR UTC+3 (Europe/Moscow, no DST)."""
         now = datetime.now(ZoneInfo("Europe/Moscow"))
-        return now.weekday() == 4 and now.hour >= 22
+        return now.weekday() == 4 and now.hour >= FRIDAY_CLOSE_HOUR
 
     def _get_symbols(self) -> list[str]:
         return self.scanner.scan()
@@ -442,7 +443,7 @@ class Core:
             if self.global_context.get("friday_close"):
                 new_sig = dict(sig)
                 new_sig["signal"] = "WAIT_SESSION"
-                new_sig["info"] = "Заблокировано: закрытие перед выходными (пятница 22:00 UTC+3)"
+                new_sig["info"] = f"Заблокировано: закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
                 return new_sig
         return sig
 
@@ -790,14 +791,15 @@ class Core:
                                 {"type": "BE", "price": float(trade.entry)}
                             )
 
-                    # Friday weekend close: hard rule — force exit all positions at 22:00 UTC+3.
-                    # Placed after TP partial-close events and after grace period so it always fires.
+                    # Friday weekend close: hard rule — force exit all positions at
+                    # FRIDAY_CLOSE_HOUR UTC+3. Placed after TP partial-close events and
+                    # after grace period so it always fires.
                     if self.global_context.get("friday_close") and manage.get("signal") not in ("EXIT_BROKER",):
                         manage = dict(manage)
                         manage["signal"] = "EXIT_TIME"
-                        manage["info"] = "Закрытие перед выходными (пятница 22:00 UTC+3)"
+                        manage["info"] = f"Закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
                         manage["exit_price"] = float(last_price)
-                        print(f"[Core] {symbol} пятница 22:00 UTC+3 — принудительное закрытие позиции")
+                        print(f"[Core] {symbol} пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3 — принудительное закрытие позиции")
 
                     if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
