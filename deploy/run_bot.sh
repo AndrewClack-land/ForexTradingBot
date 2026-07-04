@@ -12,7 +12,6 @@ export PYTHONUNBUFFERED=1
 export PYTHONUTF8=1
 
 BOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MT5_EXE="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/terminal64.exe"
 PY_EXE="$WINEPREFIX/drive_c/Python311/python.exe"
 
 cd "$BOT_DIR"
@@ -23,12 +22,12 @@ if ! pgrep -f "Xvfb :99" > /dev/null; then
     sleep 2
 fi
 
-# The MetaTrader5 Python package can start the terminal itself, but a
-# pre-started terminal makes initialize() faster and more reliable.
-if ! pgrep -f "terminal64.exe" > /dev/null; then
-    wine "$MT5_EXE" > /dev/null 2>&1 &
-    sleep 25
-fi
+# IMPORTANT: do NOT pre-start terminal64.exe here. mt5.initialize() must launch
+# the terminal itself — it passes hidden command-line flags that enable the
+# Python API IPC. A manually started terminal has no API enabled, and its
+# single-instance guard prevents the package from starting its own, so
+# initialize() times out. Kill any stray instance instead.
+pkill -x terminal64.exe 2>/dev/null && sleep 3
 
 # Stale PID-lock from the previous run: Wine assigns small Windows PIDs that
 # collide with system processes after restart, so the psutil check in
