@@ -225,7 +225,9 @@ def init_mt5(login: int | None, password: str | None, server: str | None) -> Non
         kwargs["password"] = password
     if server:
         kwargs["server"] = server
-    if not mt5.initialize(**kwargs):
+    term_path = os.getenv("MT5_TERMINAL_PATH", "").strip()
+    ok = mt5.initialize(term_path, **kwargs) if term_path else mt5.initialize(**kwargs)
+    if not ok:
         raise RuntimeError(f"mt5.initialize failed: {mt5.last_error()}")
 
 

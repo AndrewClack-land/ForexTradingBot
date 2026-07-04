@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List
 
@@ -258,9 +259,17 @@ class MT5Executor:
     # internals
     # ------------------------------------------------------------------
     def _connect(self) -> None:
-        if not mt5.initialize(login=self.settings.login,
-                              password=self.settings.password,
-                              server=self.settings.server):
+        # MT5_TERMINAL_PATH: explicit terminal64.exe location. Required where the
+        # MetaTrader5 package cannot discover the terminal itself (e.g. Wine on a
+        # Linux VPS); optional on a normal Windows install.
+        term_path = os.getenv("MT5_TERMINAL_PATH", "").strip()
+        kwargs = dict(
+            login=self.settings.login,
+            password=self.settings.password,
+            server=self.settings.server,
+        )
+        ok = mt5.initialize(term_path, **kwargs) if term_path else mt5.initialize(**kwargs)
+        if not ok:
             raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
         self.logger.info("MT5 executor connected as %s@%s", self.settings.login, self.settings.server)
 
