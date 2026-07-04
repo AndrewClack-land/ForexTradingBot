@@ -30,4 +30,9 @@ if ! pgrep -f "terminal64.exe" > /dev/null; then
     sleep 25
 fi
 
+# Stale PID-lock from the previous run: Wine assigns small Windows PIDs that
+# collide with system processes after restart, so the psutil check in
+# _acquire_pid_lock misfires. systemd already guarantees a single instance.
+rm -f "$BOT_DIR/ai_data/bot.pid"
+
 exec wine "$PY_EXE" main.py
