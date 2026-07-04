@@ -1,0 +1,17 @@
+[Unit]
+Description=Forex Trading Bot (MetaTrader 5 under Wine)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forexbot
+ExecStart=/home/ubuntu/forexbot/deploy/run_bot.sh
+Restart=always
+RestartSec=20
+TimeoutStopSec=30
+KillMode=mixed
+
+[Install]
+WantedBy=multi-user.target

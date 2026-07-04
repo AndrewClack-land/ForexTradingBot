@@ -4,6 +4,16 @@ import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
+
+# Load .env from the project root so the bot works the same under the Windows
+# GUI launcher, a bare `python main.py`, and systemd on a VPS. Existing process
+# environment variables take precedence over .env values.
+try:
+    from dotenv import load_dotenv
+
+    load_dotenv(BASE_DIR / ".env")
+except Exception:
+    pass
 AI_DATA_DIR = BASE_DIR / "ai_data"
 AI_DATA_DIR.mkdir(parents=True, exist_ok=True)
 
