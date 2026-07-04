@@ -36,9 +36,11 @@ class AILive:
             tr = active_trades.get(symbol)
             if tr is not None:
                 try:
-                    reward = abs(float(tr.tp) - float(tr.entry))
+                    # ActiveTrade has tp_prices (list), not a single .tp attribute
+                    tps = list(getattr(tr, "tp_prices", []) or [])
+                    reward = abs(float(tps[-1]) - float(tr.entry)) if tps else 0.0
                     risk = abs(float(tr.entry) - float(tr.stop))
-                    rr_numeric = (reward / risk) if risk > 0 else None
+                    rr_numeric = (reward / risk) if (risk > 0 and reward > 0) else None
                 except Exception:
                     rr_numeric = None
 

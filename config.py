@@ -53,6 +53,26 @@ MT5_BRIDGE_INTERVAL = _env_int("MT5_BRIDGE_INTERVAL") or 60
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "CHANGE_ME_TELEGRAM_TOKEN")
 TELEGRAM_CHANNEL_ID = int(os.getenv("TELEGRAM_CHANNEL_ID", "-1003871620174"))
 
+
+def _parse_id_set(raw: str) -> frozenset[int]:
+    out: set[int] = set()
+    for part in (raw or "").replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.add(int(part))
+        except ValueError:
+            continue
+    return frozenset(out)
+
+
+# User/chat ids allowed to run bot commands (/status, /open, /report, /universe).
+# Comma-separated. The channel itself is always allowed. When empty, commands
+# from anywhere except the channel are IGNORED — bot commands expose open
+# positions and must not be public.
+TELEGRAM_ADMIN_IDS = _parse_id_set(os.getenv("TELEGRAM_ADMIN_IDS", ""))
+
 # ================== UNIVERSE ==================
 # Maps bot_symbol → MT5 terminal symbol name.
 # These must match the exact symbol names used in the MT5 terminal
@@ -103,3 +123,12 @@ DEBUG_RAW_SIGNALS = os.getenv("DEBUG_RAW_SIGNALS", "0").strip().lower() in {"1",
 # "split"   → MK-style: N sub-positions, each with its own broker TP. Broker closes each leg.
 # "monitor" → legacy: one position, bot monitors and closes partially via market orders.
 PARTIAL_TP_MODE = os.getenv("PARTIAL_TP_MODE", "split").strip().lower()
+
+# Move SL to break-even (entry price) once TP1 is hit:
+#   split mode   → when the first leg is closed by the broker
+#   monitor mode → after the first partial close
+MOVE_BE_AFTER_TP1 = os.getenv("MOVE_BE_AFTER_TP1", "1").strip().lower() in {"1", "true", "yes", "on"}
+
+# Run the strategy on CLOSED candles only (drop the still-forming last bar).
+# Prevents repaint: a trigger that appears mid-bar can vanish by bar close.
+SIGNAL_ON_CLOSED_BARS = os.getenv("SIGNAL_ON_CLOSED_BARS", "1").strip().lower() in {"1", "true", "yes", "on"}

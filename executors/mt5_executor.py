@@ -83,18 +83,49 @@ class MT5Executor:
         if len(tp_prices) != len(volumes_per_tp):
             raise ValueError("tp_prices and volumes_per_tp must have the same length")
 
+        info = mt5.symbol_info(symbol)
+        vol_min = float(getattr(info, "volume_min", 0.0) or 0.0) if info is not None else 0.0
+        if vol_min <= 0:
+            vol_min = 0.01
+
         results: List[Dict[str, Any]] = []
+        carry = 0.0  # volume from legs too small to open, merged into the next leg
         for i, (vol, tp) in enumerate(zip(volumes_per_tp, tp_prices)):
+            vol = round(vol + carry, 8)
+            carry = 0.0
             if vol <= 0:
                 self.logger.warning(
                     "Split entry: skipping leg %d/%d — volume %.4f ≤ 0 (rounding remainder)",
                     i + 1, len(tp_prices), vol,
                 )
                 continue
+            if vol < vol_min:
+                self.logger.warning(
+                    "Split entry: leg %d/%d volume %.4f < volume_min %.2f — merging into next leg",
+                    i + 1, len(tp_prices), vol, vol_min,
+                )
+                carry = vol
+                continue
             leg_comment = f"{(comment or 'Bot')[:20]} TP{i + 1}"
-            order_result = self._send_order(
-                symbol, side, vol, entry_price, stop_price, tp, comment=leg_comment
-            )
+            try:
+                order_result = self._send_order(
+                    symbol, side, vol, entry_price, stop_price, tp, comment=leg_comment
+                )
+            except Exception:
+                # Roll back the legs opened so far — a half-opened split entry is not
+                # registered in active_trades and would be orphaned in the market.
+                for r in results:
+                    try:
+                        self.close_trade(symbol, position_id=r.get("position_id"), volume=None)
+                        self.logger.warning(
+                            "Split entry rollback: closed leg position_id=%s", r.get("position_id"),
+                        )
+                    except Exception as rollback_exc:
+                        self.logger.error(
+                            "Split entry rollback FAILED for position %s: %s — orphaned leg!",
+                            r.get("position_id"), rollback_exc,
+                        )
+                raise
             deal_ticket = order_result["deal"]
             position_id = self._find_position_id_from_deal(deal_ticket)
             if position_id is None:
@@ -120,6 +151,10 @@ class MT5Executor:
             self.logger.info(
                 "Split entry leg %d/%d: %s %s vol=%.2f tp=%.5f position_id=%s",
                 i + 1, len(tp_prices), symbol, side, vol, tp, position_id,
+            )
+        if carry > 0:
+            self.logger.warning(
+                "Split entry: %.4f lots left unallocated (below volume_min on the last leg)", carry,
             )
         return results
 
@@ -228,6 +263,59 @@ class MT5Executor:
                               server=self.settings.server):
             raise RuntimeError(f"MT5 initialize failed: {mt5.last_error()}")
         self.logger.info("MT5 executor connected as %s@%s", self.settings.login, self.settings.server)
+
+    def connection_alive(self) -> bool:
+        """True when the terminal is reachable and the account is logged in.
+
+        Used to distinguish "positions really closed" from "API call failed
+        because the terminal link dropped" — positions_get() returns None in
+        the latter case and must never be read as an empty position list.
+        """
+        try:
+            return mt5.account_info() is not None
+        except Exception:
+            return False
+
+    def reconnect(self) -> bool:
+        """Re-initialize a dropped terminal connection. Returns True on success."""
+        try:
+            mt5.shutdown()
+        except Exception:
+            pass
+        try:
+            self._connect()
+            return True
+        except Exception as exc:
+            self.logger.warning("MT5 reconnect failed: %s", exc)
+            return False
+
+    def get_position_close_reason(self, position_id: Optional[int]) -> Optional[str]:
+        """Return 'TP' | 'SL' | None — how a closed position ended, from deal history.
+
+        Split mode has no EXIT_TP/EXIT_SL signals (the broker closes each leg),
+        so the outcome for journaling/AI stats is recovered from the closing
+        deal's reason code.
+        """
+        if not position_id:
+            return None
+        try:
+            deals = mt5.history_deals_get(position=int(position_id))
+        except Exception:
+            return None
+        if not deals:
+            return None
+        reason_map = {
+            int(getattr(mt5, "DEAL_REASON_SL", 4)): "SL",
+            int(getattr(mt5, "DEAL_REASON_TP", 5)): "TP",
+        }
+        entry_out = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
+        for deal in deals:
+            if int(getattr(deal, "entry", -1)) != entry_out:
+                continue
+            reason = reason_map.get(int(getattr(deal, "reason", -1)))
+            if reason:
+                return reason
+        return None
 
     def _calc_volume(self, symbol: str, entry_price: float, stop_price: float) -> float:
         info = mt5.symbol_info(symbol)
@@ -430,11 +518,12 @@ class MT5Executor:
 
     def _find_position_id_from_deal(self, deal_ticket: int) -> Optional[int]:
         """Resolve position_id from a deal ticket (required in MT5 hedging mode)."""
-        import time as _time
-        from_ts = int(_time.time()) - 60
-        to_ts = int(_time.time()) + 5
+        from datetime import datetime, timedelta
+        # Deal timestamps are in BROKER SERVER time (often UTC+2/+3), so a narrow
+        # UTC-based window misses freshly created deals. ±1 day covers any offset.
+        now = datetime.now()
         try:
-            deals = mt5.history_deals_get(from_ts, to_ts)
+            deals = mt5.history_deals_get(now - timedelta(days=1), now + timedelta(days=1))
             if deals:
                 for deal in deals:
                     if int(deal.ticket) == deal_ticket:
@@ -445,16 +534,21 @@ class MT5Executor:
             pass
         return None
 
-    def get_current_price(self, symbol: str, side: str) -> Optional[float]:
-        """Return current BID price for SL/TP monitoring.
+    def get_current_price(self, symbol: str, side: Optional[str]) -> Optional[float]:
+        """Return the price MT5 itself uses to evaluate the position's SL/TP.
 
-        Always returns BID regardless of side — using ASK for SHORT monitoring causes
-        false exits because the 30-pt GOLD spread makes ASK >> signal SL level.
-        MT5 itself uses BID to evaluate SHORT SL orders, so BID is the correct reference.
+        LONG (BUY) positions are closed by a SELL at BID → broker triggers on BID.
+        SHORT (SELL) positions are closed by a BUY at ASK → broker triggers on ASK.
+        Monitoring on the same side of the spread as the broker keeps the bot's
+        SL/TP checks aligned with the actual fills (a BID-only check detects a
+        SHORT stop-out one spread late and a SHORT TP one spread early).
+        Pass side=None (no open trade) to get BID.
         """
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             return None
+        if side is not None and str(side).upper() == "SHORT":
+            return float(tick.ask)
         return float(tick.bid)
 
     def get_position(self, symbol: str, position_id: Optional[int]) -> Optional[Any]:

@@ -281,8 +281,20 @@ class TradeJournal:
             if self.export_on_each_event:
                 self.export_all()
 
-        elif st in ("EXIT_TP", "EXIT_SL"):
-            outcome = "TP" if st == "EXIT_TP" else "SL"
+        elif st in ("EXIT_TP", "EXIT_SL", "EXIT_BROKER", "EXIT_TIME"):
+            # EXIT_BROKER carries the TP/SL outcome inferred from MT5 deal history
+            # (split mode closes every trade this way); EXIT_TIME is a forced
+            # time-based close. Both MUST close the DB row — a dangling open row
+            # blocks journaling of every following trade on the symbol (duplicate
+            # guard in _open_trade).
+            if st == "EXIT_TP":
+                outcome = "TP"
+            elif st == "EXIT_SL":
+                outcome = "SL"
+            elif st == "EXIT_TIME":
+                outcome = str(sig.get("outcome") or "TIME")
+            else:
+                outcome = str(sig.get("outcome") or "BROKER")
             exit_price = sig.get("exit_price")
             if exit_price is None:
                 return

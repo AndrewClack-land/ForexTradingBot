@@ -1,6 +1,6 @@
 pandas
 pyarrow
-aiogram
+python-telegram-bot[job-queue]
 python-dotenv
 MetaTrader5
 psutil

@@ -10,7 +10,14 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 from telegram.request import HTTPXRequest
 from telegram.error import NetworkError, TimedOut, RetryAfter
 
-from config import AI_DATA_DIR, TELEGRAM_CHANNEL_ID, SYMBOL_DECIMALS, POST_STARTUP_REPORT, REPORT_DEFAULT_LIMIT
+from config import (
+    AI_DATA_DIR,
+    TELEGRAM_CHANNEL_ID,
+    TELEGRAM_ADMIN_IDS,
+    SYMBOL_DECIMALS,
+    POST_STARTUP_REPORT,
+    REPORT_DEFAULT_LIMIT,
+)
 from core.profiler import TickProfiler
 from core.trade_journal import TradeJournal
 
@@ -177,6 +184,15 @@ class TelegramBot:
                 if tp_price is None:
                     continue
                 await self._reply(app, symbol, f"✅Тп {idx}: {_fmt_price(symbol, float(tp_price))}", meta=meta)
+            elif et == "BE":
+                price = e.get("price")
+                if price is None:
+                    continue
+                await self._reply(
+                    app, symbol,
+                    f"🔒 Стоп перенесён в безубыток: {_fmt_price(symbol, float(price))}",
+                    meta=meta,
+                )
 
     async def _handle_exit(self, app, symbol: str, sig: Dict[str, Any]) -> None:
         st = sig.get("signal")
@@ -351,11 +367,32 @@ class TelegramBot:
             self.profiler.dump(prefix="[Profiler:bot]")
 
     # ----------------- commands -----------------
+    def _authorized(self, update: Update) -> bool:
+        """Commands expose open positions/history — restrict to the channel and
+        explicitly whitelisted ids (TELEGRAM_ADMIN_IDS). Everyone else is ignored."""
+        chat = update.effective_chat
+        user = update.effective_user
+        if chat is not None and int(chat.id) == self.channel_id:
+            return True
+        if user is not None and int(user.id) in TELEGRAM_ADMIN_IDS:
+            return True
+        if chat is not None and int(chat.id) in TELEGRAM_ADMIN_IDS:
+            return True
+        print(
+            f"[TelegramBot] unauthorized command ignored: "
+            f"chat={getattr(chat, 'id', None)} user={getattr(user, 'id', None)}"
+        )
+        return False
+
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
         open_trades = len(getattr(self.core, "active_trades", {}) or {})
         await update.message.reply_text(f"Open trades: {open_trades}")
 
     async def cmd_open(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
         try:
             rows = self.journal.load_open_trades()
         except Exception:
@@ -397,6 +434,8 @@ class TelegramBot:
                 await update.message.reply_text(chunk)
 
     async def cmd_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
         limit = REPORT_DEFAULT_LIMIT
         if context.args:
             try:
@@ -443,6 +482,8 @@ class TelegramBot:
                 await update.message.reply_text(chunk)
 
     async def cmd_universe(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorized(update):
+            return
         uni = list(getattr(self.core, "universe", {}).keys())
         await update.message.reply_text("Universe:\n" + ", ".join(uni))
 
@@ -495,5 +536,11 @@ class TelegramBot:
 
         app.post_init = _post_startup  # type: ignore
 
+        if not TELEGRAM_ADMIN_IDS:
+            print(
+                "[TelegramBot] WARNING: TELEGRAM_ADMIN_IDS is empty — bot commands "
+                "(/status /open /report /universe) are only accepted from the channel. "
+                "Add your user id to TELEGRAM_ADMIN_IDS in .env to use them in DM."
+            )
         print(f"[TelegramBot] posting to channel_id={self.channel_id} | poll_sec={self.poll_sec}")
         app.run_polling(close_loop=False)

@@ -43,6 +43,9 @@ def save_active_trades(active_trades: Dict[str, Any], path: Path) -> None:
             # Split-mode legs — CRITICAL: without this, bot loses split mode on restart
             # and tries to manage SL/TP manually instead of letting the broker handle them.
             "split_position_ids": list(getattr(tr, "split_position_ids", []) or []),
+
+            # BE state — persisted so restarts don't move the stop twice
+            "moved_to_be": bool(getattr(tr, "moved_to_be", False)),
         }
 
     tmp = path.with_suffix(".tmp")
@@ -82,6 +85,7 @@ def load_active_trades(path: Path) -> Dict[str, Any]:
             tr.volume_per_tp = [float(v) for v in (d.get("volume_per_tp") or [])]
             tr.volume_remaining = float(d.get("volume_remaining") or 0.0)
             tr.split_position_ids = [int(x) for x in (d.get("split_position_ids") or [])]
+            tr.moved_to_be = bool(d.get("moved_to_be", False))
             restored[symbol] = tr
         except Exception:
             continue

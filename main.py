@@ -1,6 +1,7 @@
 # main.py
 from __future__ import annotations
 
+import math
 import os
 import threading
 import time
@@ -33,7 +34,15 @@ from config import (
     MT5_BRIDGE_LOOKBACK_DAYS,
     MT5_BRIDGE_INTERVAL,
     PARTIAL_TP_MODE,
+    MOVE_BE_AFTER_TP1,
+    SIGNAL_ON_CLOSED_BARS,
 )
+from core.mt5_guard import install as _install_mt5_guard
+
+# Must run before any thread touches the MetaTrader5 API — wraps every mt5.*
+# call with a shared lock (tick loop, DataCacheLoop and MT5Bridge all use it).
+_install_mt5_guard()
+
 from core.data_cache import DataCache
 from core.data_feed import DataFeed
 from core.market_scanner import MarketScanner
@@ -49,7 +58,7 @@ from executors.mt5_executor import MT5Executor, MT5Settings
 from mt5_bridge.mt5_native_bridge import MT5NativeBridge, parse_symbol_spec, parse_timeframes
 
 
-def _compute_tp_volumes(total_volume: float, n_tps: int) -> List[float]:
+def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> List[float]:
     """
     Split total_volume into per-TP partial-close amounts.
 
@@ -58,11 +67,20 @@ def _compute_tp_volumes(total_volume: float, n_tps: int) -> List[float]:
       3 TPs → [50%, 25%, remainder]
       4 TPs → [25%, 30%, 30%, remainder]
       >4 TPs → first three get 25%/30%/30%, last entry is always remainder
+
+    Volumes are floored to the broker's volume_step — legs that are not
+    step-aligned get rejected with "Invalid volume" on some brokers.
     """
     if n_tps <= 0 or total_volume <= 0:
         return []
+    if not step or step <= 0:
+        step = 0.01
+
+    def _quantize(v: float) -> float:
+        return round(math.floor(v / step + 1e-9) * step, 8)
+
     if n_tps == 1:
-        return [total_volume]
+        return [_quantize(total_volume)]
 
     if n_tps == 2:
         pre_ratios: List[float] = [0.50]
@@ -75,11 +93,11 @@ def _compute_tp_volumes(total_volume: float, n_tps: int) -> List[float]:
     vols: List[float] = []
     allocated = 0.0
     for ratio in pre_ratios:
-        vol = round(total_volume * ratio, 2)
+        vol = _quantize(total_volume * ratio)
         vols.append(vol)
         allocated = round(allocated + vol, 10)
 
-    remainder = round(total_volume - allocated, 2)
+    remainder = _quantize(total_volume - allocated)
     # Floating-point rounding can produce 0.00 or tiny negatives for the
     # last leg.  Clamp to 0.0 — the split executor will skip zero-volume legs.
     vols.append(max(0.0, remainder))
@@ -135,6 +153,14 @@ class Core:
         self._entry_cooldowns: Dict[str, float] = {}
         self._entry_cooldown_sec: float = 300.0  # 5 minutes
         self._stale_cooldown_sec: float = 60.0   # shorter cooldown for stale-price rejections
+
+        # A broker position "disappearing" must be confirmed on N consecutive ticks
+        # with a healthy MT5 connection before the trade is treated as closed.
+        # Otherwise a dropped terminal link (positions_get() → None) produces a
+        # false EXIT_BROKER and the bot forgets live positions.
+        self._broker_missing_counts: Dict[str, int] = {}
+        self._broker_missing_confirm: int = 2
+        self._last_reconnect_ts: float = 0.0
 
         self.mt5_executor: MT5Executor | None = None
         if MT5_EXECUTION_ENABLED:
@@ -244,6 +270,105 @@ class Core:
             save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
             print(f"[Core] hydration done: {hydrated} new, {relinked} relinked")
 
+
+    def _position_gone_confirmed(self, symbol: str, query_failed: bool) -> bool:
+        """True only after N consecutive ticks where the position is absent AND the
+        MT5 connection is verifiably alive. Any failed/untrusted query resets nothing
+        and confirms nothing — better to hold a closed trade one extra tick than to
+        forget a live position."""
+        if query_failed:
+            return False
+        if not (self.mt5_executor and self.mt5_executor.connection_alive()):
+            return False
+        count = self._broker_missing_counts.get(symbol, 0) + 1
+        self._broker_missing_counts[symbol] = count
+        return count >= self._broker_missing_confirm
+
+    @staticmethod
+    def _trade_rr(trade: ActiveTrade) -> Optional[float]:
+        try:
+            tps = list(trade.tp_prices or [])
+            risk = abs(float(trade.entry) - float(trade.stop))
+            if not tps or risk <= 0:
+                return None
+            return abs(float(tps[-1]) - float(trade.entry)) / risk
+        except Exception:
+            return None
+
+    @staticmethod
+    def _closed_bars_view(data: Dict[str, Any]) -> Dict[str, Any]:
+        """Strategy input with the still-forming last candle removed per timeframe.
+
+        MT5 copy_rates returns the current forming bar as the last row while the
+        market is open; triggers computed on it can appear mid-bar and vanish by
+        the close (repaint). Dropping the last row makes signals deterministic
+        per closed bar. Price/SLTP checks keep using the live tick, not this view.
+        """
+        out: Dict[str, Any] = {}
+        for tf, df in (data or {}).items():
+            if df is not None and getattr(df, "empty", True) is False and len(df) > 1:
+                out[tf] = df.iloc[:-1]
+            else:
+                out[tf] = df
+        return out
+
+    def _move_to_breakeven(self, symbol: str, trade: ActiveTrade) -> bool:
+        """Move SL to the entry (fill) price after TP1. Returns True on success.
+
+        Split mode: updates every remaining leg. Monitor mode: updates the single
+        position. move_stop() itself clamps the level to the broker's minimum
+        stop distance, so this never produces [Invalid stops].
+        """
+        if not (MOVE_BE_AFTER_TP1 and self.mt5_executor):
+            return False
+        if getattr(trade, "moved_to_be", False):
+            return False
+        be_price = float(trade.entry)
+        if be_price <= 0:
+            return False
+        try:
+            split_ids = list(getattr(trade, "split_position_ids", []) or [])
+            if split_ids:
+                updated = self.mt5_executor.move_stop_all(symbol, position_ids=split_ids, new_stop=be_price)
+                ok = updated > 0
+            else:
+                pos_id = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
+                if not pos_id:
+                    return False
+                ok = self.mt5_executor.move_stop(symbol, position_id=pos_id, new_stop=be_price)
+        except Exception as exc:
+            print(f"[Core] {symbol} BE move failed: {exc}")
+            return False
+        if ok:
+            trade.moved_to_be = True
+            trade.stop = be_price
+            print(f"[Core] {symbol} TP1 hit — SL moved to break-even {be_price:.5f}")
+        return ok
+
+    def _register_broker_close(self, symbol: str, trade: ActiveTrade, manage: Dict[str, Any]) -> None:
+        """Infer TP/SL outcome of a broker-side close from MT5 deal history and
+        feed it to the AI stats store. Split mode ends every trade via EXIT_BROKER,
+        so without this neither the journal nor the AI filter ever sees outcomes."""
+        if not self.mt5_executor:
+            return
+        ids = list(getattr(trade, "split_position_ids", []) or [])
+        if not ids:
+            pid = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
+            ids = [pid] if pid else []
+        outcome: Optional[str] = None
+        for pid in ids:
+            reason = self.mt5_executor.get_position_close_reason(pid)
+            if reason == "SL":
+                outcome = "SL"
+                break
+            if reason == "TP":
+                outcome = "TP"
+        if outcome:
+            manage["outcome"] = outcome
+            try:
+                self.ai_store.update_on_close(symbol, outcome, rr_numeric=self._trade_rr(trade))
+            except Exception:
+                traceback.print_exc()
 
     @staticmethod
     def _parse_time_str(value: str) -> dt_time:
@@ -362,12 +487,26 @@ class Core:
         tps = trade.tp_prices or []
         n_tps = len(tps)
 
-        if side == "LONG":
-            if last_price <= trade.stop:
-                return {"signal": "EXIT_SL", "side": side, "exit_price": last_price, "info": "Стоп-лосс"}
-        else:
-            if last_price >= trade.stop:
-                return {"signal": "EXIT_SL", "side": side, "exit_price": last_price, "info": "Стоп-лосс"}
+        stop = float(trade.stop or 0.0)
+        # stop == 0 means "no SL known" (e.g. a position hydrated from MT5 without SL).
+        # A zero stop must never trigger an exit — for SHORT `price >= 0` is always true.
+        if stop > 0:
+            if side == "LONG":
+                if last_price <= stop:
+                    return {"signal": "EXIT_SL", "side": side, "exit_price": last_price, "info": "Стоп-лосс"}
+            else:
+                if last_price >= stop:
+                    return {"signal": "EXIT_SL", "side": side, "exit_price": last_price, "info": "Стоп-лосс"}
+
+        # Final TP was already reached earlier but the close failed (trade kept for
+        # retry) → re-emit EXIT_TP so the close is retried instead of holding forever.
+        if n_tps > 0 and trade.tp_hit >= n_tps:
+            return {
+                "signal": "EXIT_TP",
+                "side": side,
+                "exit_price": float(last_price),
+                "info": f"TP{n_tps} (final, retry)",
+            }
 
         events: List[Dict[str, Any]] = []
         next_idx = trade.tp_hit + 1
@@ -424,6 +563,15 @@ class Core:
         with prof.section("context_update"):
             self._update_global_context()
 
+        # MT5 health check: the executor connects once at startup and the link can
+        # silently die (terminal restart, network). Try to re-initialize, throttled.
+        if self.mt5_executor and not self.mt5_executor.connection_alive():
+            now = time.time()
+            if now - self._last_reconnect_ts >= 60.0:
+                self._last_reconnect_ts = now
+                ok = self.mt5_executor.reconnect()
+                print(f"[MT5] connection lost — reconnect {'ok' if ok else 'failed'}")
+
         dirty = False
 
         for symbol in symbols:
@@ -445,9 +593,11 @@ class Core:
                 df_5M = data.get("5M")
                 df_15M = data.get("15M")
 
-                # MT5 live BID tick is primary — TV/bridge candles are fallback only.
-                # This eliminates TV↔broker divergence for all SL/TP checks.
-                _mt5_live = self.mt5_executor.get_current_price(symbol, None) if self.mt5_executor else None
+                # MT5 live tick is primary — bridge candles are fallback only.
+                # Pass the open trade's side so SHORT positions are monitored on
+                # ASK (the price MT5 uses for their SL/TP) and LONG on BID.
+                _trade_side = getattr(self.active_trades.get(symbol), "side", None)
+                _mt5_live = self.mt5_executor.get_current_price(symbol, _trade_side) if self.mt5_executor else None
                 if _mt5_live is not None:
                     last_price = _mt5_live
                 elif df_1M is not None and not df_1M.empty:
@@ -465,13 +615,25 @@ class Core:
                     if self.mt5_executor and (getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)):
                         split_ids = getattr(trade, "split_position_ids", [])
                         if split_ids:
-                            # Split mode: check how many legs are still open
+                            # Split mode: check how many legs are still open.
+                            # positions_get() returns None on an API/connection failure and
+                            # an EMPTY tuple when there really are no positions — never
+                            # conflate the two, or a dropped terminal link masquerades as
+                            # "all legs closed" and live positions get forgotten.
                             import MetaTrader5 as _mt5
                             open_positions = _mt5.positions_get(symbol=symbol)
+                            query_failed = open_positions is None
                             open_ids = {p.ticket for p in (open_positions or [])}
                             still_open = [pid for pid in split_ids if pid in open_ids]
-                            if not still_open:
+                            if still_open:
+                                self._broker_missing_counts.pop(symbol, None)
+                                # Update remaining legs list
+                                if len(still_open) < len(split_ids):
+                                    trade.split_position_ids = still_open
+                                    dirty = True
+                            elif self._position_gone_confirmed(symbol, query_failed):
                                 # All legs closed (all TPs hit or SL fired)
+                                self._broker_missing_counts.pop(symbol, None)
                                 manage = {
                                     "signal": "EXIT_BROKER",
                                     "side": trade.side,
@@ -483,19 +645,28 @@ class Core:
                                     "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
                                     "telegram_message_id": getattr(trade, "telegram_message_id", None),
                                 }
+                                self._register_broker_close(symbol, trade, manage)
                                 results[symbol] = manage
                                 del self.active_trades[symbol]
                                 dirty = True
                                 self._log_signal(symbol, manage)
                                 continue
-                            # Update remaining legs list
-                            if len(still_open) < len(split_ids):
-                                trade.split_position_ids = still_open
-                                dirty = True
+                            else:
+                                info = (
+                                    "MT5 query failed — keeping trade"
+                                    if query_failed
+                                    else "split legs not visible — awaiting confirmation"
+                                )
+                                print(f"[Core] {symbol} broker check inconclusive: {info}")
+                                results[symbol] = {"signal": "HOLD", "info": info}
+                                continue
                         else:
                             pos_id = trade.mt5_position_id or trade.mt5_ticket
                             position = self.mt5_executor.get_position(symbol, pos_id)
-                            if position is None:
+                            if position is not None:
+                                self._broker_missing_counts.pop(symbol, None)
+                            elif self._position_gone_confirmed(symbol, query_failed=False):
+                                self._broker_missing_counts.pop(symbol, None)
                                 manage = {
                                     "signal": "EXIT_BROKER",
                                     "side": trade.side,
@@ -509,10 +680,15 @@ class Core:
                                     "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
                                     "telegram_message_id": getattr(trade, "telegram_message_id", None),
                                 }
+                                self._register_broker_close(symbol, trade, manage)
                                 results[symbol] = manage
                                 del self.active_trades[symbol]
                                 dirty = True
                                 self._log_signal(symbol, manage)
+                                continue
+                            else:
+                                print(f"[Core] {symbol} position not visible — awaiting confirmation before EXIT_BROKER")
+                                results[symbol] = {"signal": "HOLD", "info": "position not visible — awaiting confirmation"}
                                 continue
 
                     with prof.section("trade_manage"):
@@ -552,7 +728,14 @@ class Core:
                     # Block all MT5 closes during startup grace period.
                     _in_grace = (time.time() - self._startup_time) < self._startup_grace_sec
                     if _in_grace and self.mt5_executor:
-                        manage.pop("events", None)
+                        dropped_events = manage.pop("events", None) or []
+                        # _check_active_trade already advanced tp_hit for these events;
+                        # roll it back, otherwise the partial closes (and Telegram
+                        # notifications) for those TPs are swallowed forever.
+                        n_tp_events = sum(1 for e in dropped_events if e.get("type") == "TP")
+                        if n_tp_events:
+                            trade.tp_hit = max(0, int(trade.tp_hit) - n_tp_events)
+                            dirty = True
                         if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                             print(f"[Core] {symbol} startup grace ({self._startup_grace_sec:.0f}s) — skipping close")
                             manage["signal"] = "HOLD"
@@ -593,6 +776,20 @@ class Core:
                                     except Exception as exc:
                                         manage.setdefault("execution_error", str(exc))
 
+                    # Move SL to break-even once TP1 is reached. tp_hit is persisted, so
+                    # a failed modify retries every tick until it succeeds. Works for both
+                    # modes: split (all remaining legs) and monitor (single position).
+                    if (
+                        not getattr(trade, "moved_to_be", False)
+                        and int(getattr(trade, "tp_hit", 0) or 0) >= 1
+                        and manage.get("signal") not in ("EXIT_SL", "EXIT_TP", "EXIT_TIME", "EXIT_BROKER")
+                    ):
+                        if self._move_to_breakeven(symbol, trade):
+                            dirty = True
+                            manage.setdefault("events", []).append(
+                                {"type": "BE", "price": float(trade.entry)}
+                            )
+
                     # Friday weekend close: hard rule — force exit all positions at 22:00 UTC+3.
                     # Placed after TP partial-close events and after grace period so it always fires.
                     if self.global_context.get("friday_close") and manage.get("signal") not in ("EXIT_BROKER",):
@@ -605,25 +802,35 @@ class Core:
                     if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
                         manage.setdefault("telegram_message_id", getattr(trade, "telegram_message_id", None))
+                        close_failed = False
                         if self.mt5_executor:
-                            try:
-                                exec_block = manage.setdefault("execution", {})
-                                if not isinstance(exec_block, dict):
-                                    exec_block = {}
-                                    manage["execution"] = exec_block
-                                split_ids = getattr(trade, "split_position_ids", [])
-                                if split_ids:
-                                    # Close any remaining split legs (already-hit TPs are gone)
-                                    closed_count = 0
-                                    for pid in split_ids:
-                                        try:
-                                            ok = self.mt5_executor.close_trade(symbol, position_id=pid, volume=None)
-                                            if ok:
-                                                closed_count += 1
-                                        except Exception:
-                                            pass
-                                    exec_block["mt5_closed_split"] = closed_count
-                                elif getattr(trade, "mt5_position_id", None):
+                            exec_block = manage.setdefault("execution", {})
+                            if not isinstance(exec_block, dict):
+                                exec_block = {}
+                                manage["execution"] = exec_block
+                            conn_ok = self.mt5_executor.connection_alive()
+                            split_ids = getattr(trade, "split_position_ids", [])
+                            if split_ids:
+                                # Close any remaining split legs (already-hit TPs are gone)
+                                closed_count = 0
+                                remaining_legs: List[int] = []
+                                for pid in split_ids:
+                                    try:
+                                        ok = self.mt5_executor.close_trade(symbol, position_id=pid, volume=None)
+                                        if ok:
+                                            closed_count += 1
+                                        elif not conn_ok:
+                                            # "not found" is not trustworthy on a dead connection
+                                            remaining_legs.append(pid)
+                                    except Exception as exc:
+                                        manage.setdefault("execution_error", str(exc))
+                                        remaining_legs.append(pid)
+                                exec_block["mt5_closed_split"] = closed_count
+                                if remaining_legs:
+                                    close_failed = True
+                                    trade.split_position_ids = remaining_legs
+                            elif getattr(trade, "mt5_position_id", None):
+                                try:
                                     close_vol = getattr(trade, "volume_remaining", 0.0) or trade.volume
                                     closed = self.mt5_executor.close_trade(
                                         symbol,
@@ -631,8 +838,26 @@ class Core:
                                         volume=close_vol,
                                     )
                                     exec_block["mt5_closed"] = closed
-                            except Exception as exc:
-                                manage.setdefault("execution_error", str(exc))
+                                    if not closed and not conn_ok:
+                                        close_failed = True
+                                except Exception as exc:
+                                    manage.setdefault("execution_error", str(exc))
+                                    close_failed = True
+                        if close_failed:
+                            # Keep the trade tracked and retry next tick — deleting it
+                            # here would leave a live position unmanaged in the market.
+                            print(
+                                f"[Core] {symbol} close failed ({manage.get('execution_error', 'position not confirmed')})"
+                                f" — keeping trade, retrying next tick"
+                            )
+                            manage = dict(manage)
+                            manage["signal"] = "HOLD"
+                            manage["info"] = "MT5 close failed — retrying next tick"
+                            trade.last_price_ts = time.time()
+                            results[symbol] = manage
+                            dirty = True
+                            self._log_signal(symbol, manage)
+                            continue
                         results[symbol] = manage
                         del self.active_trades[symbol]
                         dirty = True
@@ -644,8 +869,9 @@ class Core:
                     self._log_signal(symbol, manage)
                     continue
 
+                strategy_data = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
                 with prof.section("strategy"):
-                    raw_sig = self.strategy.generate_signal(data, symbol=symbol)
+                    raw_sig = self.strategy.generate_signal(strategy_data, symbol=symbol)
                 if DEBUG_RAW_SIGNALS and raw_sig.get("signal") != "NO_TRIGGER":
                     print(f"[RAW_SIG] {symbol} {raw_sig}")
                 with prof.section("ai_filter"):
@@ -730,7 +956,9 @@ class Core:
                                     else sorted(tp_prices, reverse=True)
                                 )
                                 new_trade.tp_prices = tp_prices
-                                vols = _compute_tp_volumes(total_vol, len(tp_prices))
+                                _info = _mt5.symbol_info(symbol)
+                                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
+                                vols = _compute_tp_volumes(total_vol, len(tp_prices), step=_step or 0.01)
                                 legs = self.mt5_executor.execute_split_entry(
                                     symbol,
                                     side=new_trade.side,
@@ -740,6 +968,10 @@ class Core:
                                     volumes_per_tp=vols,
                                     comment=new_trade.narrative[:20] if new_trade.narrative else None,
                                 )
+                                if not legs:
+                                    raise RuntimeError(
+                                        "Split entry opened no legs (all volumes below broker minimum)"
+                                    )
                                 new_trade.volume = round(sum(l["volume"] for l in legs), 2)
                                 new_trade.volume_remaining = new_trade.volume
                                 new_trade.volume_per_tp = vols

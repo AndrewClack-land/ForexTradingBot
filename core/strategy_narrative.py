@@ -118,6 +118,9 @@ class ActiveTrade:
     # When non-empty, MT5 closes each leg automatically — bot skips manual partial closes.
     split_position_ids: List[int] = field(default_factory=list)
 
+    # SL moved to break-even (entry) after TP1 — done at most once per trade.
+    moved_to_be: bool = False
+
 
 # ================== STRATEGY ==================
 

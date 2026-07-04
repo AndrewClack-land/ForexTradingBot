@@ -26,6 +26,9 @@ class DataCache:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._subscriptions: Dict[Tuple[str, str], int] = defaultdict(int)
+        # Largest limit ever requested per key — the background refresher must
+        # not overwrite a 300-bar frame with a default_limit-sized one.
+        self._limits: Dict[Tuple[str, str], int] = {}
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -41,11 +44,13 @@ class DataCache:
 
     def request(self, symbol: str, tf: str, limit: Optional[int] = None) -> Optional[pd.DataFrame]:
         key = (symbol, tf)
+        lim = int(limit or self.default_limit)
         with self._lock:
             self._subscriptions[key] += 1
+            self._limits[key] = max(self._limits.get(key, 0), lim)
             cached = self._cache.get(key)
         if cached is None:
-            df = self.feed.get_klines(symbol, tf, limit or self.default_limit)
+            df = self.feed.get_klines(symbol, tf, lim)
             if df is not None and not df.empty:
                 with self._lock:
                     self._cache[key] = (time.time(), df)
@@ -54,7 +59,11 @@ class DataCache:
         ts, df = cached
         refresh = float(self.refresh_sec.get(tf, 30))
         if time.time() - ts > refresh:
-            self._schedule_refresh(key, limit or self.default_limit)
+            self._schedule_refresh(key, lim)
+            with self._lock:
+                refreshed = self._cache.get(key)
+            if refreshed is not None:
+                return refreshed[1]
         return df
 
     def _schedule_refresh(self, key: Tuple[str, str], limit: int) -> None:
@@ -82,4 +91,6 @@ class DataCache:
                 ts, _ = cached
                 if now - ts < refresh:
                     continue
-                self._schedule_refresh(key, self.default_limit)
+                with self._lock:
+                    limit = self._limits.get(key, self.default_limit)
+                self._schedule_refresh(key, limit)

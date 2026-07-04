@@ -23,7 +23,7 @@ MetaTrader5 terminal via the official `MetaTrader5` Python package.
 cd E:\Forex_TradingBot\mt5_bridge
 python mt5_native_bridge.py \
   --server "FxPro-MT5 Demo" \
-  --login 591216595 \
+  --login 12345678 \
   --password "YOUR_PASSWORD" \
   --symbols "EURUSD,GBPUSD,USDCAD,GOLD:XAUUSD" \
   --timeframes "15m,1h,4h,1d" \

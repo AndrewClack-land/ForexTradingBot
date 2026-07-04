@@ -6,7 +6,7 @@ high‑TF data without relying on the ZeroMQ EA bridge.
 
 Usage (example):
     python mt5_native_bridge.py --server "FxPro-MT5 Demo" \
-        --login 591216595 --password "***" \
+        --login 12345678 --password "***" \
         --symbols "EURUSD,GBPUSD,USDCAD,GOLD:XAUUSD" \
         --timeframes "1m,5m,15m,1h,4h,1d" --lookback-days 15 --interval 60
 
