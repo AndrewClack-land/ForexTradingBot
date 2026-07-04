@@ -164,25 +164,35 @@ class Core:
         self._last_reconnect_ts: float = 0.0
 
         self.mt5_executor: MT5Executor | None = None
+        self._executor_retry_ts: float = 0.0
         if MT5_EXECUTION_ENABLED:
-            try:
-                if MT5_LOGIN is None or not MT5_PASSWORD:
-                    raise RuntimeError("MT5 credentials are missing")
-                settings = MT5Settings(
-                    login=MT5_LOGIN,
-                    password=MT5_PASSWORD,
-                    server=MT5_SERVER,
-                    risk_pct=MT5_RISK_PER_TRADE,
-                    magic=MT5_MAGIC,
-                    slippage=MT5_SLIPPAGE,
-                )
-                self.mt5_executor = MT5Executor(settings)
-                print(f"[MT5] Execution enabled (risk={MT5_RISK_PER_TRADE:.2%})")
-            except Exception as exc:
-                print(f"[MT5] Executor disabled: {exc}")
+            self._try_create_executor()
 
         if self.mt5_executor:
             self._hydrate_active_trades_from_mt5()
+
+    def _try_create_executor(self) -> bool:
+        """Create the MT5 executor. Safe to call repeatedly — used both at startup
+        and as a periodic retry when the terminal wasn't ready yet (a cold MT5
+        start on a VPS can take longer than the IPC timeout)."""
+        try:
+            if MT5_LOGIN is None or not MT5_PASSWORD:
+                raise RuntimeError("MT5 credentials are missing")
+            settings = MT5Settings(
+                login=MT5_LOGIN,
+                password=MT5_PASSWORD,
+                server=MT5_SERVER,
+                risk_pct=MT5_RISK_PER_TRADE,
+                magic=MT5_MAGIC,
+                slippage=MT5_SLIPPAGE,
+            )
+            self.mt5_executor = MT5Executor(settings)
+            print(f"[MT5] Execution enabled (risk={MT5_RISK_PER_TRADE:.2%})")
+            return True
+        except Exception as exc:
+            self.mt5_executor = None
+            print(f"[MT5] Executor unavailable: {exc} — will retry")
+            return False
 
     def _hydrate_active_trades_from_mt5(self) -> None:
         try:
@@ -572,6 +582,14 @@ class Core:
                 self._last_reconnect_ts = now
                 ok = self.mt5_executor.reconnect()
                 print(f"[MT5] connection lost — reconnect {'ok' if ok else 'failed'}")
+        elif self.mt5_executor is None and MT5_EXECUTION_ENABLED:
+            # Executor never came up (e.g. terminal was still cold-starting when the
+            # bot launched) — keep retrying until the terminal is reachable.
+            now = time.time()
+            if now - self._executor_retry_ts >= 60.0:
+                self._executor_retry_ts = now
+                if self._try_create_executor():
+                    self._hydrate_active_trades_from_mt5()
 
         dirty = False
 

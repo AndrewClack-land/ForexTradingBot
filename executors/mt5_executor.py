@@ -267,6 +267,8 @@ class MT5Executor:
             login=self.settings.login,
             password=self.settings.password,
             server=self.settings.server,
+            # A cold terminal start (fresh VPS boot) can exceed the default 60s IPC window
+            timeout=120000,
         )
         ok = mt5.initialize(term_path, **kwargs) if term_path else mt5.initialize(**kwargs)
         if not ok:
