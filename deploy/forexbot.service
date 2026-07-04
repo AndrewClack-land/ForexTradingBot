@@ -1,7 +1,8 @@
 [Unit]
 Description=Forex Trading Bot (MetaTrader 5 under Wine)
-After=network-online.target
+After=network-online.target xvfb99.service
 Wants=network-online.target
+Requires=xvfb99.service
 
 [Service]
 Type=simple

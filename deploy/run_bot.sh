@@ -16,11 +16,9 @@ PY_EXE="$WINEPREFIX/drive_c/Python311/python.exe"
 
 cd "$BOT_DIR"
 
-# Virtual display for the MT5 terminal GUI
-if ! pgrep -f "Xvfb :99" > /dev/null; then
-    Xvfb :99 -screen 0 1280x800x24 &
-    sleep 2
-fi
+# Virtual display :99 is provided by xvfb99.service (see deploy/xvfb99.service).
+# Keeping Xvfb outside this unit means a bot restart never tears down the
+# display under the MT5 terminal.
 
 # IMPORTANT: do NOT pre-start terminal64.exe here. mt5.initialize() must launch
 # the terminal itself — it passes hidden command-line flags that enable the
