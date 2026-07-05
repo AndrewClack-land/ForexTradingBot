@@ -10,3 +10,6 @@ ai_data/
 *.csv
 *.json
 .env
+
+# SSH-ключ доступа к VPS — приватный, никогда не коммитить
+deploy/keys/

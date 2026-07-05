@@ -25,7 +25,18 @@ cd "$BOT_DIR"
 # Python API IPC. A manually started terminal has no API enabled, and its
 # single-instance guard prevents the package from starting its own, so
 # initialize() times out. Kill any stray instance instead.
-pkill -x terminal64.exe 2>/dev/null && sleep 3
+# pkill -x does NOT match Wine processes (their comm is not the exe name), so
+# match the full command line; -U keeps Docker containers' terminals alive.
+pkill -9 -U "$(id -u)" -f 'terminal64\.exe' 2>/dev/null && sleep 4
+
+# The terminal must already know the broker's server (Config/servers.dat,
+# copied from a working Windows install). Without it initialize() dies with
+# 'IPC timeout' — see gmag11/MetaTrader5-Docker#15.
+SERVERS_DAT="$WINEPREFIX/drive_c/Program Files/MetaTrader 5/Config/servers.dat"
+if [ ! -f "$SERVERS_DAT" ]; then
+    echo "FATAL: $SERVERS_DAT is missing — initialize() would hang with IPC timeout." >&2
+    exit 1
+fi
 
 # Stale PID-lock from the previous run: Wine assigns small Windows PIDs that
 # collide with system processes after restart, so the psutil check in
