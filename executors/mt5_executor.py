@@ -9,6 +9,28 @@ from typing import Optional, Dict, Any, List
 import MetaTrader5 as mt5
 
 
+def _send_request(request: Dict[str, Any]):
+    """order_send() compatible with both MetaTrader5 package generations.
+
+    The 5.0.5xxx rewrite rejects the classic positional-dict call with
+    (-2, 'Unnamed arguments not allowed') and wants named arguments; it also
+    rejects None values and numpy integer scalars outright. Older packages
+    (the local Windows install) only accept the positional dict. Sanitize the
+    request, try positional first, fall back to named arguments on -2.
+    """
+    req = {}
+    for key, value in request.items():
+        if value is None:
+            continue
+        if type(value).__module__ == "numpy":  # np.float64 / np.int64 → native
+            value = value.item()
+        req[key] = value
+    result = mt5.order_send(req)
+    if result is None and mt5.last_error()[0] == -2:
+        result = mt5.order_send(**req)
+    return result
+
+
 @dataclass
 class MT5Settings:
     login: int
@@ -202,7 +224,7 @@ class MT5Executor:
         last_result = None
         for fill_mode in fill_modes:
             request["type_filling"] = fill_mode
-            result = mt5.order_send(request)
+            result = _send_request(request)
             # order_send returns None (no result object) when the terminal is not
             # ready to take requests yet — e.g. right after a cold start.
             if result is None:
@@ -254,7 +276,7 @@ class MT5Executor:
             "tp": position.tp,
             "magic": self.settings.magic,
         }
-        result = mt5.order_send(request)
+        result = _send_request(request)
         if result is None:
             raise RuntimeError(
                 f"Failed to update SL for {symbol}: order_send returned None ({mt5.last_error()})"
@@ -492,7 +514,7 @@ class MT5Executor:
         unsupported_code = getattr(mt5, "TRADE_RETCODE_INVALID_FILLING", 10030)
         for fill_mode in fill_modes:
             request["type_filling"] = fill_mode
-            result = mt5.order_send(request)
+            result = _send_request(request)
             # order_send returns None (no result object) when the terminal is not
             # ready to take requests yet — e.g. right after a cold start.
             if result is None:
