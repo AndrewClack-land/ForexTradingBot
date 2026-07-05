@@ -203,6 +203,10 @@ class MT5Executor:
         for fill_mode in fill_modes:
             request["type_filling"] = fill_mode
             result = mt5.order_send(request)
+            # order_send returns None (no result object) when the terminal is not
+            # ready to take requests yet — e.g. right after a cold start.
+            if result is None:
+                raise RuntimeError(f"order_send close returned None: {mt5.last_error()}")
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 self._fill_mode_cache[symbol] = fill_mode
                 return True
@@ -251,6 +255,10 @@ class MT5Executor:
             "magic": self.settings.magic,
         }
         result = mt5.order_send(request)
+        if result is None:
+            raise RuntimeError(
+                f"Failed to update SL for {symbol}: order_send returned None ({mt5.last_error()})"
+            )
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             raise RuntimeError(f"Failed to update SL for {symbol}: {result}")
         return True
@@ -485,6 +493,10 @@ class MT5Executor:
         for fill_mode in fill_modes:
             request["type_filling"] = fill_mode
             result = mt5.order_send(request)
+            # order_send returns None (no result object) when the terminal is not
+            # ready to take requests yet — e.g. right after a cold start.
+            if result is None:
+                raise RuntimeError(f"MT5 order_send returned None: {mt5.last_error()}")
             if result.retcode == mt5.TRADE_RETCODE_DONE:
                 self._fill_mode_cache[symbol] = fill_mode
                 return {
