@@ -113,6 +113,23 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
+# ================== ENTRY FREQUENCY / RISK BRAKES ==================
+# Cooldown (minutes) per symbol after a position is closed by stop-loss.
+# Blocks the 2-3 minute revenge re-entries seen on 2026-07-10.
+POST_SL_COOLDOWN_MIN = _env_int("POST_SL_COOLDOWN_MIN") or 60
+# Hard cap of executed setups per symbol per day (counter resets at UTC midnight).
+MAX_SETUPS_PER_SYMBOL_PER_DAY = _env_int("MAX_SETUPS_PER_SYMBOL_PER_DAY") or 3
+# Bot-wide daily loss limit as a fraction of the day's starting balance.
+# When equity drops below balance*(1-limit), new entries stop until next day.
+DAILY_MAX_LOSS_PCT = _env_float("DAILY_MAX_LOSS_PCT", 0.03)
+
+# ================== EXECUTION SIZING GUARDS ==================
+# Cap on total volume (lots) per setup, applied on top of the broker maximum.
+MT5_MAX_VOLUME = _env_float("MT5_MAX_VOLUME", 10.0)
+# Round-turn commission per 1.0 lot (USD) — included in position sizing so a
+# tight stop cannot balloon volume past the planned risk.
+MT5_COMMISSION_PER_LOT = _env_float("MT5_COMMISSION_PER_LOT", 7.0)
+
 # ================== FRIDAY WEEKEND CLOSE ==================
 # On Friday at/after this hour (Europe/Moscow, UTC+3 no DST) the bot blocks
 # new entries and force-closes all open positions before the weekend.

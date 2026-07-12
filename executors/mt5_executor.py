@@ -40,6 +40,31 @@ class MT5Settings:
     magic: int = 20260318
     slippage: int = 20
     retry_sec: float = 0.3
+    # Sizing guards: hard cap on total lots per setup and round-turn
+    # commission per lot included in the risk-per-lot calculation.
+    max_volume: float = 10.0
+    commission_per_lot: float = 7.0
+
+
+# Absolute floor (in price units) for the stop distance used in SIZING, and the
+# expected exit slippage added on top. A 4-pip stop on EURUSD sized 67 lots on
+# 2026-07-10; 3 pips of SL slippage then nearly doubled the planned loss.
+# Volume is derived from max(actual stop, floor) + slippage — the real stop
+# order is not modified.
+_MIN_SIZING_STOP: Dict[str, float] = {
+    "EURUSD": 0.0008,
+    "GBPUSD": 0.0008,
+    "USDCAD": 0.0008,
+    "GOLD":   3.0,
+    "XAUUSD": 3.0,
+}
+_EXPECTED_SLIPPAGE: Dict[str, float] = {
+    "EURUSD": 0.0002,
+    "GBPUSD": 0.0002,
+    "USDCAD": 0.0002,
+    "GOLD":   0.30,
+    "XAUUSD": 0.30,
+}
 
 
 class MT5Executor:
@@ -375,13 +400,21 @@ class MT5Executor:
         if stop_distance < point:
             stop_distance = point
 
-        ticks = stop_distance / point
+        # Size against a floored stop distance + expected slippage so a
+        # micro-stop cannot balloon the volume; commission is part of the
+        # per-lot risk. The actual SL order keeps the strategy's level.
+        sym_key = symbol.upper()
+        sizing_distance = max(stop_distance, _MIN_SIZING_STOP.get(sym_key, 0.0))
+        sizing_distance += _EXPECTED_SLIPPAGE.get(sym_key, 0.0)
+
+        ticks = sizing_distance / point
         tick_value = getattr(info, "tick_value", None)
         if not tick_value:
             contract_size = getattr(info, "trade_contract_size", 1.0)
             tick_value = contract_size * point
         tick_value = max(tick_value, 1e-9)
-        risk_per_lot = max(ticks * tick_value, 1e-6)
+        commission = max(float(self.settings.commission_per_lot), 0.0)
+        risk_per_lot = max(ticks * tick_value + commission, 1e-6)
 
         account = mt5.account_info()
         if account is None:
@@ -392,6 +425,8 @@ class MT5Executor:
         # info.volume_max can be None or 0 on some brokers — guard against an
         # unbounded result that causes "Invalid volume" (e.g. 184467M lots).
         vol_max = float(info.volume_max) if (getattr(info, "volume_max", None) and info.volume_max > 0) else 500.0
+        if self.settings.max_volume and self.settings.max_volume > 0:
+            vol_max = min(vol_max, float(self.settings.max_volume))
         volume = max(info.volume_min or 0.01, min(volume, vol_max))
         step = info.volume_step or 0.01
         volume = math.floor(volume / step) * step

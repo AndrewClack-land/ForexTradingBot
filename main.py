@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from pathlib import Path
-from datetime import datetime, time as dt_time
+from datetime import datetime, date, time as dt_time, timezone
 from typing import Dict, Any, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
@@ -37,6 +37,11 @@ from config import (
     MOVE_BE_AFTER_TP1,
     SIGNAL_ON_CLOSED_BARS,
     FRIDAY_CLOSE_HOUR,
+    POST_SL_COOLDOWN_MIN,
+    MAX_SETUPS_PER_SYMBOL_PER_DAY,
+    DAILY_MAX_LOSS_PCT,
+    MT5_MAX_VOLUME,
+    MT5_COMMISSION_PER_LOT,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -154,6 +159,19 @@ class Core:
         self._entry_cooldowns: Dict[str, float] = {}
         self._entry_cooldown_sec: float = 300.0  # 5 minutes
         self._stale_cooldown_sec: float = 60.0   # shorter cooldown for stale-price rejections
+        # cooldown after a stop-loss close — the same still-valid M15 trigger
+        # otherwise re-enters 2-3 minutes after the stop (2026-07-10 pattern)
+        self._post_sl_cooldown_sec: float = float(POST_SL_COOLDOWN_MIN) * 60.0
+
+        # Daily entry-frequency state (reset at UTC midnight, in-memory):
+        #   _entries_today       — executed setups per symbol
+        #   _trigger_signatures  — one-shot trigger dedupe (same zone/stop never re-traded)
+        #   _day_baseline_balance / _daily_loss_stop — bot-wide daily loss brake
+        self._counters_day: Optional[date] = None
+        self._entries_today: Dict[str, int] = {}
+        self._trigger_signatures: Dict[str, set] = {}
+        self._day_baseline_balance: Optional[float] = None
+        self._daily_loss_stop: bool = False
 
         # A broker position "disappearing" must be confirmed on N consecutive ticks
         # with a healthy MT5 connection before the trade is treated as closed.
@@ -185,6 +203,8 @@ class Core:
                 risk_pct=MT5_RISK_PER_TRADE,
                 magic=MT5_MAGIC,
                 slippage=MT5_SLIPPAGE,
+                max_volume=MT5_MAX_VOLUME,
+                commission_per_lot=MT5_COMMISSION_PER_LOT,
             )
             self.mt5_executor = MT5Executor(settings)
             print(f"[MT5] Execution enabled (risk={MT5_RISK_PER_TRADE:.2%})")
@@ -376,6 +396,13 @@ class Core:
                 outcome = "TP"
         if outcome:
             manage["outcome"] = outcome
+            if outcome == "SL":
+                until = time.time() + self._post_sl_cooldown_sec
+                self._entry_cooldowns[symbol] = max(self._entry_cooldowns.get(symbol, 0.0), until)
+                print(
+                    f"[Core] {symbol} stopped out — entry cooldown "
+                    f"{self._post_sl_cooldown_sec / 60:.0f}m (until {datetime.fromtimestamp(until).strftime('%H:%M')})"
+                )
             try:
                 self.ai_store.update_on_close(symbol, outcome, rr_numeric=self._trade_rr(trade))
             except Exception:
@@ -426,11 +453,51 @@ class Core:
             "1M": _get("1m"),
         }
 
+    def _roll_daily_counters(self) -> None:
+        today = datetime.now(timezone.utc).date()
+        if self._counters_day == today:
+            return
+        self._counters_day = today
+        self._entries_today = {}
+        self._trigger_signatures = {}
+        self._day_baseline_balance = None
+        if self._daily_loss_stop:
+            print("[Core] new UTC day — daily loss stop reset")
+        self._daily_loss_stop = False
+
+    def _check_daily_loss_stop(self) -> None:
+        """Bot-wide brake: once equity is DAILY_MAX_LOSS_PCT below the day's
+        starting balance, block new entries until the next UTC day. The baseline
+        is captured on the first tick of the day (or after a restart)."""
+        if self._daily_loss_stop or not self.mt5_executor:
+            return
+        try:
+            import MetaTrader5 as _mt5
+            account = _mt5.account_info()
+        except Exception:
+            return
+        if account is None:
+            return
+        if self._day_baseline_balance is None:
+            self._day_baseline_balance = float(account.balance)
+            return
+        limit = self._day_baseline_balance * (1.0 - float(DAILY_MAX_LOSS_PCT))
+        if float(account.equity) <= limit:
+            self._daily_loss_stop = True
+            print(
+                f"[Core] DAILY LOSS STOP: equity {account.equity:.2f} <= {limit:.2f} "
+                f"({DAILY_MAX_LOSS_PCT:.0%} of day baseline {self._day_baseline_balance:.2f}) — "
+                f"no new entries until next UTC day"
+            )
+
     def _update_global_context(self) -> None:
         allowed, session_name = self._session_allowance()
         self.global_context["session"] = session_name
         self.global_context["session_allowed"] = allowed
         self.global_context["friday_close"] = self._is_friday_weekend_close()
+        self._roll_daily_counters()
+        self._check_daily_loss_stop()
+        self.global_context["daily_loss_stop"] = self._daily_loss_stop
 
     def _apply_session_filter(self, symbol: str, sig: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(sig, dict):
@@ -455,7 +522,25 @@ class Core:
                 new_sig["signal"] = "WAIT_SESSION"
                 new_sig["info"] = f"Заблокировано: закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
                 return new_sig
+            if self.global_context.get("daily_loss_stop"):
+                new_sig = dict(sig)
+                new_sig["signal"] = "WAIT_RISK"
+                new_sig["info"] = f"Заблокировано: дневной лимит убытка {DAILY_MAX_LOSS_PCT:.0%} достигнут"
+                return new_sig
         return sig
+
+    @staticmethod
+    def _trigger_signature(sig: Dict[str, Any]) -> str:
+        """Stable identity of a setup: side + trigger kind + its zone (or stop
+        level for zoneless triggers). The same zone/stop is traded at most once
+        per day — a still-valid M15 trigger cannot re-enter after a stop-out."""
+        trig_kind = str(sig.get("trigger_reason") or "").split("|")[0].strip().split(" ")[0]
+        zl, zh = sig.get("zone_low"), sig.get("zone_high")
+        if zl is not None and zh is not None:
+            anchor = f"z{float(zl):.5f}-{float(zh):.5f}"
+        else:
+            anchor = f"s{float(sig.get('stop_price') or 0.0):.5f}"
+        return f"{sig.get('side')}|{trig_kind}|{anchor}"
 
     def _log_signal(self, symbol: str, sig: Dict[str, Any]) -> None:
         if not isinstance(sig, dict):
@@ -465,17 +550,14 @@ class Core:
         important = signal_type not in {"HOLD", None}
         if not (self.log_tick or important):
             return
-        m15_raw = sig.get("m15_trend_raw")
-        m15_part = f" | m15_ema={m15_raw}" if m15_raw else ""
-        vc = sig.get("vc")
-        vc_part = f" | block=VC({vc})" if vc else ""
+        fvg = sig.get("vc")
+        fvg_part = f" | fvg={fvg}" if fvg else ""
         info = (
             f"[Ticker] {symbol} {signal_type}"
             f" | side={sig.get('side')}"
             f" | session={self.global_context.get('session')}"
             f" | trigger={sig.get('trigger_reason')}"
-            f"{m15_part}"
-            f"{vc_part}"
+            f"{fvg_part}"
             f" | narrative={sig.get('narrative')}"
         )
         if signal_type == "EXECUTION_ERROR" and sig.get("execution_error"):
@@ -913,11 +995,27 @@ class Core:
                         self._log_signal(symbol, sig)
                         continue
 
-                    # Skip if this symbol is in cooldown after a failed execution
+                    # Skip if this symbol is in cooldown (failed execution or stop-out)
                     cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
                     if time.time() < cooldown_until:
                         sig["signal"] = "WAIT_COOLDOWN"
-                        sig["info"] = "Entry cooldown after failed execution"
+                        sig["info"] = f"Entry cooldown ({cooldown_until - time.time():.0f}s left)"
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        continue
+
+                    # Daily frequency brakes: setup cap per symbol + one-shot triggers
+                    if self._entries_today.get(symbol, 0) >= MAX_SETUPS_PER_SYMBOL_PER_DAY:
+                        sig["signal"] = "SKIP_DAILY_LIMIT"
+                        sig["info"] = f"Достигнут лимит {MAX_SETUPS_PER_SYMBOL_PER_DAY} сетапов/день"
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        continue
+
+                    trig_sig = self._trigger_signature(sig)
+                    if trig_sig in self._trigger_signatures.get(symbol, set()):
+                        sig["signal"] = "SKIP_DUP_TRIGGER"
+                        sig["info"] = f"Зона/бар триггера уже отторгована сегодня ({trig_sig})"
                         results[symbol] = sig
                         self._log_signal(symbol, sig)
                         continue
@@ -1075,6 +1173,8 @@ class Core:
 
                     self.active_trades[symbol] = new_trade
                     dirty = True
+                    self._entries_today[symbol] = self._entries_today.get(symbol, 0) + 1
+                    self._trigger_signatures.setdefault(symbol, set()).add(trig_sig)
 
                 results[symbol] = sig
                 self._log_signal(symbol, sig)

@@ -15,27 +15,32 @@
 
 ## Как бот принимает направление (HTF bias)
 
-Направление определяется скорингом по старшим таймфреймам (D / 4H / 1H) —
-каждый инструмент добавляет голоса LONG или SHORT (`core/strategy_narrative.py: calc_narrative`):
+Направление определяется ансамблем независимых моделей (ensemble learning) по старшим
+таймфреймам (`core/strategy_narrative.py: calc_narrative`):
 
-| Инструмент | Вклад |
+| Модель | Вклад |
 | --- | --- |
-| **Daily Premium/Discount** — положение цены относительно PDH/PDL вчерашнего дня | +2 |
+| **Daily Premium/Discount** — текущая цена относительно PDH/PDL вчерашнего дня | +2 |
 | **5-дневный дилинг-рендж** — доминирующая сторона строки и её вероятность (≥55%) | +1 |
-| **Fractal Power** — соотношение силы бычьих/медвежьих фракталов (бонус при ≥65%) | +1..+2 |
-| **Ордерблок (OB)** на 1H — сторона ближайшего валидного блока | +1 |
-| **Rejection Block (RB)** на 1H — валидный неповреждённый блок | +1 |
+| **Ложный пробой фрактала D1** — свеча проколола уровень, но закрылась внутри (разворот) | +2 |
+| **Истинный пробой фрактала D1** — закрытие за уровнем (продолжение) | +1 |
+| **Ордерблок (OB)** на 4H — сторона ближайшего валидного блока | +1 |
+| **Rejection Block (RB)** на 4H — валидный неповреждённый блок | +1 |
 
-Bias принимается, когда перевес голосов достигает порога (`HTF_SCORE_MARGIN`, по умолчанию 2).
-При «смешанном» счёте решает запасной top-down: тренд 4H (SMA50) → 1H (SMA30) + позиция
-в 4H-рендже по фракталам.
+Bias принимается при перевесе голосов ≥ `HTF_SCORE_MARGIN` (по умолчанию 2).
+Строгость регулирует **FVG-режим 1H** (LuxAlgo Instantaneous Mitigation): против
+направления режима порог ужесточается на +1. SMA/EMA в принятии решения не участвуют;
+при смешанном счёте bias = NEUTRAL (входа нет).
 
 ## Фильтры перед входом
 
 1. **Торговая сессия** — только London / New York;
-2. **M15 EMA-тренд** (EMA72/EMA89) — не входить против локального импульса;
-3. **Volume Confirmation на 1H** — SNR-пробой или FVG не должны конфликтовать с bias;
-4. **Пятница после 21:00 МСК** — новые входы блокируются, открытые позиции закрываются перед выходными.
+2. **Пятница после 21:00 МСК** — новые входы блокируются, открытые позиции закрываются перед выходными;
+3. **Частота входов**: кулдаун 60 мин после выбитого стопа (`POST_SL_COOLDOWN_MIN`),
+   максимум 3 сетапа на символ в день (`MAX_SETUPS_PER_SYMBOL_PER_DAY`),
+   одна и та же зона/уровень триггера не торгуется повторно в течение дня;
+4. **Дневной стоп бота** — при просадке −3% от баланса на начало дня (`DAILY_MAX_LOSS_PCT`)
+   новые входы блокируются до следующего дня.
 
 ## Триггеры входа
 
@@ -48,7 +53,10 @@ Bias принимается, когда перевес голосов дости
 
 ## Риск и сопровождение
 
-- **Стоп** — за фрактал Вильямса на 1H с ATR-буфером, риск ограничен коридором min/max ATR;
+- **Стоп** — за фрактал Вильямса на 1H с ATR-буфером, риск ограничен коридором min/max ATR
+  (min 0.75×ATR — микро-стопы не раздувают объём);
+- **Сайзинг** — от риска на сделку с учётом комиссии и ожидаемого проскальзывания,
+  потолок объёма `MT5_MAX_VOLUME` (по умолчанию 10 лотов на сетап);
 - **4 тейк-профита** по уровням RR (1.0 / rr_min / 2.0 / 3.0);
 - **Split-TP** — каждая цель открывается отдельной позицией со своим брокерским TP,
   промежуточные тейки исполняет сам брокер точно по цене;
@@ -109,27 +117,32 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 ### How the bot picks direction (HTF bias)
 
-Direction comes from scoring the higher timeframes (D / 4H / 1H) —
-each instrument adds LONG or SHORT votes (`core/strategy_narrative.py: calc_narrative`):
+Direction comes from an ensemble of independent models on the higher
+timeframes (`core/strategy_narrative.py: calc_narrative`):
 
-| Instrument | Weight |
+| Model | Weight |
 | --- | --- |
-| **Daily Premium/Discount** — price position vs yesterday's PDH/PDL | +2 |
+| **Daily Premium/Discount** — current price vs yesterday's PDH/PDL | +2 |
+| **D1 fractal false breakout** — wick pierced the level, close back inside (reversal) | +2 |
+| **D1 fractal true breakout** — close beyond the level (continuation) | +1 |
 | **5-day dealing range** — dominant side of the current row and its probability (≥55%) | +1 |
-| **Fractal Power** — bullish/bearish fractal strength ratio (bonus at ≥65%) | +1..+2 |
-| **Order Block (OB)** on 1H — side of the nearest valid block | +1 |
-| **Rejection Block (RB)** on 1H — valid, unbroken block | +1 |
+| **Order Block (OB)** on 4H — side of the nearest valid block | +1 |
+| **Rejection Block (RB)** on 4H — valid, unbroken block | +1 |
 
-Bias is accepted once the vote margin reaches the threshold (`HTF_SCORE_MARGIN`, default 2).
-On a mixed score a legacy top-down fallback decides: 4H trend (SMA50) → 1H trend (SMA30)
-plus position inside the fractal-based 4H range.
+Bias is accepted once the vote margin reaches `HTF_SCORE_MARGIN` (default 2).
+Strictness is regulated by the **1H FVG regime** (LuxAlgo Instantaneous Mitigation):
+against the regime direction the required margin tightens by +1. SMA/EMA take no part
+in the decision; on a mixed score the bias is NEUTRAL (no entry).
 
 ### Entry filters
 
 1. **Trading session** — London / New York only;
-2. **M15 EMA trend** (EMA72/EMA89) — never enter against local momentum;
-3. **Volume Confirmation on 1H** — SNR breakout or FVG must not conflict with the bias;
-4. **Friday after 21:00 MSK** — new entries blocked, open positions force-closed before the weekend.
+2. **Friday after 21:00 MSK** — new entries blocked, open positions force-closed before the weekend;
+3. **Entry frequency**: 60-min cooldown after a stop-out (`POST_SL_COOLDOWN_MIN`),
+   max 3 setups per symbol per day (`MAX_SETUPS_PER_SYMBOL_PER_DAY`),
+   the same trigger zone/level is never re-traded within the day;
+4. **Bot-wide daily stop** — at −3% from the day's starting balance (`DAILY_MAX_LOSS_PCT`)
+   new entries are blocked until the next day.
 
 ### Entry triggers
 
@@ -142,7 +155,10 @@ Checked in order; the first one that fires produces an ENTER signal:
 
 ### Risk & trade management
 
-- **Stop** — behind a 1H Williams fractal with an ATR buffer; risk clamped to a min/max ATR corridor;
+- **Stop** — behind a 1H Williams fractal with an ATR buffer; risk clamped to a min/max ATR corridor
+  (min 0.75×ATR — micro-stops cannot balloon the volume);
+- **Sizing** — from per-trade risk including commission and expected slippage,
+  volume capped by `MT5_MAX_VOLUME` (default 10 lots per setup);
 - **4 take-profits** at RR levels (1.0 / rr_min / 2.0 / 3.0);
 - **Split-TP** — each target is opened as a separate position with its own broker-side TP,
   so intermediate TPs are filled by the broker exactly at price;

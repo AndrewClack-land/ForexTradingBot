@@ -22,11 +22,6 @@ ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.000
 ORDERBLOCK_MAX_AGE_BARS = int(getattr(_cfg, "ORDERBLOCK_MAX_AGE_BARS", 240))
 HTF_SCORE_MARGIN = int(getattr(_cfg, "HTF_SCORE_MARGIN", 1))
 
-# M15 EMA trend filter
-EMA_FAST = 72
-EMA_SLOW = 89
-MIN_BARS_FOR_EMA = 100
-
 Side = Literal["LONG", "SHORT", "NEUTRAL"]
 
 
@@ -192,9 +187,17 @@ class NarrativeStrategy:
         self.entry_range_m1_atr_k = 0.25           # NEW: tighter localization around 1M close
 
         # Stop logic — raised min_risk to avoid micro-stops on noise/spread
+        # (0.40 still allowed ~4-pip stops that ballooned volume; slippage then
+        # doubled the planned loss — 2026-07-10 EURUSD −4976).
         self.stop_buffer_atr_k = 0.05
-        self.min_risk_atr_k = 0.40
+        self.min_risk_atr_k = 0.75
         self.max_risk_atr_k = 2.0
+
+        # FVG regime (1H, LuxAlgo Instantaneous-Mitigation signals) — replaces
+        # EMA/SMA as the price-direction utility; regulates bias strictness.
+        self.fvg_width_filter_atr = 0.0     # min gap width in ATR(200) fractions
+        self.fvg_regime_lookback = 300      # 1H bars scanned for IMFVG signals
+        self.fvg_atr_period = 200
 
         self.use_prev_candle_stop_floor = True
 
@@ -220,11 +223,6 @@ class NarrativeStrategy:
         return float(v) if pd.notna(v) else 0.0
 
     @staticmethod
-    def _sma(series: pd.Series, n: int) -> float:
-        v = series.tail(n).mean()
-        return float(v) if pd.notna(v) else 0.0
-
-    @staticmethod
     def _pct_of_price(value: float, price: float) -> float:
         if price <= 0:
             return 0.0
@@ -242,39 +240,56 @@ class NarrativeStrategy:
     def _clamp(x: float, lo: float, hi: float) -> float:
         return float(max(lo, min(hi, x)))
 
-    # ================== DR / FRACTALS (for Bias) ==================
+    # ================== FVG REGIME (1H) ==================
 
-    @staticmethod
-    def detect_fractals_1_1(df: pd.DataFrame):
-        highs = []
-        lows = []
-        for i in range(1, len(df) - 1):
-            prev = df.iloc[i - 1]
-            cur = df.iloc[i]
-            nxt = df.iloc[i + 1]
+    def calc_fvg_regime_1h(self, df_1H: pd.DataFrame) -> Tuple[Side, str]:
+        """Направление цены по FVG Instantaneous Mitigation (LuxAlgo, 1H).
 
-            if float(cur["high"]) > float(prev["high"]) and float(cur["high"]) > float(nxt["high"]):
-                highs.append({"index": i, "price": float(cur["high"])})
-            if float(cur["low"]) < float(prev["low"]) and float(cur["low"]) < float(nxt["low"]):
-                lows.append({"index": i, "price": float(cur["low"])})
-        return highs, lows
+        bull: медвежий FVG (low[3] > high[1]) мгновенно перекрыт — close[2] < low[3],
+              текущий close > low[3]  → режим LONG (os=1)
+        bear: бычий FVG (low[1] > high[3]) мгновенно перекрыт — close[2] > high[3],
+              текущий close < high[3] → режим SHORT (os=0)
+        Режим защёлкивается до противоположного сигнала.
+        """
+        if df_1H is None or df_1H.empty or len(df_1H) < 6:
+            return "NEUTRAL", "FVG: недостаточно данных 1H"
 
-    @staticmethod
-    def get_dr_from_fractals(df: pd.DataFrame) -> Optional[Dict[str, float]]:
-        highs, lows = NarrativeStrategy.detect_fractals_1_1(df)
-        if not highs or not lows:
-            return None
+        w = df_1H.tail(int(self.fvg_regime_lookback))
+        high = w["high"].astype(float).to_numpy()
+        low = w["low"].astype(float).to_numpy()
+        close = w["close"].astype(float).to_numpy()
+        n = len(w)
 
-        last_close = float(df["close"].iloc[-1])
-        highs_above = [h for h in highs if h["price"] > last_close]
-        lows_below = [l for l in lows if l["price"] < last_close]
-        if not highs_above or not lows_below:
-            return None
+        atr_period = min(int(self.fvg_atr_period), max(2, n - 2))
+        atr = self._atr(w, atr_period)
+        min_width = float(self.fvg_width_filter_atr) * max(atr, 0.0)
 
-        dr_high = min(highs_above, key=lambda x: x["price"])["price"]
-        dr_low = max(lows_below, key=lambda x: x["price"])["price"]
-        mid = (dr_high + dr_low) / 2.0
-        return {"high": dr_high, "low": dr_low, "mid": mid}
+        os_state: Optional[int] = None
+        last_sig_ago = -1
+        for i in range(3, n):
+            bull = (
+                low[i - 3] > high[i - 1]
+                and close[i - 2] < low[i - 3]
+                and close[i] > low[i - 3]
+                and (low[i - 3] - high[i - 1]) > min_width
+            )
+            bear = (
+                low[i - 1] > high[i - 3]
+                and close[i - 2] > high[i - 3]
+                and close[i] < high[i - 3]
+                and (low[i - 1] - high[i - 3]) > min_width
+            )
+            if bull:
+                os_state = 1
+                last_sig_ago = n - 1 - i
+            elif bear:
+                os_state = 0
+                last_sig_ago = n - 1 - i
+
+        if os_state is None:
+            return "NEUTRAL", "FVG: сигналов IMFVG на 1H не найдено"
+        side: Side = "LONG" if os_state == 1 else "SHORT"
+        return side, f"FVG-режим {side} (IMFVG 1H, сигнал {last_sig_ago} барами ранее)"
 
     def _build_htf_context(self, df_D: pd.DataFrame, df_4H: pd.DataFrame, df_1H: pd.DataFrame) -> Optional[HtfContext]:
         if df_4H is None or df_1H is None or df_4H.empty or df_1H.empty:
@@ -301,9 +316,22 @@ class NarrativeStrategy:
         return ctx
 
     def calc_narrative(self, df_D: pd.DataFrame, df_4H: pd.DataFrame, df_1H: pd.DataFrame) -> Tuple[Side, str]:
+        """Ensemble-скоринг HTF bias. Голосуют независимые модели:
+
+          DailyPD (текущая цена vs вчерашний рендж)  +2
+          5-дневный дилинг-рендж                      +1
+          D1 фрактал: ложный пробой (разворот)        +2
+          D1 фрактал: истинный пробой (продолжение)   +1
+          OB 4H                                       +1
+          RB 4H (валидный)                            +1
+
+        FVG-режим 1H регулирует строгость: против лидера голосов порог
+        htf_score_margin ужесточается на +1. SMA/EMA в решении не участвуют;
+        при смешанном счёте bias = NEUTRAL (без фолбэка).
+        """
         ctx = self._build_htf_context(df_D, df_4H, df_1H)
         if ctx is None:
-            return self._legacy_calc_narrative(df_D, df_4H, df_1H)
+            return "NEUTRAL", "Нет данных HTF (4H/1H) для Narrative"
 
         parts: List[str] = []
         score_long = 0
@@ -339,36 +367,34 @@ class NarrativeStrategy:
                 elif drange.bias == "SHORT":
                     score_short += 1
 
-        # Fractal power
-        if ctx.fractals is not None:
-            fp = ctx.fractals
+        # D1 fractal breakout: false break = primary reversal vote (+2),
+        # true break = continuation vote (+1)
+        if ctx.daily_breakout is not None:
+            db = ctx.daily_breakout
             parts.append(
-                f"Fractal power {fp.bullish_power:.1f}/{fp.bearish_power:.1f}% strength={fp.strength}"
+                f"D1 {db.kind} {db.level_kind}@{db.level:.5f} -> {db.side} ({db.bars_ago}d ago)"
             )
-            if fp.dominant == "LONG":
-                score_long += 1
-                if fp.bullish_power >= 65:
-                    score_long += 1
-            elif fp.dominant == "SHORT":
-                score_short += 1
-                if fp.bearish_power >= 65:
-                    score_short += 1
+            weight = 2 if db.kind == "FALSE_BREAK" else 1
+            if db.side == "LONG":
+                score_long += weight
+            elif db.side == "SHORT":
+                score_short += weight
 
         zone_snippets: List[str] = []
-        if ctx.order_blocks:
-            ob = ctx.order_blocks[0]
+        if ctx.order_blocks_4h:
+            ob = ctx.order_blocks_4h[0]
             zone_snippets.append(
-                f"OB {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}{' breaker' if ob.breaker else ''}"
+                f"OB4H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}{' breaker' if ob.breaker else ''}"
             )
             if ob.side == "LONG":
                 score_long += 1
             elif ob.side == "SHORT":
                 score_short += 1
-        if ctx.rejection_blocks:
-            rb = ctx.rejection_blocks[-1]
+        if ctx.rejection_blocks_4h:
+            rb = ctx.rejection_blocks_4h[-1]
             state = "valid" if rb.valid and not rb.broken else "invalid"
             zone_snippets.append(
-                f"RB {rb.side} @{min(rb.zone_low, rb.zone_high):.5f}-{max(rb.zone_low, rb.zone_high):.5f} {state}"
+                f"RB4H {rb.side} @{min(rb.zone_low, rb.zone_high):.5f}-{max(rb.zone_low, rb.zone_high):.5f} {state}"
             )
             if rb.valid and not rb.broken:
                 if rb.side == "LONG":
@@ -379,116 +405,22 @@ class NarrativeStrategy:
             parts.append("; ".join(zone_snippets))
 
         if not parts:
-            return self._legacy_calc_narrative(df_D, df_4H, df_1H)
+            return "NEUTRAL", "HTF: ни одна модель ансамбля не дала голоса"
+
+        # FVG regime (1H) tightens the required margin against its direction
+        fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
+        parts.append(fvg_text)
+
+        base_margin = int(getattr(self, "htf_score_margin", 1))
+        margin_long = base_margin + (1 if fvg_side == "SHORT" else 0)
+        margin_short = base_margin + (1 if fvg_side == "LONG" else 0)
 
         summary = " | ".join(parts)
-        margin = getattr(self, "htf_score_margin", 1)
-        if score_long >= score_short + margin:
-            return "LONG", f"HTF Bias LONG (scores L/S={score_long}/{score_short}) | {summary}"
-        if score_short >= score_long + margin:
-            return "SHORT", f"HTF Bias SHORT (scores L/S={score_long}/{score_short}) | {summary}"
-
-        legacy_side, legacy_text = self._legacy_calc_narrative(df_D, df_4H, df_1H)
-        if legacy_side != "NEUTRAL":
-            blended = f"HTF mixed (L/S={score_long}/{score_short}) | {summary}"
-            return legacy_side, blended + " :: " + legacy_text
+        if score_long >= score_short + margin_long:
+            return "LONG", f"HTF Bias LONG (scores L/S={score_long}/{score_short}, margin={margin_long}) | {summary}"
+        if score_short >= score_long + margin_short:
+            return "SHORT", f"HTF Bias SHORT (scores L/S={score_long}/{score_short}, margin={margin_short}) | {summary}"
         return "NEUTRAL", f"HTF mixed (L/S={score_long}/{score_short}) | {summary}"
-
-    def _legacy_calc_narrative(self, df_D: pd.DataFrame, df_4H: pd.DataFrame, df_1H: pd.DataFrame) -> Tuple[Side, str]:
-        if df_4H is None or df_1H is None or df_4H.empty or df_1H.empty:
-            return "NEUTRAL", "Нет данных для Narrative (4H/1H)"
-        if len(df_4H) < 80 or len(df_1H) < 80:
-            return "NEUTRAL", "Недостаточно данных для Narrative (4H/1H)"
-
-        dr4 = self.get_dr_from_fractals(df_4H)
-        if dr4 is None:
-            return "NEUTRAL", "Нет валидного DR по 4H"
-
-        price_4h = float(df_4H["close"].iloc[-1])
-        pos_4h = "DISCOUNT" if price_4h < dr4["mid"] else "PREMIUM"
-
-        sma4 = self._sma(df_4H["close"], 50)
-        sma1 = self._sma(df_1H["close"], 30)
-
-        p4 = float(df_4H["close"].iloc[-1])
-        p1 = float(df_1H["close"].iloc[-1])
-
-        trend4 = "LONG" if p4 > sma4 else "SHORT"
-        trend1 = "LONG" if p1 > sma1 else "SHORT"
-
-        score_long = 0
-        score_short = 0
-
-        score_long += 1 if pos_4h == "DISCOUNT" else 0
-        score_short += 1 if pos_4h == "PREMIUM" else 0
-
-        score_long += 1 if trend4 == "LONG" else 0
-        score_short += 1 if trend4 == "SHORT" else 0
-
-        score_long += 1 if trend1 == "LONG" else 0
-        score_short += 1 if trend1 == "SHORT" else 0
-
-        if score_long >= 2 and score_long > score_short:
-            return "LONG", (
-                f"Bias LONG (TopDown 4H→1H): 4H_DR={pos_4h}, 4H_trend={trend4}, 1H_trend={trend1} "
-                f"(голоса LONG/SHORT = {score_long}/{score_short})"
-            )
-        if score_short >= 2 and score_short > score_long:
-            return "SHORT", (
-                f"Bias SHORT (TopDown 4H→1H): 4H_DR={pos_4h}, 4H_trend={trend4}, 1H_trend={trend1} "
-                f"(голоса LONG/SHORT = {score_long}/{score_short})"
-            )
-
-        return "NEUTRAL", (
-            f"Смешанный контекст (4H→1H): 4H_DR={pos_4h}, 4H_trend={trend4}, 1H_trend={trend1} "
-            f"(голоса LONG/SHORT = {score_long}/{score_short})"
-        )
-
-    # ================== VC (optional) ==================
-
-    @staticmethod
-    def detect_snr_break(df: pd.DataFrame, lookback: int = 20) -> Optional[str]:
-        if len(df) < lookback + 1:
-            return None
-        window = df.tail(lookback + 1)
-        last = window.iloc[-1]
-        prev = window.iloc[:-1]
-        max_high = float(prev["high"].max())
-        min_low = float(prev["low"].min())
-        if float(last["close"]) > max_high:
-            return "BULL"
-        if float(last["close"]) < min_low:
-            return "BEAR"
-        return None
-
-    @staticmethod
-    def detect_fvg(df: pd.DataFrame, max_bars_back: int = 15) -> Optional[Dict[str, Any]]:
-        if len(df) < 5:
-            return None
-        end = len(df)
-        start = max(2, end - max_bars_back)
-        for i in range(start, end):
-            c0 = df.iloc[i - 2]
-            c1 = df.iloc[i - 1]
-            c2 = df.iloc[i]
-            max_high = max(float(c0["high"]), float(c2["high"]))
-            min_low = min(float(c0["low"]), float(c2["low"]))
-            if float(c1["low"]) > max_high:
-                return {"type": "BULL", "low": max_high, "high": float(c1["low"]), "index": i - 1}
-            if float(c1["high"]) < min_low:
-                return {"type": "BEAR", "high": min_low, "low": float(c1["high"]), "index": i - 1}
-        return None
-
-    def volume_confirmation(self, df_1H: pd.DataFrame) -> tuple[Optional[str], str]:
-        snr = self.detect_snr_break(df_1H)
-        fvg = self.detect_fvg(df_1H)
-        if snr == "BULL":
-            return "BULL", "SNR breakout вверх (1H)"
-        if snr == "BEAR":
-            return "BEAR", "SNR breakout вниз (1H)"
-        if fvg is not None:
-            return ("BULL", "Bullish FVG (1H)") if fvg["type"] == "BULL" else ("BEAR", "Bearish FVG (1H)")
-        return None, "Нет явного VC (SNR/FVG) на 1H"
 
     # ================== 15M Rejection Block Trigger ==================
 
@@ -1046,92 +978,6 @@ class NarrativeStrategy:
 
         return float(stop), tps
 
-    # ================== M15 EMA TREND FILTER ==================
-
-    @staticmethod
-    def calc_m15_ema_trend(df_15m: pd.DataFrame) -> Tuple[str, str]:
-        """
-        Determines local trend direction on M15 using EMA72 and EMA89 as a dynamic
-        support/resistance zone. Returns (m15_trend, description_text).
-
-        Rules:
-          bullish : price above EMA zone — close > EMA72 AND close > EMA89 AND EMA72 > EMA89
-          bearish : price below EMA zone — close < EMA72 AND close < EMA89 AND EMA72 < EMA89
-          neutral : price inside or between the EMAs
-        """
-        if df_15m is None or df_15m.empty:
-            return (
-                "neutral",
-                "M15 trend: neutral. Insufficient M15 data for EMA calculation.",
-            )
-
-        if "close" not in df_15m.columns:
-            return (
-                "neutral",
-                "M15 trend: neutral. Missing 'close' column in M15 data.",
-            )
-
-        if len(df_15m) < MIN_BARS_FOR_EMA:
-            return (
-                "neutral",
-                f"M15 trend: neutral. Insufficient M15 data for EMA calculation "
-                f"(have {len(df_15m)} bars, need at least {MIN_BARS_FOR_EMA}).",
-            )
-
-        close = df_15m["close"].astype(float)
-        ema72 = close.ewm(span=EMA_FAST, adjust=False).mean()
-        ema89 = close.ewm(span=EMA_SLOW, adjust=False).mean()
-
-        last_close = float(close.iloc[-1])
-        last_ema72 = float(ema72.iloc[-1])
-        last_ema89 = float(ema89.iloc[-1])
-
-        if not pd.notna(last_ema72) or not pd.notna(last_ema89):
-            return (
-                "neutral",
-                "M15 trend: neutral. EMA values could not be calculated.",
-            )
-
-        ema_aligned_bull = last_ema72 > last_ema89
-        ema_aligned_bear = last_ema72 < last_ema89
-
-        # Price above both EMAs — bullish only when EMA cross is confirmed
-        if last_close > last_ema72 and last_close > last_ema89:
-            if ema_aligned_bull:
-                return (
-                    "bullish",
-                    f"M15 trend: bullish. Price ({last_close:.5f}) above "
-                    f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72>EMA89 confirmed.",
-                )
-            return (
-                "neutral",
-                f"M15 trend: neutral (early bullish). Price ({last_close:.5f}) above "
-                f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72<EMA89 (transition).",
-            )
-
-        # Price below both EMAs — bearish only when EMA cross is confirmed
-        if last_close < last_ema72 and last_close < last_ema89:
-            if ema_aligned_bear:
-                return (
-                    "bearish",
-                    f"M15 trend: bearish. Price ({last_close:.5f}) below "
-                    f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72<EMA89 confirmed.",
-                )
-            return (
-                "neutral",
-                f"M15 trend: neutral (early bearish). Price ({last_close:.5f}) below "
-                f"EMA72 ({last_ema72:.5f}) and EMA89 ({last_ema89:.5f}) — EMA72>EMA89 (transition).",
-            )
-
-        # Price inside EMA zone → neutral
-        return (
-            "neutral",
-            (
-                f"M15 trend: neutral. Price ({last_close:.5f}) inside "
-                f"EMA72/EMA89 zone ({last_ema72:.5f}/{last_ema89:.5f})."
-            ),
-        )
-
     # ================== MAIN SIGNAL ==================
 
     def generate_signal(self, data: Dict[str, pd.DataFrame], symbol: str = "") -> Dict[str, Any]:
@@ -1147,19 +993,9 @@ class NarrativeStrategy:
         if side_bias == "NEUTRAL":
             return {"signal": "NO_TREND", "narrative": narrative_text}
 
-        m15_trend, m15_trend_text = self.calc_m15_ema_trend(df_15M)
-
-        # Block entry when M15 EMA trend directly opposes HTF bias
-        if m15_trend == "bearish" and side_bias == "LONG":
-            return {"signal": "WAIT_M15_EMA", "narrative": narrative_text, "m15_trend": m15_trend_text, "m15_trend_raw": m15_trend}
-        if m15_trend == "bullish" and side_bias == "SHORT":
-            return {"signal": "WAIT_M15_EMA", "narrative": narrative_text, "m15_trend": m15_trend_text, "m15_trend_raw": m15_trend}
-
-        vc_dir, vc_text = self.volume_confirmation(df_1H)
-        if vc_dir == "BEAR" and side_bias == "LONG":
-            return {"signal": "WAIT_PHASE", "narrative": narrative_text, "vc": vc_text + " | Конфликт с LONG bias"}
-        if vc_dir == "BULL" and side_bias == "SHORT":
-            return {"signal": "WAIT_PHASE", "narrative": narrative_text, "vc": vc_text + " | Конфликт с SHORT bias"}
+        # EMA-M15 и Volume-Confirmation фильтры удалены: направление и строгость
+        # bias регулирует FVG-режим 1H внутри calc_narrative.
+        fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
 
         entry = self.trigger_15m_rejection_block(df_15M, side_bias)
         if entry is None:
@@ -1170,7 +1006,7 @@ class NarrativeStrategy:
             entry = self.trigger_orderblock_touch(df_1H, ctx, side_bias)
 
         if entry is None:
-            return {"signal": "NO_TRIGGER", "narrative": narrative_text, "vc": vc_text}
+            return {"signal": "NO_TRIGGER", "narrative": narrative_text, "vc": fvg_text}
 
         # build entry range (фиксированная 15M локализация)
         if not getattr(entry, "lock_entry_range", False):
@@ -1217,11 +1053,11 @@ class NarrativeStrategy:
             "setup_tf": "15M",
 
             "narrative": narrative_text,
-            "vc": vc_text,
+            # журнал сделок пишет колонку vc — теперь здесь FVG-режим 1H
+            "vc": fvg_text,
+            "fvg_regime": fvg_side,
             "trigger_reason": entry.reason,
             "m1_localized": False,
-            "m15_trend": m15_trend_text,
-            "m15_trend_raw": m15_trend,
         }
 
         if entry.zone_low is not None and entry.zone_high is not None:

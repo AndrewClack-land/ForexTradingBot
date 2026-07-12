@@ -138,6 +138,30 @@ class DailyRange:
 
 
 @dataclass
+class DailyBreakout:
+    """Latest interaction of a D1 bar with a confirmed D1 Williams fractal level.
+
+    FALSE_BREAK — wick pierced the level but the bar closed back inside → reversal vote.
+    TRUE_BREAK  — the bar closed beyond the level → continuation vote.
+    """
+    kind: Literal["FALSE_BREAK", "TRUE_BREAK"]
+    side: Side               # voting direction implied by the event
+    level: float
+    level_kind: Literal["HIGH", "LOW"]
+    bar_index: int
+    bars_ago: int
+
+    def to_dict(self) -> dict:
+        return {
+            "kind": self.kind,
+            "side": self.side,
+            "level": float(self.level),
+            "level_kind": self.level_kind,
+            "bars_ago": int(self.bars_ago),
+        }
+
+
+@dataclass
 class OrderBlock:
     side: Side
     top: float
@@ -424,6 +448,10 @@ class HtfContext:
         self.daily_range: Optional[DailyRange] = None
         self.order_blocks: List[OrderBlock] = []
         self.rejection_blocks: List[RejectionBlock] = []
+        # 4H zones vote in the HTF bias; 1H zones stay for entry triggers.
+        self.order_blocks_4h: List[OrderBlock] = []
+        self.rejection_blocks_4h: List[RejectionBlock] = []
+        self.daily_breakout: Optional[DailyBreakout] = None
 
         if self.df_1h is not None and not self.df_1h.empty:
             self.fractals = self._calc_fractals()
@@ -431,6 +459,11 @@ class HtfContext:
             self.daily_range = self._calc_daily_range()
             self.order_blocks = self.ob_tracker.build(self.df_1h)
             self.rejection_blocks = self.rb_tracker.build(self.df_1h)
+        if self.df_4h is not None and not self.df_4h.empty:
+            self.order_blocks_4h = self.ob_tracker.build(self.df_4h)
+            self.rejection_blocks_4h = self.rb_tracker.build(self.df_4h)
+        if self.df_daily is not None and not self.df_daily.empty:
+            self.daily_breakout = self._calc_daily_breakout()
 
     # ---------------------- FRACTALS ----------------------
 
@@ -647,6 +680,62 @@ class HtfContext:
                     idxs.append(i)
         return idxs
 
+    # ---------------------- D1 FRACTAL BREAKOUTS ----------------------
+
+    def _calc_daily_breakout(self, scan_bars: int = 10) -> Optional[DailyBreakout]:
+        """Most recent false/true breakout of a confirmed D1 Williams fractal.
+
+        A fractal at index i (pivot_lookback bars each side) is confirmed only at
+        i + pivot_lookback, so a bar j may interact solely with levels where
+        i + pivot_lookback < j — no lookahead. Scanning newest-first, the first
+        event found wins.
+        """
+        df = self.df_daily
+        lb = self.pivot_lookback
+        if df is None or df.empty or len(df) < lb * 2 + 3:
+            return None
+
+        highs = df["high"].astype(float).to_numpy()
+        lows = df["low"].astype(float).to_numpy()
+        closes = df["close"].astype(float).to_numpy()
+        n = len(df)
+
+        frac_high_idx: List[int] = []
+        frac_low_idx: List[int] = []
+        for i in range(lb, n - lb):
+            hw = highs[i - lb : i + lb + 1]
+            lw = lows[i - lb : i + lb + 1]
+            if highs[i] == hw.max() and highs[i] > np.delete(hw, lb).max():
+                frac_high_idx.append(i)
+            if lows[i] == lw.min() and lows[i] < np.delete(lw, lb).min():
+                frac_low_idx.append(i)
+
+        if not frac_high_idx and not frac_low_idx:
+            return None
+
+        start = max(lb + 1, n - int(scan_bars))
+        for j in range(n - 1, start - 1, -1):
+            confirmed_highs = [i for i in frac_high_idx if i + lb < j]
+            confirmed_lows = [i for i in frac_low_idx if i + lb < j]
+            lvl_high = highs[confirmed_highs[-1]] if confirmed_highs else None
+            lvl_low = lows[confirmed_lows[-1]] if confirmed_lows else None
+
+            # Primary basis: false breakout of a D1 fractal → reversal vote.
+            if lvl_high is not None and highs[j] > lvl_high and closes[j] < lvl_high:
+                return DailyBreakout(kind="FALSE_BREAK", side="SHORT", level=float(lvl_high),
+                                     level_kind="HIGH", bar_index=j, bars_ago=n - 1 - j)
+            if lvl_low is not None and lows[j] < lvl_low and closes[j] > lvl_low:
+                return DailyBreakout(kind="FALSE_BREAK", side="LONG", level=float(lvl_low),
+                                     level_kind="LOW", bar_index=j, bars_ago=n - 1 - j)
+            # Secondary: true breakout (close beyond the level) → continuation vote.
+            if lvl_high is not None and closes[j] > lvl_high:
+                return DailyBreakout(kind="TRUE_BREAK", side="LONG", level=float(lvl_high),
+                                     level_kind="HIGH", bar_index=j, bars_ago=n - 1 - j)
+            if lvl_low is not None and closes[j] < lvl_low:
+                return DailyBreakout(kind="TRUE_BREAK", side="SHORT", level=float(lvl_low),
+                                     level_kind="LOW", bar_index=j, bars_ago=n - 1 - j)
+        return None
+
     # ---------------------- DAILY PD ----------------------
 
     def _calc_daily_range(self) -> Optional[DailyRange]:
@@ -673,6 +762,11 @@ class HtfContext:
 
         if high <= low:
             return None
+        # Premium/discount must track the CURRENT price against yesterday's
+        # range. Using the daily bar's own close froze the position for the
+        # whole session (2026-07-10: bias stayed LONG through a full-day dump).
+        if self.df_1h is not None and not self.df_1h.empty:
+            close = float(self.df_1h["close"].iloc[-1])
         mid = (high + low) / 2.0
         if close > mid:
             position = "PREMIUM"
@@ -697,6 +791,9 @@ class HtfContext:
             "fractals": self.fractals.to_dict() if self.fractals else None,
             "order_blocks": [ob.to_dict() for ob in self.order_blocks],
             "rejection_blocks": [rb.to_dict() for rb in self.rejection_blocks],
+            "order_blocks_4h": [ob.to_dict() for ob in self.order_blocks_4h],
+            "rejection_blocks_4h": [rb.to_dict() for rb in self.rejection_blocks_4h],
+            "daily_breakout": self.daily_breakout.to_dict() if self.daily_breakout else None,
         }
 
     @property
