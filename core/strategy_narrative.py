@@ -113,6 +113,13 @@ class ActiveTrade:
     # When non-empty, MT5 closes each leg automatically — bot skips manual partial closes.
     split_position_ids: List[int] = field(default_factory=list)
 
+    # Durable split-leg identity. Keys are MT5 position tickets (not order/deal
+    # tickets); values retain the TP index/price and original volume even after a
+    # leg disappears from the open-position list.  ``split_position_ids`` remains
+    # the backward-compatible list of legs that are still open (or awaiting deal
+    # history), while this mapping is the authoritative lifecycle record.
+    split_legs: Dict[int, Dict[str, Any]] = field(default_factory=dict)
+
     # SL moved to break-even (entry) after TP1 — done at most once per trade.
     moved_to_be: bool = False
 
@@ -131,15 +138,17 @@ class NarrativeStrategy:
          - всё локализуется вокруг последнего 15M close
          - если есть RB зона -> диапазон зажимается внутри неё
       7) Stop: 1H fractal (3-bar) + ATR buffer + candle floor
-      8) TP: 4 take-profits by RR (TP2 = rr_min)
+      8) TP: 3 take-profits at fixed R-multiples (1R / 2R / 3R)
     """
 
     def __init__(self):
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
 
-        # 4 TPs
-        self.tp_rr_levels = [1.0, float(self.rr_min), 2.0, 3.0]
+        # 3 TPs at clean R-multiples. TP1 = 1R keeps the break-even trigger
+        # consistently reachable (the old fixed-% TP1 override made it swing
+        # between 0.1R and 2.6R depending on stop width).
+        self.tp_rr_levels = [1.0, 2.0, 3.0]
 
         # Turtle Soup (15M)
         self.ts_lookback_bars_15m = 20
@@ -896,14 +905,6 @@ class NarrativeStrategy:
 
         return None
 
-    _TP1_PCT: Dict[str, float] = {
-        "EURUSD": 0.0015,
-        "GBPUSD": 0.0015,
-        "USDCAD": 0.0015,
-        "GOLD":   0.0045,
-        "XAUUSD": 0.0045,
-    }
-
     def calc_stop_and_tps(
         self,
         entry_price: float,
@@ -958,9 +959,8 @@ class NarrativeStrategy:
 
         risk = abs(entry_price - stop)
 
-        base = [1.0, float(self.rr_min), 2.0, 3.0]
-        rr_levels = sorted(set(float(x) for x in (self.tp_rr_levels + base)))
-        rr_levels = rr_levels[:4]  # 4 levels
+        rr_levels = sorted(set(float(x) for x in self.tp_rr_levels))
+        rr_levels = rr_levels[:3]  # 3 levels: 1R / 2R / 3R
 
         tps: List[float] = []
         for rr in rr_levels:
@@ -969,12 +969,6 @@ class NarrativeStrategy:
             tps.append(float(tp))
 
         tps = sorted(tps) if side == "LONG" else sorted(tps, reverse=True)
-
-        tp1_pct = self._TP1_PCT.get(symbol.upper())
-        if tp1_pct is not None:
-            tp1_val = (entry_price * (1 + tp1_pct)) if side == "LONG" else (entry_price * (1 - tp1_pct))
-            tps[0] = float(tp1_val)
-            tps = sorted(tps) if side == "LONG" else sorted(tps, reverse=True)
 
         return float(stop), tps
 

@@ -135,6 +135,23 @@ MT5_COMMISSION_PER_LOT = _env_float("MT5_COMMISSION_PER_LOT", 7.0)
 # new entries and force-closes all open positions before the weekend.
 FRIDAY_CLOSE_HOUR = _env_int("FRIDAY_CLOSE_HOUR") or 21
 
+# ================== DAILY FLAT CLOSE ==================
+# Every day at/after this hour (Europe/Moscow, UTC+3 no DST) the bot blocks
+# new entries and force-closes all open positions — no positions held past
+# this time. Trading resumes with the next day's allowed sessions.
+DAILY_CLOSE_HOUR = _env_int("DAILY_CLOSE_HOUR") or 21
+
+# ================== CORRELATION GUARD ==================
+# Groups of correlated symbols: while one symbol of a group has an open trade,
+# a same-direction entry on another symbol of that group is blocked (the two
+# would effectively double the risk on a single idea).
+# Format: "EURUSD+GBPUSD,AUDUSD+NZDUSD"
+CORRELATED_GROUPS = [
+    [s.strip().upper() for s in grp.split("+") if s.strip()]
+    for grp in os.getenv("CORRELATED_GROUPS", "EURUSD+GBPUSD").split(",")
+    if grp.strip()
+]
+
 # ================== SESSIONS / FILTERS ==================
 SESSION_WINDOWS = {
     "ASIA":   ("00:00", "08:00"),

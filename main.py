@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import threading
 import time
 import traceback
@@ -37,6 +38,8 @@ from config import (
     MOVE_BE_AFTER_TP1,
     SIGNAL_ON_CLOSED_BARS,
     FRIDAY_CLOSE_HOUR,
+    DAILY_CLOSE_HOUR,
+    CORRELATED_GROUPS,
     POST_SL_COOLDOWN_MIN,
     MAX_SETUPS_PER_SYMBOL_PER_DAY,
     DAILY_MAX_LOSS_PCT,
@@ -70,7 +73,7 @@ def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> 
 
       1 TP  → [100%]
       2 TPs → [50%, remainder]
-      3 TPs → [50%, 25%, remainder]
+      3 TPs → [50%, 30%, remainder]  (50/30/20 @ TP1/TP2/TP3)
       4 TPs → [25%, 30%, 30%, remainder]
       >4 TPs → first three get 25%/30%/30%, last entry is always remainder
 
@@ -91,7 +94,7 @@ def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> 
     if n_tps == 2:
         pre_ratios: List[float] = [0.50]
     elif n_tps == 3:
-        pre_ratios = [0.50, 0.25]
+        pre_ratios = [0.50, 0.30]
     else:
         pre_ratios = [0.25, 0.30, 0.30]
         pre_ratios += [0.0] * (n_tps - 4)
@@ -180,6 +183,10 @@ class Core:
         self._broker_missing_counts: Dict[str, int] = {}
         self._broker_missing_confirm: int = 2
         self._last_reconnect_ts: float = 0.0
+        # Serializes the fast broker-management job with any direct lifecycle
+        # polling. TelegramBot also shares one asyncio lock between its 3-second
+        # management job and 60-second signal job.
+        self._management_lock = threading.RLock()
 
         self.mt5_executor: MT5Executor | None = None
         self._executor_retry_ts: float = 0.0
@@ -238,16 +245,26 @@ class Core:
             first = sym_positions[0]
             all_tickets = [int(p["ticket"]) for p in sym_positions if p.get("ticket")]
             total_volume = round(sum(float(p.get("volume", 0.0) or 0.0) for p in sym_positions), 2)
-            is_split = len(all_tickets) > 1
-
             trade = self.active_trades.get(symbol)
+            was_split = bool(
+                trade
+                and (
+                    getattr(trade, "split_legs", {})
+                    or getattr(trade, "split_position_ids", [])
+                )
+            )
+            comment_marks_split = any(
+                re.search(r"(?:^|\s)TP\s*\d+(?:\s|$)", str(p.get("comment") or ""), re.IGNORECASE)
+                for p in sym_positions
+            )
+            # A restarted split setup can have only its final leg left. Do not
+            # downgrade that one remaining leg to monitor mode.
+            is_split = was_split or len(all_tickets) > 1 or comment_marks_split
+
             if trade:
                 updated = False
-                existing_split = list(getattr(trade, "split_position_ids", []) or [])
                 if is_split:
-                    # Rebuild split_position_ids — critical after restart so bot tracks all legs
-                    if set(all_tickets) != set(existing_split):
-                        trade.split_position_ids = all_tickets
+                    if self._ensure_split_leg_mapping(trade, positions=sym_positions):
                         trade.mt5_position_id = all_tickets[0]
                         trade.mt5_ticket = all_tickets[0]
                         updated = True
@@ -287,6 +304,7 @@ class Core:
             trade.mt5_position_id = all_tickets[0] if all_tickets else None
             if is_split:
                 trade.split_position_ids = all_tickets
+                self._ensure_split_leg_mapping(trade, positions=sym_positions)
             trade.ts_open = float(first.get("time", time.time()) or time.time())
             trade.last_price_ts = time.time()
             self.active_trades[symbol] = trade
@@ -300,6 +318,335 @@ class Core:
         if hydrated or relinked:
             save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
             print(f"[Core] hydration done: {hydrated} new, {relinked} relinked")
+
+    @staticmethod
+    def _is_split_trade(trade: ActiveTrade) -> bool:
+        """True for both current and legacy persisted split setups."""
+        return bool(
+            getattr(trade, "split_legs", {})
+            or getattr(trade, "split_position_ids", [])
+        )
+
+    def _ensure_split_leg_mapping(
+        self,
+        trade: ActiveTrade,
+        *,
+        positions: Optional[List[Dict[str, Any]]] = None,
+    ) -> bool:
+        """Normalize/backfill the durable ticket -> TP metadata mapping.
+
+        ``positions`` is supplied during startup hydration and lets us recover a
+        TP index from the broker TP/comment. Without broker rows (legacy state),
+        the old ordered ``split_position_ids`` list plus ``tp_hit`` is used.
+        Returns True when persisted state changed.
+        """
+        before_legs = {
+            int(k): dict(v or {})
+            for k, v in (getattr(trade, "split_legs", {}) or {}).items()
+            if k is not None
+        }
+        before_ids = [int(x) for x in (getattr(trade, "split_position_ids", []) or [])]
+        legs: Dict[int, Dict[str, Any]] = {}
+        for raw_ticket, raw_meta in before_legs.items():
+            try:
+                ticket = int(raw_ticket)
+            except (TypeError, ValueError):
+                continue
+            if ticket <= 0:
+                continue
+            meta = dict(raw_meta or {})
+            try:
+                meta["tp_index"] = int(meta.get("tp_index") or 0)
+            except (TypeError, ValueError):
+                meta["tp_index"] = 0
+            for key in ("tp", "volume"):
+                try:
+                    meta[key] = float(meta.get(key) or 0.0)
+                except (TypeError, ValueError):
+                    meta[key] = 0.0
+            meta["status"] = str(meta.get("status") or "open")
+            legs[ticket] = meta
+
+        position_by_ticket: Dict[int, Dict[str, Any]] = {}
+        for pos in positions or []:
+            try:
+                ticket = int(pos.get("ticket") or 0)
+            except (TypeError, ValueError):
+                continue
+            if ticket > 0:
+                position_by_ticket[ticket] = pos
+
+        tracked_ids: List[int] = []
+        for raw_ticket in before_ids:
+            if raw_ticket > 0 and raw_ticket not in tracked_ids:
+                tracked_ids.append(raw_ticket)
+        for ticket in position_by_ticket:
+            if ticket not in tracked_ids:
+                tracked_ids.append(ticket)
+
+        tps = [float(x) for x in (getattr(trade, "tp_prices", []) or [])]
+        volumes = [float(x) for x in (getattr(trade, "volume_per_tp", []) or [])]
+        used_indices = {
+            int(meta.get("tp_index") or 0)
+            for meta in legs.values()
+            if int(meta.get("tp_index") or 0) > 0
+            and not meta.get("legacy_inferred")
+        }
+
+        def _resolve_index(ticket: int, pos: Optional[Dict[str, Any]]) -> int:
+            comment = str((pos or {}).get("comment") or "")
+            match = re.search(r"(?:^|\s)TP\s*(\d+)(?:\s|$)", comment, re.IGNORECASE)
+            if match:
+                idx = int(match.group(1))
+                if idx > 0:
+                    return idx
+            broker_tp = float((pos or {}).get("tp") or 0.0)
+            if broker_tp > 0 and tps:
+                candidates = [
+                    (abs(tp - broker_tp), idx)
+                    for idx, tp in enumerate(tps, start=1)
+                    if idx not in used_indices
+                ]
+                if candidates:
+                    return min(candidates)[1]
+            start = max(1, int(getattr(trade, "tp_hit", 0) or 0) + 1)
+            for idx in range(start, max(start, len(tps)) + 2):
+                if idx not in used_indices:
+                    return idx
+            return start
+
+        for ticket in tracked_ids:
+            pos = position_by_ticket.get(ticket)
+            meta = legs.get(ticket)
+            if meta is None:
+                idx = _resolve_index(ticket, pos)
+                used_indices.add(idx)
+                meta = {
+                    "tp_index": idx,
+                    "tp": (
+                        float((pos or {}).get("tp") or 0.0)
+                        or (float(tps[idx - 1]) if idx <= len(tps) else 0.0)
+                    ),
+                    "volume": (
+                        float((pos or {}).get("volume") or 0.0)
+                        or (float(volumes[idx - 1]) if idx <= len(volumes) else 0.0)
+                    ),
+                    "status": "open",
+                }
+                legs[ticket] = meta
+            elif pos is not None:
+                # Broker says this ticket is currently open; refresh mutable
+                # broker values without losing its original TP identity.
+                if meta.pop("legacy_inferred", False):
+                    idx = _resolve_index(ticket, pos)
+                    meta["tp_index"] = idx
+                    used_indices.add(idx)
+                meta["status"] = "open"
+                if float(pos.get("tp") or 0.0) > 0:
+                    meta["tp"] = float(pos["tp"])
+                if float(pos.get("volume") or 0.0) > 0:
+                    meta["volume"] = float(pos["volume"])
+
+        if positions is not None:
+            # During hydration this list must mean *currently visible* legs. The
+            # complete historical identity remains in split_legs.
+            tracked_ids = sorted(
+                position_by_ticket,
+                key=lambda ticket: (
+                    int(legs.get(ticket, {}).get("tp_index") or 10**6),
+                    ticket,
+                ),
+            )
+
+        trade.split_legs = legs
+        trade.split_position_ids = tracked_ids
+        return legs != before_legs or tracked_ids != before_ids
+
+    def _poll_split_lifecycle(
+        self,
+        symbol: str,
+        trade: ActiveTrade,
+        *,
+        last_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Reconcile one split setup against open positions and deal history.
+
+        The function is idempotent: a TP event is emitted only on the transition
+        from open/pending to closed. Missing deal history keeps the ticket in a
+        pending state and is retried on the next management tick.
+        """
+        result: Dict[str, Any] = {
+            "events": [],
+            "changed": self._ensure_split_leg_mapping(trade),
+            "final": False,
+            "query_failed": False,
+            "pending_history": False,
+            "visible_open_count": 0,
+        }
+        if not self.mt5_executor or not getattr(trade, "split_legs", {}):
+            return result
+
+        open_ids = self.mt5_executor.get_open_position_ids(symbol)
+        if open_ids is None:
+            result["query_failed"] = True
+            return result
+
+        remaining: List[int] = []
+        ordered_legs = sorted(
+            trade.split_legs.items(),
+            key=lambda item: (int(item[1].get("tp_index") or 10**6), int(item[0])),
+        )
+        for ticket, meta in ordered_legs:
+            ticket = int(ticket)
+            status = str(meta.get("status") or "open")
+            if status == "closed":
+                continue
+            if ticket in open_ids:
+                remaining.append(ticket)
+                result["visible_open_count"] += 1
+                if status != "open":
+                    meta["status"] = "open"
+                    result["changed"] = True
+                continue
+
+            close_info = self.mt5_executor.get_position_close_info(ticket)
+            if close_info is None:
+                remaining.append(ticket)
+                result["pending_history"] = True
+                if status != "pending_history":
+                    meta["status"] = "pending_history"
+                    result["changed"] = True
+                continue
+
+            meta["status"] = "closed"
+            meta["close_reason"] = str(close_info.get("reason") or "OTHER")
+            meta["close_reason_code"] = int(close_info.get("reason_code") or 0)
+            meta["close_deal_ticket"] = int(close_info.get("deal_ticket") or 0)
+            meta["close_price"] = float(close_info.get("price") or 0.0)
+            meta["close_volume"] = float(close_info.get("volume") or 0.0)
+            meta["close_profit"] = float(close_info.get("profit") or 0.0)
+            meta["close_commission"] = float(close_info.get("commission") or 0.0)
+            meta["close_swap"] = float(close_info.get("swap") or 0.0)
+            meta["closed_at"] = int(close_info.get("time") or 0)
+            result["changed"] = True
+
+            reason = meta["close_reason"]
+            tp_index = int(meta.get("tp_index") or 0)
+            if reason == "TP":
+                trade.tp_hit = max(
+                    int(getattr(trade, "tp_hit", 0) or 0) + 1,
+                    tp_index,
+                )
+                tp_price = float(meta.get("tp") or 0.0)
+                hit_price = float(meta.get("close_price") or tp_price or last_price or 0.0)
+                result["events"].append({
+                    "type": "TP",
+                    "tp_index": tp_index,
+                    "tp_price": tp_price or None,
+                    "hit_price": hit_price,
+                    "source": "broker_deal",
+                    "position_id": ticket,
+                    "close_deal_ticket": meta["close_deal_ticket"],
+                })
+                print(
+                    f"[Core] {symbol} leg {ticket} closed by broker TP{tp_index} "
+                    f"at {hit_price:.5f}"
+                )
+            else:
+                print(f"[Core] {symbol} leg {ticket} closed by broker ({reason})")
+
+        if trade.split_position_ids != remaining:
+            trade.split_position_ids = remaining
+            result["changed"] = True
+
+        remaining_volume = sum(
+            float(meta.get("volume") or 0.0)
+            for meta in trade.split_legs.values()
+            if str(meta.get("status") or "open") != "closed"
+        )
+        if remaining_volume > 0 and abs(float(trade.volume_remaining or 0.0) - remaining_volume) > 1e-8:
+            trade.volume_remaining = round(remaining_volume, 8)
+            result["changed"] = True
+        elif not remaining and not result["pending_history"] and trade.volume_remaining != 0.0:
+            trade.volume_remaining = 0.0
+            result["changed"] = True
+
+        if remaining:
+            self._broker_missing_counts.pop(symbol, None)
+        elif self._position_gone_confirmed(symbol, query_failed=False):
+            self._broker_missing_counts.pop(symbol, None)
+            result["final"] = True
+        return result
+
+    def manage_active_trades(self) -> Dict[str, dict]:
+        """Fast broker-only management pass (safe to run every 1–5 seconds).
+
+        This deliberately does not fetch candles, generate signals, call the AI
+        filter, or journal partial HOLDs. It only consumes authoritative broker
+        leg-close events, moves remaining split legs to BE, and emits one terminal
+        EXIT_BROKER when all legs are confirmed closed.
+        """
+        if not self.mt5_executor:
+            return {}
+        results: Dict[str, dict] = {}
+        dirty = False
+        lock = getattr(self, "_management_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._management_lock = lock
+        with lock:
+            for symbol, trade in list(self.active_trades.items()):
+                if not self._is_split_trade(trade):
+                    continue
+                last_price = self.mt5_executor.get_current_price(symbol, trade.side)
+                lifecycle = self._poll_split_lifecycle(symbol, trade, last_price=last_price)
+                dirty = dirty or bool(lifecycle.get("changed"))
+                events = list(lifecycle.get("events") or [])
+
+                if (
+                    not getattr(trade, "moved_to_be", False)
+                    and int(getattr(trade, "tp_hit", 0) or 0) >= 1
+                    and getattr(trade, "split_position_ids", [])
+                ):
+                    if self._move_to_breakeven(symbol, trade):
+                        dirty = True
+                        events.append({"type": "BE", "price": float(trade.entry)})
+
+                if lifecycle.get("final"):
+                    manage = {
+                        "signal": "EXIT_BROKER",
+                        "side": trade.side,
+                        "exit_price": float(last_price or trade.entry),
+                        "info": "All split legs closed",
+                        "tf": trade.tf,
+                        "narrative": trade.narrative,
+                        "events": events + [
+                            {"type": "BROKER_CLOSE", "info": "All split TP legs closed in MT5"}
+                        ],
+                        "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
+                        "telegram_message_id": getattr(trade, "telegram_message_id", None),
+                    }
+                    self._register_broker_close(symbol, trade, manage)
+                    results[symbol] = manage
+                    del self.active_trades[symbol]
+                    dirty = True
+                    self._log_signal(symbol, manage)
+                elif events:
+                    results[symbol] = {
+                        "signal": "HOLD",
+                        "side": trade.side,
+                        "entry_price": float(trade.entry),
+                        "stop_price": float(trade.stop),
+                        "tp_prices": [float(x) for x in (trade.tp_prices or [])],
+                        "tp_hit": int(trade.tp_hit),
+                        "tf": trade.tf,
+                        "narrative": trade.narrative,
+                        "events": events,
+                    }
+
+            if dirty:
+                save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
+        return results
 
 
     def _position_gone_confirmed(self, symbol: str, query_failed: bool) -> bool:
@@ -382,18 +729,29 @@ class Core:
         so without this neither the journal nor the AI filter ever sees outcomes."""
         if not self.mt5_executor:
             return
-        ids = list(getattr(trade, "split_position_ids", []) or [])
+        split_legs = getattr(trade, "split_legs", {}) or {}
+        ids = [int(pid) for pid in split_legs]
+        stored_reasons = {
+            str(meta.get("close_reason"))
+            for meta in split_legs.values()
+            if meta.get("close_reason")
+        }
+        outcome: Optional[str] = None
+        if "SL" in stored_reasons or "STOP_OUT" in stored_reasons:
+            outcome = "SL"
+        elif "TP" in stored_reasons:
+            outcome = "TP"
         if not ids:
             pid = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
             ids = [pid] if pid else []
-        outcome: Optional[str] = None
-        for pid in ids:
-            reason = self.mt5_executor.get_position_close_reason(pid)
-            if reason == "SL":
-                outcome = "SL"
-                break
-            if reason == "TP":
-                outcome = "TP"
+        if outcome != "SL":
+            for pid in ids:
+                reason = self.mt5_executor.get_position_close_reason(pid)
+                if reason == "SL":
+                    outcome = "SL"
+                    break
+                if reason == "TP":
+                    outcome = outcome or "TP"
         if outcome:
             manage["outcome"] = outcome
             if outcome == "SL":
@@ -433,6 +791,13 @@ class Core:
         """True on Friday at or after FRIDAY_CLOSE_HOUR UTC+3 (Europe/Moscow, no DST)."""
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         return now.weekday() == 4 and now.hour >= FRIDAY_CLOSE_HOUR
+
+    @staticmethod
+    def _is_daily_flat_close() -> bool:
+        """True at or after DAILY_CLOSE_HOUR UTC+3 (Europe/Moscow, no DST) —
+        all positions must be flat by this time every day."""
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        return now.hour >= DAILY_CLOSE_HOUR
 
     def _get_symbols(self) -> list[str]:
         return self.scanner.scan()
@@ -495,6 +860,7 @@ class Core:
         self.global_context["session"] = session_name
         self.global_context["session_allowed"] = allowed
         self.global_context["friday_close"] = self._is_friday_weekend_close()
+        self.global_context["daily_close"] = self._is_daily_flat_close()
         self._roll_daily_counters()
         self._check_daily_loss_stop()
         self.global_context["daily_loss_stop"] = self._daily_loss_stop
@@ -521,6 +887,11 @@ class Core:
                 new_sig = dict(sig)
                 new_sig["signal"] = "WAIT_SESSION"
                 new_sig["info"] = f"Заблокировано: закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
+                return new_sig
+            if self.global_context.get("daily_close"):
+                new_sig = dict(sig)
+                new_sig["signal"] = "WAIT_SESSION"
+                new_sig["info"] = f"Заблокировано: дневное закрытие ({DAILY_CLOSE_HOUR}:00 UTC+3)"
                 return new_sig
             if self.global_context.get("daily_loss_stop"):
                 new_sig = dict(sig)
@@ -591,9 +962,16 @@ class Core:
                 if last_price >= stop:
                     return {"signal": "EXIT_SL", "side": side, "exit_price": last_price, "info": "Стоп-лосс"}
 
+        # In split mode the broker owns every leg's TP and tp_hit is advanced from
+        # deal history when a leg disappears (see the split watcher in get_signals).
+        # Price polling must NOT advance tp_hit here — the two sources would double
+        # count the same leg (poll sees price beyond TP1, then the closed leg is
+        # detected next tick).
+        _is_split = self._is_split_trade(trade)
+
         # Final TP was already reached earlier but the close failed (trade kept for
         # retry) → re-emit EXIT_TP so the close is retried instead of holding forever.
-        if n_tps > 0 and trade.tp_hit >= n_tps:
+        if n_tps > 0 and trade.tp_hit >= n_tps and not _is_split:
             return {
                 "signal": "EXIT_TP",
                 "side": side,
@@ -608,7 +986,7 @@ class Core:
             tp = float(tps[idx - 1])
             return (last_price >= tp) if side == "LONG" else (last_price <= tp)
 
-        while next_idx <= n_tps and _tp_hit_condition(next_idx):
+        while not _is_split and next_idx <= n_tps and _tp_hit_condition(next_idx):
             tp_price = float(tps[next_idx - 1])
             events.append({"type": "TP", "tp_index": next_idx, "tp_price": tp_price, "hit_price": float(last_price)})
             trade.tp_hit = next_idx
@@ -712,29 +1090,26 @@ class Core:
 
                 if symbol in self.active_trades:
                     trade = self.active_trades[symbol]
+                    # TP events recovered from broker-closed split legs this tick
+                    # (deal-reason based — the authoritative tp_hit source in split mode).
+                    leg_events: List[Dict[str, Any]] = []
 
-                    if self.mt5_executor and (getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)):
-                        split_ids = getattr(trade, "split_position_ids", [])
-                        if split_ids:
-                            # Split mode: check how many legs are still open.
-                            # positions_get() returns None on an API/connection failure and
-                            # an EMPTY tuple when there really are no positions — never
-                            # conflate the two, or a dropped terminal link masquerades as
-                            # "all legs closed" and live positions get forgotten.
-                            import MetaTrader5 as _mt5
-                            open_positions = _mt5.positions_get(symbol=symbol)
-                            query_failed = open_positions is None
-                            open_ids = {p.ticket for p in (open_positions or [])}
-                            still_open = [pid for pid in split_ids if pid in open_ids]
-                            if still_open:
-                                self._broker_missing_counts.pop(symbol, None)
-                                # Update remaining legs list
-                                if len(still_open) < len(split_ids):
-                                    trade.split_position_ids = still_open
-                                    dirty = True
-                            elif self._position_gone_confirmed(symbol, query_failed):
-                                # All legs closed (all TPs hit or SL fired)
-                                self._broker_missing_counts.pop(symbol, None)
+                    if self.mt5_executor and (
+                        self._is_split_trade(trade)
+                        or getattr(trade, "mt5_position_id", None)
+                        or getattr(trade, "mt5_ticket", None)
+                    ):
+                        if self._is_split_trade(trade):
+                            # Shared with the 3-second broker-management job. The
+                            # durable map makes this call idempotent if the fast job
+                            # already consumed a close event.
+                            with self._management_lock:
+                                lifecycle = self._poll_split_lifecycle(
+                                    symbol, trade, last_price=last_price
+                                )
+                            leg_events.extend(lifecycle.get("events") or [])
+                            dirty = dirty or bool(lifecycle.get("changed"))
+                            if lifecycle.get("final"):
                                 manage = {
                                     "signal": "EXIT_BROKER",
                                     "side": trade.side,
@@ -742,7 +1117,9 @@ class Core:
                                     "info": "All split legs closed",
                                     "tf": trade.tf,
                                     "narrative": trade.narrative,
-                                    "events": [{"type": "BROKER_CLOSE", "info": "All split TP legs closed in MT5"}],
+                                    "events": leg_events + [
+                                        {"type": "BROKER_CLOSE", "info": "All split TP legs closed in MT5"}
+                                    ],
                                     "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
                                     "telegram_message_id": getattr(trade, "telegram_message_id", None),
                                 }
@@ -752,14 +1129,21 @@ class Core:
                                 dirty = True
                                 self._log_signal(symbol, manage)
                                 continue
-                            else:
-                                info = (
-                                    "MT5 query failed — keeping trade"
-                                    if query_failed
-                                    else "split legs not visible — awaiting confirmation"
-                                )
-                                print(f"[Core] {symbol} broker check inconclusive: {info}")
-                                results[symbol] = {"signal": "HOLD", "info": info}
+                            if lifecycle.get("query_failed"):
+                                results[symbol] = {
+                                    "signal": "HOLD",
+                                    "info": "MT5 query failed — keeping split trade",
+                                }
+                                continue
+                            if (
+                                lifecycle.get("pending_history")
+                                and not lifecycle.get("visible_open_count")
+                                and not leg_events
+                            ):
+                                results[symbol] = {
+                                    "signal": "HOLD",
+                                    "info": "Split leg disappeared — awaiting broker deal history",
+                                }
                                 continue
                         else:
                             pos_id = trade.mt5_position_id or trade.mt5_ticket
@@ -795,12 +1179,19 @@ class Core:
                     with prof.section("trade_manage"):
                         raw_manage = self._check_active_trade(symbol, last_price, trade)
 
+                    # Surface TP legs closed by the broker this tick (detected via
+                    # deal reasons above) — drives Telegram notifications and the
+                    # break-even move below.
+                    if leg_events:
+                        raw_manage = dict(raw_manage)
+                        raw_manage.setdefault("events", []).extend(leg_events)
+
                     # In split mode the broker owns each leg's SL and TP.
                     # EXIT_SL, EXIT_TP, and EXIT_TIME are all suppressed — the bot waits
                     # for EXIT_BROKER (all split_position_ids disappear from MT5) instead
                     # of sending redundant close orders that would fill at market price
                     # rather than the exact TP/SL levels set on each leg.
-                    _is_split_active = bool(getattr(trade, "split_position_ids", []))
+                    _is_split_active = self._is_split_trade(trade)
                     if _is_split_active and raw_manage.get("signal") in ("EXIT_SL", "EXIT_TP"):
                         raw_manage = dict(raw_manage)
                         raw_manage["signal"] = "HOLD"
@@ -829,11 +1220,28 @@ class Core:
                     # Block all MT5 closes during startup grace period.
                     _in_grace = (time.time() - self._startup_time) < self._startup_grace_sec
                     if _in_grace and self.mt5_executor:
-                        dropped_events = manage.pop("events", None) or []
+                        all_events = list(manage.get("events") or [])
+                        broker_events = [
+                            e for e in all_events
+                            if e.get("source") in {"leg_close", "broker_deal"}
+                        ]
+                        dropped_events = [e for e in all_events if e not in broker_events]
+                        if broker_events:
+                            # These are already-completed broker facts, not close
+                            # intents; retain their one-shot Telegram event in grace.
+                            manage["events"] = broker_events
+                        else:
+                            manage.pop("events", None)
                         # _check_active_trade already advanced tp_hit for these events;
                         # roll it back, otherwise the partial closes (and Telegram
                         # notifications) for those TPs are swallowed forever.
-                        n_tp_events = sum(1 for e in dropped_events if e.get("type") == "TP")
+                        # Leg-close events are excluded: the broker already closed
+                        # those legs — that tp_hit advance is a fact, not an intent.
+                        n_tp_events = sum(
+                            1 for e in dropped_events
+                            if e.get("type") == "TP"
+                            and e.get("source") not in {"leg_close", "broker_deal"}
+                        )
                         if n_tp_events:
                             trade.tp_hit = max(0, int(trade.tp_hit) - n_tp_events)
                             dirty = True
@@ -850,7 +1258,7 @@ class Core:
                             # closes it automatically at the exact price.  Sending an
                             # additional close_trade() here would fill at the current
                             # market price, which is always worse than the broker TP.
-                            if getattr(trade, "split_position_ids", []):
+                            if self._is_split_trade(trade):
                                 continue
                             tp_idx = int(ev.get("tp_index", 0))
                             vol_per_tp = getattr(trade, "volume_per_tp", [])
@@ -891,15 +1299,23 @@ class Core:
                                 {"type": "BE", "price": float(trade.entry)}
                             )
 
-                    # Friday weekend close: hard rule — force exit all positions at
-                    # FRIDAY_CLOSE_HOUR UTC+3. Placed after TP partial-close events and
-                    # after grace period so it always fires.
-                    if self.global_context.get("friday_close") and manage.get("signal") not in ("EXIT_BROKER",):
+                    # Daily/Friday flat close: hard rule — force exit all positions at
+                    # DAILY_CLOSE_HOUR (every day) / FRIDAY_CLOSE_HOUR UTC+3. Placed
+                    # after TP partial-close events and after grace period so it
+                    # always fires.
+                    if (
+                        self.global_context.get("friday_close") or self.global_context.get("daily_close")
+                    ) and manage.get("signal") not in ("EXIT_BROKER",):
+                        _close_label = (
+                            f"Закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
+                            if self.global_context.get("friday_close")
+                            else f"Дневное закрытие ({DAILY_CLOSE_HOUR}:00 UTC+3)"
+                        )
                         manage = dict(manage)
                         manage["signal"] = "EXIT_TIME"
-                        manage["info"] = f"Закрытие перед выходными (пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
+                        manage["info"] = _close_label
                         manage["exit_price"] = float(last_price)
-                        print(f"[Core] {symbol} пятница {FRIDAY_CLOSE_HOUR}:00 UTC+3 — принудительное закрытие позиции")
+                        print(f"[Core] {symbol} {_close_label} — принудительное закрытие позиции")
 
                     if manage.get("signal") in ("EXIT_SL", "EXIT_TP", "EXIT_TIME"):
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
@@ -1034,6 +1450,29 @@ class Core:
                             print(f"[Core] {symbol} anti-hedge block: {len(_opposite)} opposite leg(s) still open in MT5")
                             continue
 
+                    # Correlation guard: same-direction trades on correlated symbols
+                    # (e.g. EURUSD + GBPUSD) double the risk on a single idea.
+                    _corr_partner = None
+                    for _group in CORRELATED_GROUPS:
+                        if symbol.upper() not in _group:
+                            continue
+                        for _other in _group:
+                            if _other == symbol.upper():
+                                continue
+                            _other_trade = self.active_trades.get(_other)
+                            if _other_trade is not None and _other_trade.side == side:
+                                _corr_partner = _other
+                                break
+                        if _corr_partner:
+                            break
+                    if _corr_partner:
+                        sig["signal"] = "SKIP_CORRELATED"
+                        sig["info"] = f"Коррелированный {_corr_partner} уже открыт в ту же сторону ({side})"
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        print(f"[Core] {symbol} correlation block: {_corr_partner} already open {side}")
+                        continue
+
                     tp_prices = sig.get("tp_prices") or [sig.get("tp_price")]
                     tp_prices = [float(x) for x in tp_prices if x is not None]
 
@@ -1085,6 +1524,8 @@ class Core:
                                     tp_prices=tp_prices,
                                     volumes_per_tp=vols,
                                     comment=new_trade.narrative[:20] if new_trade.narrative else None,
+                                    entry_min=sig.get("entry_min"),
+                                    entry_max=sig.get("entry_max"),
                                 )
                                 if not legs:
                                     raise RuntimeError(
@@ -1093,8 +1534,29 @@ class Core:
                                 new_trade.volume = round(sum(l["volume"] for l in legs), 2)
                                 new_trade.volume_remaining = new_trade.volume
                                 new_trade.volume_per_tp = vols
+                                new_trade.split_legs = {}
+                                for leg in legs:
+                                    # position_id is the ticket used by positions_get;
+                                    # order ticket is retained as metadata for audits.
+                                    leg_ticket = leg.get("position_id") or leg.get("ticket")
+                                    if not leg_ticket:
+                                        continue
+                                    new_trade.split_legs[int(leg_ticket)] = {
+                                        "tp_index": int(leg.get("tp_index") or 0),
+                                        "tp": float(leg.get("tp") or 0.0),
+                                        "volume": float(leg.get("volume") or 0.0),
+                                        "order_ticket": int(leg.get("ticket") or 0),
+                                        "status": "open",
+                                    }
                                 new_trade.split_position_ids = [
-                                    l["position_id"] for l in legs if l.get("position_id")
+                                    ticket
+                                    for ticket, _ in sorted(
+                                        new_trade.split_legs.items(),
+                                        key=lambda item: (
+                                            int(item[1].get("tp_index") or 10**6),
+                                            item[0],
+                                        ),
+                                    )
                                 ]
                                 # anchor mt5_position_id to first leg for backward compat
                                 if new_trade.split_position_ids:
@@ -1125,6 +1587,8 @@ class Core:
                                     # are handled by the bot via partial market closes.
                                     tp_price=tp_prices[-1] if tp_prices else None,
                                     comment=new_trade.narrative[:28] if new_trade.narrative else None,
+                                    entry_min=sig.get("entry_min"),
+                                    entry_max=sig.get("entry_max"),
                                 )
                                 new_trade.volume = execution_payload.get("volume", 0.0)
                                 new_trade.volume_remaining = new_trade.volume

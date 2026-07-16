@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import traceback
 from typing import Any, Dict, Optional, List
@@ -61,6 +62,13 @@ class TelegramBot:
 
         # if you had "skipped max_instances" often — set 90/120
         self.poll_sec = 60
+        # Broker lifecycle/BE is latency-sensitive but signal generation is not.
+        # Clamp an operator override to the intentionally supported 1–5s range.
+        try:
+            configured_manage_poll = float(os.getenv("MANAGEMENT_POLL_SEC", "3"))
+        except (TypeError, ValueError):
+            configured_manage_poll = 3.0
+        self.manage_poll_sec = max(1.0, min(5.0, configured_manage_poll))
 
         self._tick_lock = asyncio.Lock()
 
@@ -243,6 +251,30 @@ class TelegramBot:
             except Exception:
                 traceback.print_exc()
 
+    async def _handle_broker_exit(self, app, symbol: str, sig: Dict[str, Any]) -> None:
+        # The final split leg can itself be a TP. Surface that exact mapped TP
+        # before the single terminal broker-close notification.
+        await self._handle_events(app, symbol, sig, meta=sig)
+        px = sig.get("exit_price")
+        px_str = f" @ {_fmt_price(symbol, float(px))}" if px is not None else ""
+        await self._reply(
+            app,
+            symbol,
+            f"♻️ {symbol}: позиция закрыта брокером{px_str}",
+            meta=sig,
+        )
+        try:
+            with self.profiler.section("journal_ingest"):
+                self.journal.ingest_signal(
+                    symbol=symbol,
+                    sig=sig,
+                    telegram_chat_id=self.channel_id,
+                    telegram_message_id=None,
+                    features=None,
+                )
+        except Exception:
+            traceback.print_exc()
+
     async def _post_enter(self, app, symbol: str, sig: Dict[str, Any]) -> None:
         text = self._format_signal(symbol, sig)
 
@@ -318,25 +350,7 @@ class TelegramBot:
                         continue
 
                     if st == "EXIT_BROKER":
-                        px = sig.get("exit_price")
-                        px_str = f" @ {_fmt_price(symbol, float(px))}" if px is not None else ""
-                        await self._reply(
-                            app,
-                            symbol,
-                            f"♻️ {symbol}: позиция закрыта брокером{px_str}",
-                            meta=sig,
-                        )
-                        try:
-                            with self.profiler.section("journal_ingest"):
-                                self.journal.ingest_signal(
-                                    symbol=symbol,
-                                    sig=sig,
-                                    telegram_chat_id=self.channel_id,
-                                    telegram_message_id=None,
-                                    features=None,
-                                )
-                        except Exception:
-                            traceback.print_exc()
+                        await self._handle_broker_exit(app, symbol, sig)
                         continue
 
                     if st == "EXIT_TIME":
@@ -365,6 +379,32 @@ class TelegramBot:
                     traceback.print_exc()
 
             self.profiler.dump(prefix="[Profiler:bot]")
+
+    async def _manage_tick(self, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Fast broker-only pass; shares the lock with the 60s signal tick.
+
+        Core.manage_active_trades() never generates entries or calls AI, so the
+        only messages produced here are one-shot TP/BE lifecycle events and the
+        final EXIT_BROKER (which is journaled exactly once).
+        """
+        if self._tick_lock.locked():
+            return
+        async with self._tick_lock:
+            try:
+                signals = self.core.manage_active_trades()
+            except Exception:
+                traceback.print_exc()
+                return
+
+            app = context.application
+            for symbol, sig in (signals or {}).items():
+                try:
+                    if sig.get("signal") == "HOLD" and sig.get("events"):
+                        await self._handle_events(app, symbol, sig)
+                    elif sig.get("signal") == "EXIT_BROKER":
+                        await self._handle_broker_exit(app, symbol, sig)
+                except Exception:
+                    traceback.print_exc()
 
     # ----------------- commands -----------------
     def _authorized(self, update: Update) -> bool:
@@ -530,6 +570,12 @@ class TelegramBot:
             first=3,
             job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 30},
         )
+        app.job_queue.run_repeating(
+            self._manage_tick,
+            interval=self.manage_poll_sec,
+            first=1,
+            job_kwargs={"max_instances": 1, "coalesce": True, "misfire_grace_time": 5},
+        )
 
         async def _post_startup(_: Any) -> None:
             await self._startup_report(app)
@@ -542,5 +588,8 @@ class TelegramBot:
                 "(/status /open /report /universe) are only accepted from the channel. "
                 "Add your user id to TELEGRAM_ADMIN_IDS in .env to use them in DM."
             )
-        print(f"[TelegramBot] posting to channel_id={self.channel_id} | poll_sec={self.poll_sec}")
+        print(
+            f"[TelegramBot] posting to channel_id={self.channel_id} "
+            f"| signal_poll={self.poll_sec}s | management_poll={self.manage_poll_sec:g}s"
+        )
         app.run_polling(close_loop=False)

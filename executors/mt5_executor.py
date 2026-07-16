@@ -80,7 +80,9 @@ class MT5Executor:
     # public API
     # ------------------------------------------------------------------
     def execute_entry(self, symbol: str, *, side: str, entry_price: float, stop_price: float,
-                      tp_price: Optional[float], comment: Optional[str] = None) -> Dict[str, Any]:
+                      tp_price: Optional[float], comment: Optional[str] = None,
+                      entry_min: Optional[float] = None,
+                      entry_max: Optional[float] = None) -> Dict[str, Any]:
         # Use current tick price for volume calculation — signal price can diverge from real fill
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
@@ -88,7 +90,17 @@ class MT5Executor:
         actual_entry = float(tick.ask if side.upper() == "LONG" else tick.bid)
         volume = self._calc_volume(symbol, actual_entry, stop_price)
 
-        order_result = self._send_order(symbol, side, volume, entry_price, stop_price, tp_price, comment=comment)
+        order_result = self._send_order(
+            symbol,
+            side,
+            volume,
+            entry_price,
+            stop_price,
+            tp_price,
+            comment=comment,
+            entry_min=entry_min,
+            entry_max=entry_max,
+        )
         fill_price = order_result["price"]
         deal_ticket = order_result["deal"]
 
@@ -117,6 +129,8 @@ class MT5Executor:
         tp_prices: List[float],
         volumes_per_tp: List[float],
         comment: Optional[str] = None,
+        entry_min: Optional[float] = None,
+        entry_max: Optional[float] = None,
     ) -> List[Dict[str, Any]]:
         """MK-style partial TP: open N sub-positions, each with its own broker TP.
 
@@ -157,7 +171,15 @@ class MT5Executor:
             leg_comment = f"{(comment or 'Bot')[:20]} TP{i + 1}"
             try:
                 order_result = self._send_order(
-                    symbol, side, vol, entry_price, stop_price, tp, comment=leg_comment
+                    symbol,
+                    side,
+                    vol,
+                    entry_price,
+                    stop_price,
+                    tp,
+                    comment=leg_comment,
+                    entry_min=entry_min,
+                    entry_max=entry_max,
                 )
             except Exception:
                 # Roll back the legs opened so far — a half-opened split entry is not
@@ -219,7 +241,11 @@ class MT5Executor:
         return updated
 
     def close_trade(self, symbol: str, *, position_id: Optional[int], volume: Optional[float]) -> bool:
-        position = self._find_position(symbol, position_id)
+        # A vanished split leg must never fall back to another position for the
+        # same symbol: that could close TP2 while the caller intended the already
+        # closed TP1 ticket. Symbol fallback is retained only for legacy calls
+        # that do not supply a position id.
+        position = self._find_position(symbol, position_id, strict=bool(position_id))
         if position is None:
             self.logger.warning("No MT5 position found for %s (ticket=%s)", symbol, position_id)
             return False
@@ -355,12 +381,13 @@ class MT5Executor:
             self.logger.warning("MT5 reconnect failed: %s", exc)
             return False
 
-    def get_position_close_reason(self, position_id: Optional[int]) -> Optional[str]:
-        """Return 'TP' | 'SL' | None — how a closed position ended, from deal history.
+    def get_position_close_info(self, position_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        """Return the latest broker exit deal for a position, or ``None``.
 
-        Split mode has no EXIT_TP/EXIT_SL signals (the broker closes each leg),
-        so the outcome for journaling/AI stats is recovered from the closing
-        deal's reason code.
+        Position disappearance and deal-history publication are not atomic in
+        MT5. Callers therefore distinguish ``None`` (history not visible yet)
+        from an exit whose reason is not TP/SL. The returned mapping contains
+        only JSON-safe primitives so it can be copied into persisted trade state.
         """
         if not position_id:
             return None
@@ -370,18 +397,79 @@ class MT5Executor:
             return None
         if not deals:
             return None
-        reason_map = {
-            int(getattr(mt5, "DEAL_REASON_SL", 4)): "SL",
-            int(getattr(mt5, "DEAL_REASON_TP", 5)): "TP",
+        reason_map = {}
+        for constant, label in (
+            ("DEAL_REASON_CLIENT", "MANUAL"),
+            ("DEAL_REASON_MOBILE", "MOBILE"),
+            ("DEAL_REASON_WEB", "WEB"),
+            ("DEAL_REASON_EXPERT", "EXPERT"),
+            ("DEAL_REASON_SL", "SL"),
+            ("DEAL_REASON_TP", "TP"),
+            ("DEAL_REASON_SO", "STOP_OUT"),
+            ("DEAL_REASON_ROLLOVER", "ROLLOVER"),
+            ("DEAL_REASON_VMARGIN", "VMARGIN"),
+            ("DEAL_REASON_SPLIT", "SPLIT"),
+            ("DEAL_REASON_CORPORATE_ACTION", "CORPORATE_ACTION"),
+        ):
+            value = getattr(mt5, constant, None)
+            if value is not None:
+                reason_map[int(value)] = label
+
+        exit_entries = {int(getattr(mt5, "DEAL_ENTRY_OUT", 1))}
+        for constant in ("DEAL_ENTRY_OUT_BY", "DEAL_ENTRY_INOUT"):
+            value = getattr(mt5, constant, None)
+            if value is not None:
+                exit_entries.add(int(value))
+
+        exit_deals = [
+            deal for deal in deals
+            if int(getattr(deal, "entry", -1)) in exit_entries
+        ]
+        if not exit_deals:
+            return None
+        deal = max(
+            exit_deals,
+            key=lambda d: (
+                int(getattr(d, "time_msc", 0) or 0),
+                int(getattr(d, "time", 0) or 0),
+                int(getattr(d, "ticket", 0) or 0),
+            ),
+        )
+        reason_code = int(getattr(deal, "reason", -1))
+        return {
+            "reason": reason_map.get(reason_code, "OTHER"),
+            "reason_code": reason_code,
+            "deal_ticket": int(getattr(deal, "ticket", 0) or 0),
+            "price": float(getattr(deal, "price", 0.0) or 0.0),
+            "volume": float(getattr(deal, "volume", 0.0) or 0.0),
+            "profit": float(getattr(deal, "profit", 0.0) or 0.0),
+            "commission": float(getattr(deal, "commission", 0.0) or 0.0),
+            "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+            "time": int(getattr(deal, "time", 0) or 0),
+            "time_msc": int(getattr(deal, "time_msc", 0) or 0),
         }
-        entry_out = int(getattr(mt5, "DEAL_ENTRY_OUT", 1))
-        for deal in deals:
-            if int(getattr(deal, "entry", -1)) != entry_out:
-                continue
-            reason = reason_map.get(int(getattr(deal, "reason", -1)))
-            if reason:
-                return reason
+
+    def get_position_close_reason(self, position_id: Optional[int]) -> Optional[str]:
+        """Backward-compatible TP/SL-only view of ``get_position_close_info``."""
+        info = self.get_position_close_info(position_id)
+        if info and info.get("reason") in {"TP", "SL"}:
+            return str(info["reason"])
         return None
+
+    def get_open_position_ids(self, symbol: str) -> Optional[set[int]]:
+        """Return this strategy's open tickets, or ``None`` on an MT5 query failure."""
+        try:
+            positions = mt5.positions_get(symbol=symbol)
+        except Exception:
+            return None
+        if positions is None:
+            return None
+        return {
+            int(getattr(pos, "ticket", 0) or 0)
+            for pos in positions
+            if int(getattr(pos, "ticket", 0) or 0) > 0
+            and getattr(pos, "magic", None) == self.settings.magic
+        }
 
     def _calc_volume(self, symbol: str, entry_price: float, stop_price: float) -> float:
         info = mt5.symbol_info(symbol)
@@ -453,7 +541,9 @@ class MT5Executor:
 
     def _send_order(self, symbol: str, side: str, volume: float,
                     planned_entry: float,
-                    stop_price: Optional[float], tp_price: Optional[float], comment: Optional[str]) -> Dict[str, Any]:
+                    stop_price: Optional[float], tp_price: Optional[float], comment: Optional[str],
+                    *, entry_min: Optional[float] = None,
+                    entry_max: Optional[float] = None) -> Dict[str, Any]:
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise RuntimeError(f"No tick data for {symbol}")
@@ -464,6 +554,25 @@ class MT5Executor:
         is_buy = side.upper() == "LONG"
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         price = tick.ask if is_buy else tick.bid
+        current_spread = abs(float(tick.ask) - float(tick.bid))
+
+        # The strategy calculates SL/TP from the worst edge of its entry zone.
+        # Enforce that zone at execution time so a delayed market order cannot
+        # silently turn a validated setup into a materially different trade.
+        if entry_min is not None or entry_max is not None:
+            lower = float(entry_min) if entry_min is not None else float("-inf")
+            upper = float(entry_max) if entry_max is not None else float("inf")
+            if lower > upper:
+                raise RuntimeError(
+                    f"Invalid entry range for {symbol}: {lower:.5f} > {upper:.5f}"
+                )
+            entry_tolerance = max(current_spread, point)
+            if price < lower - entry_tolerance or price > upper + entry_tolerance:
+                raise RuntimeError(
+                    f"Stale signal rejected for {symbol}: execution price {price:.5f} "
+                    f"outside entry range [{lower:.5f}, {upper:.5f}] "
+                    f"(spread tolerance {entry_tolerance:.5f})"
+                )
         # TP levels from signals are absolute technical levels — do NOT shift them
         # relative to the actual fill price (that was the root cause of TP drift).
         stops_level = 0
@@ -495,17 +604,18 @@ class MT5Executor:
         if tp_price is not None:
             if is_buy:
                 if tp_price <= price:
-                    # TP below current ask — mirror SL distance on the other side
-                    risk = (price - stop_price) if stop_price else min_gap * 10
-                    tp_price = price + max(risk, min_gap)
-                else:
-                    tp_price = max(tp_price, price + min_gap)
+                    raise RuntimeError(
+                        f"Stale signal rejected for {symbol}: LONG target {tp_price:.5f} "
+                        f"already reached by execution price {price:.5f}"
+                    )
+                tp_price = max(tp_price, price + min_gap)
             else:
                 if tp_price >= price:
-                    risk = (stop_price - price) if stop_price else min_gap * 10
-                    tp_price = price - max(risk, min_gap)
-                else:
-                    tp_price = min(tp_price, price - min_gap)
+                    raise RuntimeError(
+                        f"Stale signal rejected for {symbol}: SHORT target {tp_price:.5f} "
+                        f"already reached by execution price {price:.5f}"
+                    )
+                tp_price = min(tp_price, price - min_gap)
 
         # Reject stale signals where price has moved too close to SL or already through it.
         # Use the ORIGINAL signal SL (pre-clamp) so the distance ratio reflects the true setup.

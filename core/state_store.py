@@ -43,6 +43,13 @@ def save_active_trades(active_trades: Dict[str, Any], path: Path) -> None:
             # Split-mode legs — CRITICAL: without this, bot loses split mode on restart
             # and tries to manage SL/TP manually instead of letting the broker handle them.
             "split_position_ids": list(getattr(tr, "split_position_ids", []) or []),
+            # Full ticket -> TP metadata/lifecycle map. JSON object keys are strings;
+            # load_active_trades normalizes them back to int position tickets.
+            "split_legs": {
+                str(int(ticket)): dict(meta or {})
+                for ticket, meta in (getattr(tr, "split_legs", {}) or {}).items()
+                if ticket is not None
+            },
 
             # BE state — persisted so restarts don't move the stop twice
             "moved_to_be": bool(getattr(tr, "moved_to_be", False)),
@@ -85,6 +92,36 @@ def load_active_trades(path: Path) -> Dict[str, Any]:
             tr.volume_per_tp = [float(v) for v in (d.get("volume_per_tp") or [])]
             tr.volume_remaining = float(d.get("volume_remaining") or 0.0)
             tr.split_position_ids = [int(x) for x in (d.get("split_position_ids") or [])]
+            raw_legs = d.get("split_legs") or {}
+            tr.split_legs = {
+                int(ticket): dict(meta or {})
+                for ticket, meta in raw_legs.items()
+                if ticket is not None
+            }
+            # Backward compatibility for state written before split_legs existed.
+            # split_position_ids kept its TP order, while tp_hit tells us how many
+            # leading TP legs had already disappeared.
+            if not tr.split_legs and tr.split_position_ids:
+                start_idx = max(1, tr.tp_hit + 1)
+                for offset, ticket in enumerate(tr.split_position_ids):
+                    tp_index = start_idx + offset
+                    tr.split_legs[int(ticket)] = {
+                        "tp_index": tp_index,
+                        "tp": (
+                            float(tr.tp_prices[tp_index - 1])
+                            if tp_index <= len(tr.tp_prices)
+                            else None
+                        ),
+                        "volume": (
+                            float(tr.volume_per_tp[tp_index - 1])
+                            if tp_index <= len(tr.volume_per_tp)
+                            else 0.0
+                        ),
+                        "status": "open",
+                        # Startup MT5 hydration can replace this ordered-list
+                        # inference with the exact TP/comment from the broker.
+                        "legacy_inferred": True,
+                    }
             tr.moved_to_be = bool(d.get("moved_to_be", False))
             restored[symbol] = tr
         except Exception:
