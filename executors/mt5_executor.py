@@ -150,9 +150,37 @@ class MT5Executor:
         if vol_min <= 0:
             vol_min = 0.01
 
+        # Merge sub-minimum allocations toward the *nearest* target. Carrying
+        # them forward would leave tiny setups with only TP3, which lowers the
+        # chance of realizing any win. Reverse merging yields TP1-only when the
+        # broker minimum permits just one leg.
+        normalized_volumes = [max(0.0, float(value)) for value in volumes_per_tp]
+        for idx in range(len(normalized_volumes) - 1, 0, -1):
+            if 0 < normalized_volumes[idx] < vol_min:
+                normalized_volumes[idx - 1] += normalized_volumes[idx]
+                normalized_volumes[idx] = 0.0
+        normalized_volumes = [round(value, 8) for value in normalized_volumes]
+
         results: List[Dict[str, Any]] = []
+
+        def _rollback_opened_legs() -> None:
+            for opened in results:
+                pid = opened.get("position_id")
+                try:
+                    closed = self.close_trade(symbol, position_id=pid, volume=None)
+                    if not closed:
+                        raise RuntimeError("broker did not confirm close")
+                    self.logger.warning(
+                        "Split entry rollback: closed leg position_id=%s", pid,
+                    )
+                except Exception as rollback_exc:
+                    self.logger.error(
+                        "Split entry rollback FAILED for position %s: %s — orphaned leg!",
+                        pid, rollback_exc,
+                    )
+
         carry = 0.0  # volume from legs too small to open, merged into the next leg
-        for i, (vol, tp) in enumerate(zip(volumes_per_tp, tp_prices)):
+        for i, (vol, tp) in enumerate(zip(normalized_volumes, tp_prices)):
             vol = round(vol + carry, 8)
             carry = 0.0
             if vol <= 0:
@@ -184,31 +212,33 @@ class MT5Executor:
             except Exception:
                 # Roll back the legs opened so far — a half-opened split entry is not
                 # registered in active_trades and would be orphaned in the market.
-                for r in results:
-                    try:
-                        self.close_trade(symbol, position_id=r.get("position_id"), volume=None)
-                        self.logger.warning(
-                            "Split entry rollback: closed leg position_id=%s", r.get("position_id"),
-                        )
-                    except Exception as rollback_exc:
-                        self.logger.error(
-                            "Split entry rollback FAILED for position %s: %s — orphaned leg!",
-                            r.get("position_id"), rollback_exc,
-                        )
+                _rollback_opened_legs()
                 raise
             deal_ticket = order_result["deal"]
-            position_id = self._find_position_id_from_deal(deal_ticket)
-            if position_id is None:
-                # In hedging mode we may have multiple positions — pick the newest one
-                import time as _t
-                _t.sleep(0.05)
+            position_id: Optional[int] = None
+            # Deal/position visibility can lag order_send under Wine. Poll for a
+            # bounded period, but never substitute the order ticket: in hedging
+            # mode it is not a position id and would orphan lifecycle management.
+            import time as _t
+            for _ in range(10):
+                position_id = self._find_position_id_from_deal(deal_ticket)
+                if position_id is not None:
+                    break
                 positions = mt5.positions_get(symbol=symbol)
                 if positions:
                     own = [p for p in positions if p.magic == self.settings.magic]
                     already_known = {r["position_id"] for r in results if r.get("position_id")}
                     fresh = [p for p in own if p.ticket not in already_known]
                     if fresh:
-                        position_id = fresh[-1].ticket
+                        position_id = int(fresh[-1].ticket)
+                        break
+                _t.sleep(0.1)
+            if position_id is None:
+                _rollback_opened_legs()
+                raise RuntimeError(
+                    f"Split entry leg TP{i + 1} filled (deal={deal_ticket}) but exact "
+                    "MT5 position_id was not published; refusing an untrackable setup"
+                )
             results.append({
                 "ticket": order_result["ticket"],
                 "position_id": position_id,
@@ -298,26 +328,52 @@ class MT5Executor:
             )
             return False
 
-        # Enforce broker minimum stop distance so we never send "Invalid stops".
+        # Never weaken an existing stop. This also makes retries idempotent when
+        # one leg was updated before another leg failed.
+        current_stop = float(getattr(position, "sl", 0.0) or 0.0)
+        is_buy = position.type == mt5.POSITION_TYPE_BUY
+
+        # Require the requested BE level itself to be broker-valid. Clamping it
+        # after a retrace would silently turn break-even into a loss and prevent
+        # future retries once Core sets moved_to_be=True.
         tick = mt5.symbol_info_tick(symbol)
         info = mt5.symbol_info(symbol)
         if tick is not None and info is not None:
             point = float(getattr(info, "point", 0.0) or getattr(info, "tick_size", 0.0) or 0.0)
             if point > 0:
+                epsilon = point * 0.5
+                if current_stop > 0:
+                    already_protected = (
+                        current_stop >= new_stop - epsilon
+                        if is_buy
+                        else current_stop <= new_stop + epsilon
+                    )
+                    if already_protected:
+                        return True
                 stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
                 spread_pts = int(getattr(info, "spread", 0) or 0)
                 freeze_level = int(getattr(info, "trade_freeze_level", 0) or 0)
                 min_gap = float(max(stops_level, spread_pts, freeze_level, 1) * point)
                 if stops_level == 0 and spread_pts > 0:
                     min_gap = max(min_gap, float(spread_pts * 2 * point))
-                is_buy = position.type == mt5.POSITION_TYPE_BUY
                 ref_price = float(tick.bid if is_buy else tick.ask)
-                if is_buy:
-                    # SL must be below bid by at least min_gap
-                    new_stop = min(new_stop, ref_price - min_gap)
-                else:
-                    # SL must be above ask by at least min_gap
-                    new_stop = max(new_stop, ref_price + min_gap)
+                invalid_for_market = (
+                    new_stop > ref_price - min_gap
+                    if is_buy
+                    else new_stop < ref_price + min_gap
+                )
+                if invalid_for_market:
+                    self.logger.info(
+                        "move_stop: requested BE %.5f is inside broker gap for %s "
+                        "(reference %.5f, min_gap %.5f) — retrying later",
+                        new_stop, symbol, ref_price, min_gap,
+                    )
+                    return False
+
+        if current_stop > 0:
+            would_weaken = current_stop >= new_stop if is_buy else current_stop <= new_stop
+            if would_weaken:
+                return True
 
         request = {
             "action": mt5.TRADE_ACTION_SLTP,
@@ -436,15 +492,34 @@ class MT5Executor:
             ),
         )
         reason_code = int(getattr(deal, "reason", -1))
+        total_volume = sum(float(getattr(item, "volume", 0.0) or 0.0) for item in exit_deals)
+        weighted_price = sum(
+            float(getattr(item, "price", 0.0) or 0.0)
+            * float(getattr(item, "volume", 0.0) or 0.0)
+            for item in exit_deals
+        )
+        # Monetary result belongs to the whole position lifecycle. Brokers often
+        # charge entry commission on DEAL_ENTRY_IN and exit commission/fee on
+        # DEAL_ENTRY_OUT; summing only exit deals overstates every setup.
+        profit = sum(float(getattr(item, "profit", 0.0) or 0.0) for item in deals)
+        commission = sum(float(getattr(item, "commission", 0.0) or 0.0) for item in deals)
+        swap = sum(float(getattr(item, "swap", 0.0) or 0.0) for item in deals)
+        fee = sum(float(getattr(item, "fee", 0.0) or 0.0) for item in deals)
         return {
             "reason": reason_map.get(reason_code, "OTHER"),
             "reason_code": reason_code,
             "deal_ticket": int(getattr(deal, "ticket", 0) or 0),
-            "price": float(getattr(deal, "price", 0.0) or 0.0),
-            "volume": float(getattr(deal, "volume", 0.0) or 0.0),
-            "profit": float(getattr(deal, "profit", 0.0) or 0.0),
-            "commission": float(getattr(deal, "commission", 0.0) or 0.0),
-            "swap": float(getattr(deal, "swap", 0.0) or 0.0),
+            "price": (
+                weighted_price / total_volume
+                if total_volume > 0
+                else float(getattr(deal, "price", 0.0) or 0.0)
+            ),
+            "volume": total_volume,
+            "profit": profit,
+            "commission": commission,
+            "swap": swap,
+            "fee": fee,
+            "net": profit + commission + swap + fee,
             "time": int(getattr(deal, "time", 0) or 0),
             "time_msc": int(getattr(deal, "time_msc", 0) or 0),
         }

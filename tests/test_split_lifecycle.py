@@ -97,8 +97,12 @@ def test_mapping_preserves_exact_tp_index_and_event_is_idempotent():
     core = _core(executor, trade)
 
     first = core._poll_split_lifecycle("EURUSD", trade, last_price=1.0500)
+    assert first["events"] == []
+    assert trade.split_legs[101]["status"] == "pending_close_confirmation"
 
-    assert first["events"] == [
+    second = core._poll_split_lifecycle("EURUSD", trade, last_price=1.0500)
+
+    assert second["events"] == [
         {
             "type": "TP",
             "tp_index": 1,
@@ -113,8 +117,8 @@ def test_mapping_preserves_exact_tp_index_and_event_is_idempotent():
     assert trade.split_position_ids == [102]
     assert trade.split_legs[101]["status"] == "closed"
 
-    second = core._poll_split_lifecycle("EURUSD", trade, last_price=1.0600)
-    assert second["events"] == []
+    third = core._poll_split_lifecycle("EURUSD", trade, last_price=1.0600)
+    assert third["events"] == []
     assert trade.tp_hit == 1
 
 
@@ -152,7 +156,7 @@ def test_delayed_deal_history_retries_then_moves_be_after_retrace(monkeypatch):
     trade = _trade(201, 202)
     executor = FakeExecutor(
         open_ids={202},
-        close_info={201: [None, _tp_close()]},
+        close_info={201: [None, _tp_close(), _tp_close()]},
     )
     core = _core(executor, trade)
     monkeypatch.setattr(main, "MOVE_BE_AFTER_TP1", True)
@@ -162,6 +166,7 @@ def test_delayed_deal_history_retries_then_moves_be_after_retrace(monkeypatch):
     assert trade.split_legs[201]["status"] == "pending_history"
     assert trade.moved_to_be is False
 
+    assert core.manage_active_trades() == {}
     signals = core.manage_active_trades()
 
     assert [event["type"] for event in signals["EURUSD"]["events"]] == ["TP", "BE"]
@@ -182,6 +187,8 @@ def test_final_broker_exit_is_emitted_once(monkeypatch):
     core._log_signal = lambda *args, **kwargs: None
     monkeypatch.setattr(main, "save_active_trades", lambda *args, **kwargs: None)
 
+    assert core.manage_active_trades() == {}
+
     first = core.manage_active_trades()
     assert first["EURUSD"]["signal"] == "HOLD"
     assert [event["type"] for event in first["EURUSD"]["events"]] == ["TP"]
@@ -193,3 +200,49 @@ def test_final_broker_exit_is_emitted_once(monkeypatch):
 
     assert core.manage_active_trades() == {}
     assert registered == ["EURUSD"]
+
+
+def test_reappearing_ticket_cancels_pending_close_confirmation():
+    trade = _trade(401)
+    executor = FakeExecutor(open_ids=set(), close_info={401: _tp_close()})
+    core = _core(executor, trade)
+
+    first = core._poll_split_lifecycle("EURUSD", trade)
+    assert first["events"] == []
+    assert trade.split_legs[401]["status"] == "pending_close_confirmation"
+
+    executor.open_ids = {401}
+    second = core._poll_split_lifecycle("EURUSD", trade)
+
+    assert second["events"] == []
+    assert trade.split_legs[401]["status"] == "open"
+    assert trade.split_position_ids == [401]
+    assert trade.tp_hit == 0
+
+
+def test_partial_exit_volume_is_not_consumed_as_closed_leg():
+    trade = _trade(501)
+    partial = _tp_close()
+    partial["volume"] = 0.04
+    executor = FakeExecutor(open_ids=set(), close_info={501: partial})
+    core = _core(executor, trade)
+
+    for _ in range(3):
+        result = core._poll_split_lifecycle("EURUSD", trade)
+        assert result["events"] == []
+
+    assert trade.split_legs[501]["status"] == "pending_history"
+    assert trade.split_position_ids == [501]
+
+
+def test_partial_be_success_keeps_retry_enabled(monkeypatch):
+    trade = _trade(601, 602)
+    trade.tp_hit = 1
+    executor = FakeExecutor(open_ids={601, 602}, close_info={})
+    executor.move_stop_all = lambda *args, **kwargs: 1
+    core = _core(executor, trade)
+    monkeypatch.setattr(main, "MOVE_BE_AFTER_TP1", True)
+
+    assert core._move_to_breakeven("EURUSD", trade) is False
+    assert trade.moved_to_be is False
+    assert trade.stop == 0.95

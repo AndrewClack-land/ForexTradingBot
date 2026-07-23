@@ -106,6 +106,9 @@ SYMBOL_DECIMALS = {
 
 # ================== ORDERBLOCK SETTINGS ==================
 ORDERBLOCK_ENTRY_ENABLED = os.getenv("ORDERBLOCK_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
+REJECTION_BLOCK_ENTRY_ENABLED = os.getenv(
+    "REJECTION_BLOCK_ENTRY_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
 ORDERBLOCK_TOUCH_ATR_K = _env_float("ORDERBLOCK_TOUCH_ATR_K", 0.15)
 ORDERBLOCK_TOUCH_MIN_ABS = _env_float("ORDERBLOCK_TOUCH_MIN_ABS", 0.0005)
 ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
@@ -138,8 +141,14 @@ FRIDAY_CLOSE_HOUR = _env_int("FRIDAY_CLOSE_HOUR") or 21
 # ================== DAILY FLAT CLOSE ==================
 # Every day at/after this hour (Europe/Moscow, UTC+3 no DST) the bot blocks
 # new entries and force-closes all open positions — no positions held past
-# this time. Trading resumes with the next day's allowed sessions.
-DAILY_CLOSE_HOUR = _env_int("DAILY_CLOSE_HOUR") or 21
+# this time. This experiment is opt-in; it must not silently change an existing
+# VPS schedule just because the code was upgraded.
+DAILY_FLAT_ENABLED = os.getenv("DAILY_FLAT_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+_daily_close_hour = _env_int("DAILY_CLOSE_HOUR")
+DAILY_CLOSE_HOUR = _daily_close_hour if _daily_close_hour is not None and 0 <= _daily_close_hour <= 23 else 21
+DAILY_CLOSE_BUFFER_MIN = max(0, min(180, _env_int("DAILY_CLOSE_BUFFER_MIN") or 30))
 
 # ================== CORRELATION GUARD ==================
 # Groups of correlated symbols: while one symbol of a group has an open trade,
@@ -148,7 +157,7 @@ DAILY_CLOSE_HOUR = _env_int("DAILY_CLOSE_HOUR") or 21
 # Format: "EURUSD+GBPUSD,AUDUSD+NZDUSD"
 CORRELATED_GROUPS = [
     [s.strip().upper() for s in grp.split("+") if s.strip()]
-    for grp in os.getenv("CORRELATED_GROUPS", "EURUSD+GBPUSD").split(",")
+    for grp in os.getenv("CORRELATED_GROUPS", "").split(",")
     if grp.strip()
 ]
 

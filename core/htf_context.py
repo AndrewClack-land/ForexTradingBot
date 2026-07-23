@@ -249,15 +249,20 @@ class OrderBlockTracker:
                         loc = idx
                 bullish.insert(0, OrderBlock(side="LONG", top=float(maxima), bottom=float(minima), created_idx=loc))
 
-            if top_crossed and close[i] < min_arr[i]:
-                for ob in bullish:
-                    if not ob.breaker:
-                        ob.breaker = True
-                        ob.breaker_idx = i
-                        ob.breaker_price = float(close[i])
-                    elif close[i] > ob.top:
-                        bullish.remove(ob)
-                top_crossed = False
+            if top_crossed:
+                active_bull = next((ob for ob in bullish if not ob.breaker), None)
+                if active_bull is not None and close[i] < active_bull.bottom:
+                    active_bull.breaker = True
+                    active_bull.breaker_idx = i
+                    active_bull.breaker_price = float(close[i])
+                    top_crossed = False
+
+            # A bullish OB broken down becomes a historical breaker zone. Once
+            # price subsequently closes back above its top, the zone is spent.
+            bullish = [
+                ob for ob in bullish
+                if not (ob.breaker and close[i] > ob.top)
+            ]
 
             # Detect bearish OB when price crosses swing low
             if not bot_crossed and close[i] < np.min(window_low[:-1]):
@@ -275,17 +280,24 @@ class OrderBlockTracker:
                         loc = idx
                 bearish.insert(0, OrderBlock(side="SHORT", top=float(maxima), bottom=float(minima), created_idx=loc))
 
-            if bot_crossed and close[i] > max_arr[i]:
-                for ob in bearish:
-                    if not ob.breaker:
-                        ob.breaker = True
-                        ob.breaker_idx = i
-                        ob.breaker_price = float(close[i])
-                    elif close[i] < ob.bottom:
-                        bearish.remove(ob)
-                bot_crossed = False
+            if bot_crossed:
+                active_bear = next((ob for ob in bearish if not ob.breaker), None)
+                if active_bear is not None and close[i] > active_bear.top:
+                    active_bear.breaker = True
+                    active_bear.breaker_idx = i
+                    active_bear.breaker_price = float(close[i])
+                    bot_crossed = False
 
-        return (bullish[: self.show_last] if bullish else []) + (bearish[: self.show_last] if bearish else [])
+            bearish = [
+                ob for ob in bearish
+                if not (ob.breaker and close[i] < ob.bottom)
+            ]
+
+        # Do not concatenate LONG before SHORT: callers that inspect the first
+        # zone would otherwise acquire a permanent bullish bias. Keep the most
+        # recent zones from both sides in one chronological ordering.
+        blocks = bullish[: self.show_last] + bearish[: self.show_last]
+        return sorted(blocks, key=lambda ob: ob.created_idx, reverse=True)
 
 
 class RejectionBlockTracker:

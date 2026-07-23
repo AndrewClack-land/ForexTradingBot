@@ -108,3 +108,38 @@ def test_execute_entry_forwards_entry_zone(monkeypatch):
     assert captured["entry_min"] == 1.0995
     assert captured["entry_max"] == 1.1005
     assert result["position_id"] == 55
+
+
+def test_split_subminimum_volumes_are_merged_into_tp1(monkeypatch):
+    executor = _executor()
+    executor.settings = SimpleNamespace(magic=123)
+    executor.logger = SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        mt5_executor.mt5,
+        "symbol_info",
+        lambda symbol: SimpleNamespace(volume_min=0.1),
+    )
+    sent = []
+
+    def fake_send(symbol, side, volume, entry, stop, tp, comment, **kwargs):
+        sent.append((volume, tp))
+        return {"ticket": 10, "deal": 20, "price": entry}
+
+    executor._send_order = fake_send
+    executor._find_position_id_from_deal = lambda deal: 30
+
+    legs = executor.execute_split_entry(
+        "EURUSD",
+        side="LONG",
+        entry_price=1.0,
+        stop_price=0.9,
+        tp_prices=[1.1, 1.2, 1.3],
+        volumes_per_tp=[0.05, 0.03, 0.02],
+    )
+
+    assert sent == [(0.1, 1.1)]
+    assert legs[0]["tp_index"] == 1

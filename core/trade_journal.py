@@ -5,6 +5,7 @@ import json
 import os
 import sqlite3
 import threading
+import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -68,6 +69,21 @@ class TradeRow:
     stop_current: Optional[float] = None
     ts_update: Optional[str] = None
 
+    # setup-level attribution and broker-authoritative result
+    setup_id: Optional[str] = None
+    strategy_version: Optional[str] = None
+    experiment_id: Optional[str] = None
+    experiment_variant: Optional[str] = None
+    deployment_id: Optional[str] = None
+    planned_entry: Optional[float] = None
+    execution_mode: Optional[str] = None
+    total_volume: Optional[float] = None
+    weighted_rr_planned: Optional[float] = None
+    exit_signal: Optional[str] = None
+    realized_net: Optional[float] = None
+    pnl_complete: bool = False
+    close_meta_json: Optional[str] = None
+
 
 class TradeJournal:
     """
@@ -85,11 +101,30 @@ class TradeJournal:
         csv_path: Optional[str] = None,
         parquet_path: Optional[str] = None,
         export_on_each_event: bool = True,
+        strategy_version: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+        experiment_variant: Optional[str] = None,
+        deployment_id: Optional[str] = None,
     ):
         self.db_path = Path(db_path)
         self.csv_path = Path(csv_path) if csv_path else None
         self.parquet_path = Path(parquet_path) if parquet_path else None
         self.export_on_each_event = export_on_each_event
+        # Explicit release tags are deliberately not derived from git: the VPS
+        # can run a verified but uncommitted deployment. Old rows stay NULL;
+        # only setups opened by this journal instance receive current tags.
+        self.strategy_version = str(
+            strategy_version or os.getenv("STRATEGY_VERSION", "unversioned")
+        ).strip() or "unversioned"
+        self.experiment_id = str(
+            experiment_id or os.getenv("STRATEGY_EXPERIMENT_ID", "")
+        ).strip()
+        self.experiment_variant = str(
+            experiment_variant or os.getenv("STRATEGY_EXPERIMENT_VARIANT", "")
+        ).strip()
+        self.deployment_id = str(
+            deployment_id or os.getenv("DEPLOYMENT_ID", "")
+        ).strip()
 
         _ensure_dir(self.db_path)
         if self.csv_path:
@@ -150,7 +185,22 @@ class TradeJournal:
                     tp_hit INTEGER DEFAULT 0,
                     moved_to_be INTEGER DEFAULT 0,
                     stop_current REAL,
-                    ts_update TEXT
+                    ts_update TEXT,
+
+                    -- One row is one executed setup (never one split leg).
+                    setup_id TEXT,
+                    strategy_version TEXT,
+                    experiment_id TEXT,
+                    experiment_variant TEXT,
+                    deployment_id TEXT,
+                    planned_entry REAL,
+                    execution_mode TEXT,
+                    total_volume REAL,
+                    weighted_rr_planned REAL,
+                    exit_signal TEXT,
+                    realized_net REAL,
+                    pnl_complete INTEGER DEFAULT 0,
+                    close_meta_json TEXT
                 );
                 """
             )
@@ -192,10 +242,27 @@ class TradeJournal:
                 "moved_to_be": "INTEGER DEFAULT 0",
                 "stop_current": "REAL",
                 "ts_update": "TEXT",
+
+                "setup_id": "TEXT",
+                "strategy_version": "TEXT",
+                "experiment_id": "TEXT",
+                "experiment_variant": "TEXT",
+                "deployment_id": "TEXT",
+                "planned_entry": "REAL",
+                "execution_mode": "TEXT",
+                "total_volume": "REAL",
+                "weighted_rr_planned": "REAL",
+                "exit_signal": "TEXT",
+                "realized_net": "REAL",
+                "pnl_complete": "INTEGER DEFAULT 0",
+                "close_meta_json": "TEXT",
             }
             for col, ddl in needed.items():
                 if not self._column_exists("trades", col):
                     self._conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {ddl};")
+            self._conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_trades_setup_id ON trades(setup_id);"
+            )
             self._conn.commit()
 
     # ----------------- helpers -----------------
@@ -214,6 +281,19 @@ class TradeJournal:
             )
             row = cur.fetchone()
             return int(row["id"]) if row else None
+
+    @staticmethod
+    def _optional_float(value: Any) -> Optional[float]:
+        if value is None:
+            return None
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        # NaN/inf must not poison aggregate metrics or exported datasets.
+        if number != number or number in (float("inf"), float("-inf")):
+            return None
+        return number
 
     @staticmethod
     def _tp_prices_from_sig(sig: Dict[str, Any]) -> List[float]:
@@ -303,6 +383,8 @@ class TradeJournal:
                 symbol=symbol,
                 exit=float(exit_price),
                 outcome=outcome,
+                exit_signal=str(st),
+                close_meta=sig,
                 telegram_chat_id_close=telegram_chat_id,
                 telegram_message_id_close=telegram_message_id,
             )
@@ -335,9 +417,58 @@ class TradeJournal:
         ts_open = _utc_now_iso()
         with self._lock:
             # защита от дубля
-            existing_id = self._find_last_open_trade_id(symbol)
-            if existing_id is not None:
-                return
+            meta = dict(meta or {})
+            requested_setup_id = str(meta.get("setup_id") or "").strip()
+            if requested_setup_id:
+                duplicate = self._conn.execute(
+                    "SELECT id FROM trades WHERE setup_id = ? LIMIT 1;",
+                    (requested_setup_id,),
+                ).fetchone()
+                if duplicate is not None:
+                    return
+            else:
+                # Legacy callers have no stable identity; retain their original
+                # symbol-level duplicate guard. Current Core always supplies id.
+                existing_id = self._find_last_open_trade_id(symbol)
+                if existing_id is not None:
+                    return
+
+            execution = meta.get("execution")
+            execution = execution if isinstance(execution, dict) else {}
+            legs = execution.get("legs")
+            legs = legs if isinstance(legs, list) else []
+            total_volume = self._optional_float(execution.get("volume"))
+            if total_volume is None and legs:
+                leg_volumes = [
+                    self._optional_float(leg.get("volume"))
+                    for leg in legs
+                    if isinstance(leg, dict)
+                ]
+                known_volumes = [value for value in leg_volumes if value is not None]
+                total_volume = sum(known_volumes) if known_volumes else None
+            execution_mode = str(execution.get("mode") or "").strip()
+            if not execution_mode and execution:
+                execution_mode = "split" if legs else "monitor"
+
+            setup_id = requested_setup_id or uuid.uuid4().hex
+            strategy_version = str(
+                meta.get("strategy_version") or self.strategy_version
+            ).strip() or "unversioned"
+            experiment_id = str(
+                meta.get("experiment_id") or self.experiment_id
+            ).strip()
+            experiment_variant = str(
+                meta.get("experiment_variant") or self.experiment_variant
+            ).strip()
+            deployment_id = str(
+                meta.get("deployment_id") or self.deployment_id
+            ).strip()
+            planned_entry = self._optional_float(
+                meta.get("planned_entry_price", meta.get("entry_price"))
+            )
+            weighted_rr_planned = self._optional_float(
+                meta.get("weighted_rr_numeric", meta.get("weighted_rr_planned"))
+            )
 
             self._conn.execute(
                 """
@@ -347,13 +478,18 @@ class TradeJournal:
                     tf, narrative, trigger_reason, vc,
                     meta_json, features_json,
                     telegram_chat_id_open, telegram_message_id_open,
-                    tp_prices_json, tp_hit, moved_to_be, stop_current, ts_update
+                    tp_prices_json, tp_hit, moved_to_be, stop_current, ts_update,
+                    setup_id, strategy_version, experiment_id, experiment_variant,
+                    deployment_id, planned_entry, execution_mode, total_volume,
+                    weighted_rr_planned
                 ) VALUES (
                     ?, NULL, ?, ?,
                     ?, ?, ?, NULL, NULL, ?, ?,
                     ?, ?, ?, ?,
                     ?, ?,
                     ?, ?,
+                    ?, ?, ?, ?, ?,
+                    ?, ?, ?, ?,
                     ?, ?, ?, ?, ?
                 );
                 """,
@@ -369,6 +505,9 @@ class TradeJournal:
                     int(moved_to_be or 0),
                     float(stop_current) if stop_current is not None else float(stop),
                     _utc_now_iso(),
+                    setup_id, strategy_version, experiment_id, experiment_variant,
+                    deployment_id, planned_entry, execution_mode or None,
+                    total_volume, weighted_rr_planned,
                 ),
             )
             self._conn.commit()
@@ -378,6 +517,8 @@ class TradeJournal:
         symbol: str,
         exit: float,
         outcome: str,
+        exit_signal: Optional[str],
+        close_meta: Optional[Dict[str, Any]],
         telegram_chat_id_close: Optional[int],
         telegram_message_id_close: Optional[int],
     ) -> None:
@@ -387,12 +528,23 @@ class TradeJournal:
             if trade_id is None:
                 return
 
+            close_meta = dict(close_meta or {})
+            realized_net = self._optional_float(close_meta.get("realized_net"))
+            # Only explicitly complete broker history is authoritative for W/L,
+            # PF, and expectancy. A partial split history can otherwise turn a
+            # losing setup into an apparent winner (or vice versa).
+            pnl_complete = bool(close_meta.get("pnl_complete")) and realized_net is not None
+
             self._conn.execute(
                 """
                 UPDATE trades
                 SET ts_close = ?,
                     exit = ?,
                     outcome = ?,
+                    exit_signal = ?,
+                    realized_net = ?,
+                    pnl_complete = ?,
+                    close_meta_json = ?,
                     telegram_chat_id_close = ?,
                     telegram_message_id_close = ?,
                     ts_update = ?
@@ -400,6 +552,8 @@ class TradeJournal:
                 """,
                 (
                     ts_close, exit, outcome,
+                    exit_signal, realized_net, 1 if pnl_complete else 0,
+                    _json_dumps_safe(close_meta),
                     telegram_chat_id_close, telegram_message_id_close,
                     _utc_now_iso(),
                     trade_id,
@@ -473,7 +627,9 @@ class TradeJournal:
                 SELECT
                     id, ts_open, symbol, side, entry, stop, tp, tf, narrative,
                     telegram_chat_id_open, telegram_message_id_open,
-                    tp_prices_json, tp_hit, moved_to_be, stop_current
+                    tp_prices_json, tp_hit, moved_to_be, stop_current,
+                    setup_id, strategy_version, experiment_id,
+                    experiment_variant, deployment_id
                 FROM trades
                 WHERE ts_close IS NULL
                 ORDER BY id ASC;
@@ -505,6 +661,11 @@ class TradeJournal:
                 "narrative": str(r["narrative"] or ""),
                 "telegram_chat_id": int(r["telegram_chat_id_open"]) if r["telegram_chat_id_open"] is not None else None,
                 "telegram_message_id": int(r["telegram_message_id_open"]) if r["telegram_message_id_open"] is not None else None,
+                "setup_id": str(r["setup_id"]) if r["setup_id"] is not None else None,
+                "strategy_version": str(r["strategy_version"]) if r["strategy_version"] is not None else None,
+                "experiment_id": str(r["experiment_id"] or ""),
+                "experiment_variant": str(r["experiment_variant"] or ""),
+                "deployment_id": str(r["deployment_id"] or ""),
             })
         return out
 
@@ -516,8 +677,11 @@ class TradeJournal:
                 SELECT
                     id, ts_open, ts_close, symbol, side, entry, stop, tp, stop_current,
                     tp_prices_json, tp_hit, moved_to_be,
-                    exit, outcome, rr_text, tf,
-                    telegram_message_id_open
+                    exit, outcome, rr_text, tf, telegram_message_id_open,
+                    setup_id, strategy_version, experiment_id,
+                    experiment_variant, deployment_id, planned_entry,
+                    execution_mode, total_volume, weighted_rr_planned,
+                    exit_signal, realized_net, pnl_complete
                 FROM trades
                 ORDER BY id DESC
                 LIMIT ?;
@@ -548,6 +712,19 @@ class TradeJournal:
                 "rr_text": str(r["rr_text"] or ""),
                 "tf": str(r["tf"] or ""),
                 "telegram_message_id_open": int(r["telegram_message_id_open"]) if r["telegram_message_id_open"] is not None else None,
+                "setup_id": str(r["setup_id"]) if r["setup_id"] is not None else None,
+                "strategy_version": str(r["strategy_version"]) if r["strategy_version"] is not None else None,
+                "experiment_id": str(r["experiment_id"] or ""),
+                "experiment_variant": str(r["experiment_variant"] or ""),
+                "deployment_id": str(r["deployment_id"] or ""),
+                "planned_entry": float(r["planned_entry"]) if r["planned_entry"] is not None else None,
+                "execution_mode": str(r["execution_mode"] or ""),
+                "total_volume": float(r["total_volume"]) if r["total_volume"] is not None else None,
+                "weighted_rr_planned": float(r["weighted_rr_planned"]) if r["weighted_rr_planned"] is not None else None,
+                "exit_signal": str(r["exit_signal"] or ""),
+                "realized_net": float(r["realized_net"]) if r["realized_net"] is not None else None,
+                "pnl_complete": bool(int(r["pnl_complete"] or 0)),
+                "result": self._classify_setup_row(r),
             })
         return out
 
@@ -566,7 +743,11 @@ class TradeJournal:
                     meta_json, features_json,
                     telegram_chat_id_open, telegram_message_id_open,
                     telegram_chat_id_close, telegram_message_id_close,
-                    ts_update
+                    ts_update,
+                    setup_id, strategy_version, experiment_id, experiment_variant,
+                    deployment_id, planned_entry, execution_mode, total_volume,
+                    weighted_rr_planned, exit_signal, realized_net, pnl_complete,
+                    close_meta_json
                 FROM trades
                 ORDER BY ts_open ASC;
                 """
@@ -583,6 +764,10 @@ class TradeJournal:
                 "telegram_chat_id_open", "telegram_message_id_open",
                 "telegram_chat_id_close", "telegram_message_id_close",
                 "ts_update",
+                "setup_id", "strategy_version", "experiment_id", "experiment_variant",
+                "deployment_id", "planned_entry", "execution_mode", "total_volume",
+                "weighted_rr_planned", "exit_signal", "realized_net", "pnl_complete",
+                "close_meta_json",
             ])
             for r in rows:
                 writer.writerow([r[k] for k in r.keys()])
@@ -623,7 +808,11 @@ class TradeJournal:
                     meta_json, features_json,
                     telegram_chat_id_open, telegram_message_id_open,
                     telegram_chat_id_close, telegram_message_id_close,
-                    ts_update
+                    ts_update,
+                    setup_id, strategy_version, experiment_id, experiment_variant,
+                    deployment_id, planned_entry, execution_mode, total_volume,
+                    weighted_rr_planned, exit_signal, realized_net, pnl_complete,
+                    close_meta_json
                 FROM trades
                 ORDER BY ts_open ASC;
                 """,
@@ -638,20 +827,173 @@ class TradeJournal:
         self.export_csv()
         self.export_parquet()
 
-    def winrate(self) -> Tuple[float, int, int, int]:
-        with self._lock:
-            row = self._conn.execute(
-                """
-                SELECT
-                    SUM(CASE WHEN outcome='TP' THEN 1 ELSE 0 END) AS tp,
-                    SUM(CASE WHEN outcome='SL' THEN 1 ELSE 0 END) AS sl,
-                    SUM(CASE WHEN outcome IN ('TP','SL') THEN 1 ELSE 0 END) AS closed
-                FROM trades;
-                """
-            ).fetchone()
+    @staticmethod
+    def _classify_setup_row(row: Any) -> str:
+        """Classify one closed setup, never an individual TP leg.
 
-        tp = int(row["tp"] or 0)
-        sl = int(row["sl"] or 0)
-        closed = int(row["closed"] or 0)
-        wr = (tp / closed) if closed > 0 else 0.0
-        return wr, closed, tp, sl
+        Complete broker P&L is authoritative. Legacy rows fall back to their
+        terminal outcome, while TIME/BROKER without P&L remain UNKNOWN instead
+        of silently improving or depressing the win rate.
+        """
+        try:
+            keys = set(row.keys())
+        except Exception:
+            keys = set()
+
+        is_closed = (row["ts_close"] if "ts_close" in keys else None) is not None
+        if not is_closed:
+            return "OPEN"
+
+        pnl_complete = bool(int(row["pnl_complete"] or 0)) if "pnl_complete" in keys else False
+        realized_net = row["realized_net"] if "realized_net" in keys else None
+        if pnl_complete and realized_net is not None:
+            value = float(realized_net)
+            if value > 0.005:
+                return "WIN"
+            if value < -0.005:
+                return "LOSS"
+            return "BE"
+
+        outcome = str(row["outcome"] or "").strip().upper() if "outcome" in keys else ""
+        if outcome in {"TP", "WIN", "PROFIT", "MANUAL_TP", "PARTIAL_TP"}:
+            return "WIN"
+        if outcome in {"SL", "LOSS", "MANUAL_SL", "PARTIAL_SL"}:
+            return "LOSS"
+        if outcome in {"BE", "BREAKEVEN", "BREAK_EVEN", "FLAT"}:
+            return "BE"
+        return "UNKNOWN"
+
+    @classmethod
+    def _aggregate_setup_rows(cls, rows: List[Any]) -> Dict[str, Any]:
+        total = len(rows)
+        closed_rows = [row for row in rows if row["ts_close"] is not None]
+        results = [cls._classify_setup_row(row) for row in closed_rows]
+        wins = results.count("WIN")
+        losses = results.count("LOSS")
+        breakeven = results.count("BE")
+        unknown = results.count("UNKNOWN")
+        evaluated = wins + losses
+
+        pnl_rows = [
+            row for row in closed_rows
+            if bool(int(row["pnl_complete"] or 0)) and row["realized_net"] is not None
+        ]
+        pnl_values = [float(row["realized_net"]) for row in pnl_rows]
+        gross_profit = sum(value for value in pnl_values if value > 0.0)
+        gross_loss = abs(sum(value for value in pnl_values if value < 0.0))
+        if gross_loss > 1e-12:
+            profit_factor: Optional[float] = gross_profit / gross_loss
+        elif gross_profit > 1e-12:
+            profit_factor = float("inf")
+        else:
+            profit_factor = None
+
+        closed = len(closed_rows)
+        tp1_hits = sum(1 for row in closed_rows if int(row["tp_hit"] or 0) >= 1)
+        be_moves = sum(1 for row in closed_rows if bool(int(row["moved_to_be"] or 0)))
+        return {
+            "total_setups": total,
+            "open_setups": total - closed,
+            "closed_setups": closed,
+            "evaluated_setups": evaluated,
+            "wins": wins,
+            "losses": losses,
+            "breakeven": breakeven,
+            "unknown": unknown,
+            "win_rate": (wins / evaluated) if evaluated else 0.0,
+            "all_closed_win_rate": (wins / closed) if closed else 0.0,
+            "classification_coverage": ((evaluated + breakeven) / closed) if closed else 0.0,
+            "net_known_setups": len(pnl_rows),
+            "pnl_coverage": (len(pnl_rows) / closed) if closed else 0.0,
+            "net_realized": sum(pnl_values),
+            "gross_profit": gross_profit,
+            "gross_loss": gross_loss,
+            "profit_factor": profit_factor,
+            "expectancy_net": (sum(pnl_values) / len(pnl_values)) if pnl_values else None,
+            "tp1_hits": tp1_hits,
+            "tp1_rate": (tp1_hits / closed) if closed else 0.0,
+            "be_moves": be_moves,
+            "be_move_rate": (be_moves / closed) if closed else 0.0,
+        }
+
+    def setup_metrics(
+        self,
+        limit: Optional[int] = None,
+        *,
+        strategy_version: Optional[str] = None,
+        experiment_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Return setup-level metrics with explicit P&L coverage.
+
+        ``limit`` selects the newest N setups before aggregation. Optional
+        release filters make before/after comparisons reproducible.
+        """
+        conditions: List[str] = []
+        params: List[Any] = []
+        if strategy_version is not None:
+            conditions.append("strategy_version = ?")
+            params.append(str(strategy_version))
+        if experiment_id is not None:
+            conditions.append("experiment_id = ?")
+            params.append(str(experiment_id))
+
+        where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
+        limit_sql = ""
+        if limit is not None:
+            safe_limit = max(1, min(int(limit), 10000))
+            limit_sql = "LIMIT ?"
+            params.append(safe_limit)
+
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT
+                    id, ts_close, symbol, side, outcome, tp_hit, moved_to_be,
+                    strategy_version, experiment_id, experiment_variant,
+                    realized_net, pnl_complete
+                FROM trades
+                {where}
+                ORDER BY id DESC
+                {limit_sql};
+                """,
+                tuple(params),
+            ).fetchall()
+
+        metrics = self._aggregate_setup_rows(list(rows))
+
+        symbol_side: Dict[Tuple[str, str], List[Any]] = {}
+        strategy_groups: Dict[Tuple[str, str, str], List[Any]] = {}
+        for row in rows:
+            symbol_side.setdefault((str(row["symbol"]), str(row["side"])), []).append(row)
+            strategy_key = (
+                str(row["strategy_version"] or "legacy"),
+                str(row["experiment_id"] or ""),
+                str(row["experiment_variant"] or ""),
+            )
+            strategy_groups.setdefault(strategy_key, []).append(row)
+
+        metrics["by_symbol_side"] = [
+            {
+                "symbol": key[0],
+                "side": key[1],
+                **self._aggregate_setup_rows(group_rows),
+            }
+            for key, group_rows in sorted(symbol_side.items())
+        ]
+        metrics["by_strategy"] = [
+            {
+                "strategy_version": key[0],
+                "experiment_id": key[1],
+                "experiment_variant": key[2],
+                **self._aggregate_setup_rows(group_rows),
+            }
+            for key, group_rows in sorted(strategy_groups.items())
+        ]
+        return metrics
+
+    def winrate(self) -> Tuple[float, int, int, int]:
+        metrics = self.setup_metrics()
+        wins = int(metrics["wins"])
+        losses = int(metrics["losses"])
+        evaluated = int(metrics["evaluated_setups"])
+        return float(metrics["win_rate"]), evaluated, wins, losses

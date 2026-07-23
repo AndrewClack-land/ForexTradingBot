@@ -15,6 +15,7 @@ class DataCache:
         self.feed = data_feed
         self.default_limit = default_limit
         self.refresh_sec = refresh_sec or {
+            "1d": 30 * 60,
             "4h": 30 * 60,
             "1h": 10 * 60,
             "15m": 120,

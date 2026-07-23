@@ -7,6 +7,7 @@ import re
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from datetime import datetime, date, time as dt_time, timezone
 from typing import Dict, Any, List, Tuple, Optional
@@ -38,7 +39,9 @@ from config import (
     MOVE_BE_AFTER_TP1,
     SIGNAL_ON_CLOSED_BARS,
     FRIDAY_CLOSE_HOUR,
+    DAILY_FLAT_ENABLED,
     DAILY_CLOSE_HOUR,
+    DAILY_CLOSE_BUFFER_MIN,
     CORRELATED_GROUPS,
     POST_SL_COOLDOWN_MIN,
     MAX_SETUPS_PER_SYMBOL_PER_DAY,
@@ -77,40 +80,37 @@ def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> 
       4 TPs → [25%, 30%, 30%, remainder]
       >4 TPs → first three get 25%/30%/30%, last entry is always remainder
 
-    Volumes are floored to the broker's volume_step — legs that are not
-    step-aligned get rejected with "Invalid volume" on some brokers.
+    Allocation is performed in integer broker-step units (largest-remainder
+    method). This preserves the total and, for tiny setups, assigns the first
+    available unit to TP1 instead of accidentally leaving only the farthest TP.
     """
     if n_tps <= 0 or total_volume <= 0:
         return []
     if not step or step <= 0:
         step = 0.01
 
-    def _quantize(v: float) -> float:
-        return round(math.floor(v / step + 1e-9) * step, 8)
-
+    total_units = max(0, int(math.floor(total_volume / step + 1e-9)))
     if n_tps == 1:
-        return [_quantize(total_volume)]
+        return [round(total_units * step, 8)]
 
     if n_tps == 2:
-        pre_ratios: List[float] = [0.50]
+        ratios: List[float] = [0.50, 0.50]
     elif n_tps == 3:
-        pre_ratios = [0.50, 0.30]
+        ratios = [0.50, 0.30, 0.20]
     else:
-        pre_ratios = [0.25, 0.30, 0.30]
-        pre_ratios += [0.0] * (n_tps - 4)
+        ratios = [0.25, 0.30, 0.30] + [0.0] * (n_tps - 4) + [0.15]
 
-    vols: List[float] = []
-    allocated = 0.0
-    for ratio in pre_ratios:
-        vol = _quantize(total_volume * ratio)
-        vols.append(vol)
-        allocated = round(allocated + vol, 10)
-
-    remainder = _quantize(total_volume - allocated)
-    # Floating-point rounding can produce 0.00 or tiny negatives for the
-    # last leg.  Clamp to 0.0 — the split executor will skip zero-volume legs.
-    vols.append(max(0.0, remainder))
-    return vols
+    targets = [total_units * ratio for ratio in ratios]
+    units = [int(math.floor(target + 1e-12)) for target in targets]
+    remainder_units = total_units - sum(units)
+    order = sorted(
+        range(n_tps),
+        key=lambda idx: (targets[idx] - units[idx], -idx),
+        reverse=True,
+    )
+    for idx in order[:remainder_units]:
+        units[idx] += 1
+    return [round(value * step, 8) for value in units]
 
 
 class Core:
@@ -499,14 +499,20 @@ class Core:
         for ticket, meta in ordered_legs:
             ticket = int(ticket)
             status = str(meta.get("status") or "open")
-            if status == "closed":
-                continue
             if ticket in open_ids:
                 remaining.append(ticket)
                 result["visible_open_count"] += 1
                 if status != "open":
+                    if status == "closed" and meta.get("tp_event_emitted"):
+                        trade.tp_hit = max(0, int(getattr(trade, "tp_hit", 0) or 0) - 1)
                     meta["status"] = "open"
+                    meta["missing_count"] = 0
+                    for key in list(meta):
+                        if key.startswith("close_") or key in {"closed_at", "tp_event_emitted"}:
+                            meta.pop(key, None)
                     result["changed"] = True
+                continue
+            if status == "closed":
                 continue
 
             close_info = self.mt5_executor.get_position_close_info(ticket)
@@ -518,6 +524,30 @@ class Core:
                     result["changed"] = True
                 continue
 
+            expected_volume = float(meta.get("volume") or 0.0)
+            closed_volume = float(close_info.get("volume") or 0.0)
+            volume_tolerance = max(1e-8, expected_volume * 1e-4)
+            if expected_volume > 0 and closed_volume + volume_tolerance < expected_volume:
+                remaining.append(ticket)
+                result["pending_history"] = True
+                meta["status"] = "pending_history"
+                meta["observed_exit_volume"] = closed_volume
+                result["changed"] = True
+                continue
+
+            # Require two consecutive trusted absence polls before consuming a
+            # close. This prevents a transient empty positions_get() result from
+            # turning an older partial-exit deal into a terminal leg event.
+            missing_count = int(meta.get("missing_count") or 0) + 1
+            meta["missing_count"] = missing_count
+            required = max(2, int(getattr(self, "_broker_missing_confirm", 2) or 2))
+            if missing_count < required:
+                remaining.append(ticket)
+                result["pending_history"] = True
+                meta["status"] = "pending_close_confirmation"
+                result["changed"] = True
+                continue
+
             meta["status"] = "closed"
             meta["close_reason"] = str(close_info.get("reason") or "OTHER")
             meta["close_reason_code"] = int(close_info.get("reason_code") or 0)
@@ -527,6 +557,15 @@ class Core:
             meta["close_profit"] = float(close_info.get("profit") or 0.0)
             meta["close_commission"] = float(close_info.get("commission") or 0.0)
             meta["close_swap"] = float(close_info.get("swap") or 0.0)
+            meta["close_fee"] = float(close_info.get("fee") or 0.0)
+            meta["close_net"] = float(
+                close_info.get("net")
+                if close_info.get("net") is not None
+                else meta["close_profit"]
+                + meta["close_commission"]
+                + meta["close_swap"]
+                + meta["close_fee"]
+            )
             meta["closed_at"] = int(close_info.get("time") or 0)
             result["changed"] = True
 
@@ -537,6 +576,7 @@ class Core:
                     int(getattr(trade, "tp_hit", 0) or 0) + 1,
                     tp_index,
                 )
+                meta["tp_event_emitted"] = True
                 tp_price = float(meta.get("tp") or 0.0)
                 hit_price = float(meta.get("close_price") or tp_price or last_price or 0.0)
                 result["events"].append({
@@ -596,6 +636,22 @@ class Core:
             self._management_lock = lock
         with lock:
             for symbol, trade in list(self.active_trades.items()):
+                scheduled_flat = self._is_friday_weekend_close() or self._is_daily_flat_close()
+                if scheduled_flat:
+                    last_price = self.mt5_executor.get_current_price(symbol, trade.side)
+                    label = (
+                        f"Weekend close (Friday {FRIDAY_CLOSE_HOUR}:00 UTC+3)"
+                        if self._is_friday_weekend_close()
+                        else f"Daily close ({DAILY_CLOSE_HOUR}:00 UTC+3)"
+                    )
+                    manage, closed = self._force_flat_trade(
+                        symbol, trade, label=label, last_price=last_price
+                    )
+                    results[symbol] = manage
+                    dirty = True
+                    if closed:
+                        self.active_trades.pop(symbol, None)
+                    continue
                 if not self._is_split_trade(trade):
                     continue
                 last_price = self.mt5_executor.get_current_price(symbol, trade.side)
@@ -628,7 +684,7 @@ class Core:
                     }
                     self._register_broker_close(symbol, trade, manage)
                     results[symbol] = manage
-                    del self.active_trades[symbol]
+                    self.active_trades.pop(symbol, None)
                     dirty = True
                     self._log_signal(symbol, manage)
                 elif events:
@@ -647,6 +703,79 @@ class Core:
             if dirty:
                 save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
         return results
+
+    def _force_flat_trade(
+        self,
+        symbol: str,
+        trade: ActiveTrade,
+        *,
+        label: str,
+        last_price: Optional[float],
+    ) -> tuple[Dict[str, Any], bool]:
+        """Broker-only scheduled close. Returns (signal, fully_confirmed_send)."""
+        manage: Dict[str, Any] = {
+            "signal": "EXIT_TIME",
+            "side": trade.side,
+            "exit_price": float(last_price or trade.entry),
+            "info": label,
+            "tf": trade.tf,
+            "narrative": trade.narrative,
+            "telegram_chat_id": getattr(trade, "telegram_chat_id", None),
+            "telegram_message_id": getattr(trade, "telegram_message_id", None),
+            "execution": {},
+        }
+        failed = False
+        closed_position_ids: List[int] = []
+        split_ids = list(getattr(trade, "split_position_ids", []) or [])
+        if split_ids:
+            remaining: List[int] = []
+            closed_count = 0
+            for pid in split_ids:
+                try:
+                    if self.mt5_executor.close_trade(symbol, position_id=pid, volume=None):
+                        closed_count += 1
+                        closed_position_ids.append(int(pid))
+                    else:
+                        remaining.append(pid)
+                except Exception as exc:
+                    remaining.append(pid)
+                    manage.setdefault("execution_error", str(exc))
+            trade.split_position_ids = remaining
+            manage["execution"]["mt5_closed_split"] = closed_count
+            failed = bool(remaining)
+        else:
+            pos_id = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
+            if not pos_id:
+                failed = True
+                manage["execution_error"] = "No broker position id to close"
+            else:
+                try:
+                    volume = float(getattr(trade, "volume_remaining", 0.0) or trade.volume or 0.0)
+                    closed = self.mt5_executor.close_trade(
+                        symbol, position_id=pos_id, volume=volume or None
+                    )
+                    manage["execution"]["mt5_closed"] = bool(closed)
+                    failed = not bool(closed)
+                    if closed:
+                        closed_position_ids.append(int(pos_id))
+                except Exception as exc:
+                    failed = True
+                    manage["execution_error"] = str(exc)
+
+        if failed:
+            manage["signal"] = "HOLD"
+            manage["info"] = f"{label}: broker close not confirmed; retrying"
+            trade.last_price_ts = time.time()
+        else:
+            known_split_legs = getattr(trade, "split_legs", {}) or {}
+            complete_id_set = not split_ids or (
+                bool(known_split_legs)
+                and len(closed_position_ids) == len(known_split_legs)
+            )
+            if complete_id_set:
+                self._attach_position_close_metrics(manage, closed_position_ids)
+        self._log_signal(symbol, manage)
+        return manage, not failed
 
 
     def _position_gone_confirmed(self, symbol: str, query_failed: bool) -> bool:
@@ -708,7 +837,9 @@ class Core:
             split_ids = list(getattr(trade, "split_position_ids", []) or [])
             if split_ids:
                 updated = self.mt5_executor.move_stop_all(symbol, position_ids=split_ids, new_stop=be_price)
-                ok = updated > 0
+                # A partial success is not completion: leave moved_to_be=False
+                # so the remaining tickets are retried on the next fast poll.
+                ok = updated == len(split_ids)
             else:
                 pos_id = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
                 if not pos_id:
@@ -719,9 +850,56 @@ class Core:
             return False
         if ok:
             trade.moved_to_be = True
-            trade.stop = be_price
+            if trade.side == "LONG":
+                trade.stop = max(float(trade.stop or 0.0), be_price)
+            else:
+                current = float(trade.stop or 0.0)
+                trade.stop = min(current, be_price) if current > 0 else be_price
             print(f"[Core] {symbol} TP1 hit — SL moved to break-even {be_price:.5f}")
         return ok
+
+    def _attach_position_close_metrics(
+        self,
+        manage: Dict[str, Any],
+        position_ids: List[int],
+    ) -> bool:
+        """Attach complete broker P&L when every requested history is visible."""
+        if not self.mt5_executor or not hasattr(self.mt5_executor, "get_position_close_info"):
+            return False
+        ids = list(dict.fromkeys(int(pid) for pid in position_ids if pid))
+        if not ids:
+            return False
+        infos: List[Dict[str, Any]] = []
+        for pid in ids:
+            try:
+                info = self.mt5_executor.get_position_close_info(pid)
+            except Exception:
+                return False
+            if not info:
+                # MT5 can publish the exit deal a little after the position
+                # disappears. Unknown is safer than a fabricated zero P&L.
+                return False
+            infos.append(info)
+
+        total_net = sum(
+            float(info.get("net"))
+            if info.get("net") is not None
+            else float(info.get("profit") or 0.0)
+            + float(info.get("commission") or 0.0)
+            + float(info.get("swap") or 0.0)
+            + float(info.get("fee") or 0.0)
+            for info in infos
+        )
+        total_volume = sum(float(info.get("volume") or 0.0) for info in infos)
+        if total_volume > 0:
+            manage["exit_price"] = sum(
+                float(info.get("price") or 0.0) * float(info.get("volume") or 0.0)
+                for info in infos
+            ) / total_volume
+        manage["realized_net"] = total_net
+        manage["pnl_complete"] = True
+        manage["outcome"] = "TP" if total_net > 0.005 else "SL" if total_net < -0.005 else "BE"
+        return True
 
     def _register_broker_close(self, symbol: str, trade: ActiveTrade, manage: Dict[str, Any]) -> None:
         """Infer TP/SL outcome of a broker-side close from MT5 deal history and
@@ -731,20 +909,56 @@ class Core:
             return
         split_legs = getattr(trade, "split_legs", {}) or {}
         ids = [int(pid) for pid in split_legs]
-        stored_reasons = {
-            str(meta.get("close_reason"))
-            for meta in split_legs.values()
-            if meta.get("close_reason")
-        }
+        closed_meta = [
+            meta for meta in split_legs.values()
+            if str(meta.get("status") or "") == "closed"
+        ]
+        total_net = sum(
+            float(meta.get("close_net"))
+            if meta.get("close_net") is not None
+            else float(meta.get("close_profit") or 0.0)
+            + float(meta.get("close_commission") or 0.0)
+            + float(meta.get("close_swap") or 0.0)
+            + float(meta.get("close_fee") or 0.0)
+            for meta in closed_meta
+        )
+        total_close_volume = sum(float(meta.get("close_volume") or 0.0) for meta in closed_meta)
+        if total_close_volume > 0:
+            manage["exit_price"] = sum(
+                float(meta.get("close_price") or 0.0)
+                * float(meta.get("close_volume") or 0.0)
+                for meta in closed_meta
+            ) / total_close_volume
         outcome: Optional[str] = None
-        if "SL" in stored_reasons or "STOP_OUT" in stored_reasons:
-            outcome = "SL"
-        elif "TP" in stored_reasons:
+        planned_leg_count = sum(
+            1 for volume in (getattr(trade, "volume_per_tp", []) or [])
+            if float(volume or 0.0) > 0.0
+        )
+        if planned_leg_count <= 0:
+            planned_leg_count = len(trade.tp_prices or [])
+        complete_mapping = bool(split_legs) and len(split_legs) >= planned_leg_count
+        pnl_complete = complete_mapping and len(closed_meta) == len(split_legs)
+        manage["pnl_complete"] = pnl_complete
+        if pnl_complete:
+            manage["realized_net"] = total_net
+        if pnl_complete:
+            if total_net > 1e-8:
+                outcome = "TP"
+            elif total_net < -1e-8:
+                outcome = "SL"
+            else:
+                outcome = "BE"
+        elif int(getattr(trade, "tp_hit", 0) or 0) > 0:
+            # Legacy state may only know the still-open final leg. Confirmed
+            # earlier TPs must not be reclassified as a loss when that leg exits
+            # at the break-even stop.
             outcome = "TP"
         if not ids:
             pid = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
             ids = [pid] if pid else []
-        if outcome != "SL":
+        if not split_legs and self._attach_position_close_metrics(manage, ids):
+            outcome = str(manage.get("outcome") or "") or None
+        if outcome is None:
             for pid in ids:
                 reason = self.mt5_executor.get_position_close_reason(pid)
                 if reason == "SL":
@@ -761,10 +975,11 @@ class Core:
                     f"[Core] {symbol} stopped out — entry cooldown "
                     f"{self._post_sl_cooldown_sec / 60:.0f}m (until {datetime.fromtimestamp(until).strftime('%H:%M')})"
                 )
-            try:
-                self.ai_store.update_on_close(symbol, outcome, rr_numeric=self._trade_rr(trade))
-            except Exception:
-                traceback.print_exc()
+            if outcome in {"TP", "SL"}:
+                try:
+                    self.ai_store.update_on_close(symbol, outcome, rr_numeric=self._trade_rr(trade))
+                except Exception:
+                    traceback.print_exc()
 
     @staticmethod
     def _parse_time_str(value: str) -> dt_time:
@@ -796,8 +1011,21 @@ class Core:
     def _is_daily_flat_close() -> bool:
         """True at or after DAILY_CLOSE_HOUR UTC+3 (Europe/Moscow, no DST) —
         all positions must be flat by this time every day."""
+        if not DAILY_FLAT_ENABLED:
+            return False
         now = datetime.now(ZoneInfo("Europe/Moscow"))
         return now.hour >= DAILY_CLOSE_HOUR
+
+    @staticmethod
+    def _is_daily_entry_cutoff() -> bool:
+        """Block fresh risk shortly before the optional daily flat close."""
+        if not DAILY_FLAT_ENABLED or DAILY_CLOSE_BUFFER_MIN <= 0:
+            return False
+        now = datetime.now(ZoneInfo("Europe/Moscow"))
+        current_minute = now.hour * 60 + now.minute
+        close_minute = DAILY_CLOSE_HOUR * 60
+        cutoff_minute = max(0, close_minute - DAILY_CLOSE_BUFFER_MIN)
+        return cutoff_minute <= current_minute < close_minute
 
     def _get_symbols(self) -> list[str]:
         return self.scanner.scan()
@@ -810,7 +1038,7 @@ class Core:
             return df
 
         return {
-            "D": None,
+            "D": _get("1d"),
             "4H": _get("4h"),
             "1H": _get("1h"),
             "15M": _get("15m"),
@@ -861,6 +1089,7 @@ class Core:
         self.global_context["session_allowed"] = allowed
         self.global_context["friday_close"] = self._is_friday_weekend_close()
         self.global_context["daily_close"] = self._is_daily_flat_close()
+        self.global_context["daily_entry_cutoff"] = self._is_daily_entry_cutoff()
         self._roll_daily_counters()
         self._check_daily_loss_stop()
         self.global_context["daily_loss_stop"] = self._daily_loss_stop
@@ -892,6 +1121,13 @@ class Core:
                 new_sig = dict(sig)
                 new_sig["signal"] = "WAIT_SESSION"
                 new_sig["info"] = f"Заблокировано: дневное закрытие ({DAILY_CLOSE_HOUR}:00 UTC+3)"
+                return new_sig
+            if self.global_context.get("daily_entry_cutoff"):
+                new_sig = dict(sig)
+                new_sig["signal"] = "WAIT_SESSION"
+                new_sig["info"] = (
+                    f"Заблокировано: за {DAILY_CLOSE_BUFFER_MIN} мин до дневного закрытия"
+                )
                 return new_sig
             if self.global_context.get("daily_loss_stop"):
                 new_sig = dict(sig)
@@ -1125,7 +1361,7 @@ class Core:
                                 }
                                 self._register_broker_close(symbol, trade, manage)
                                 results[symbol] = manage
-                                del self.active_trades[symbol]
+                                self.active_trades.pop(symbol, None)
                                 dirty = True
                                 self._log_signal(symbol, manage)
                                 continue
@@ -1167,7 +1403,7 @@ class Core:
                                 }
                                 self._register_broker_close(symbol, trade, manage)
                                 results[symbol] = manage
-                                del self.active_trades[symbol]
+                                self.active_trades.pop(symbol, None)
                                 dirty = True
                                 self._log_signal(symbol, manage)
                                 continue
@@ -1321,6 +1557,7 @@ class Core:
                         manage.setdefault("telegram_chat_id", getattr(trade, "telegram_chat_id", None))
                         manage.setdefault("telegram_message_id", getattr(trade, "telegram_message_id", None))
                         close_failed = False
+                        closed_position_ids: List[int] = []
                         if self.mt5_executor:
                             exec_block = manage.setdefault("execution", {})
                             if not isinstance(exec_block, dict):
@@ -1337,8 +1574,10 @@ class Core:
                                         ok = self.mt5_executor.close_trade(symbol, position_id=pid, volume=None)
                                         if ok:
                                             closed_count += 1
-                                        elif not conn_ok:
-                                            # "not found" is not trustworthy on a dead connection
+                                        else:
+                                            # Any unconfirmed close is retried. A transient
+                                            # ticket lookup failure is not proof that the
+                                            # broker position is gone, even on a live link.
                                             remaining_legs.append(pid)
                                     except Exception as exc:
                                         manage.setdefault("execution_error", str(exc))
@@ -1356,8 +1595,10 @@ class Core:
                                         volume=close_vol,
                                     )
                                     exec_block["mt5_closed"] = closed
-                                    if not closed and not conn_ok:
+                                    if not closed:
                                         close_failed = True
+                                    else:
+                                        closed_position_ids.append(int(trade.mt5_position_id))
                                 except Exception as exc:
                                     manage.setdefault("execution_error", str(exc))
                                     close_failed = True
@@ -1376,8 +1617,10 @@ class Core:
                             dirty = True
                             self._log_signal(symbol, manage)
                             continue
+                        if closed_position_ids:
+                            self._attach_position_close_metrics(manage, closed_position_ids)
                         results[symbol] = manage
-                        del self.active_trades[symbol]
+                        self.active_trades.pop(symbol, None)
                         dirty = True
                         self._log_signal(symbol, manage)
                         continue
@@ -1487,9 +1730,13 @@ class Core:
                         ts_open=time.time(),
                         last_price_ts=time.time(),
                     )
+                    # Keep the strategy's intended entry before the broker fill
+                    # replaces sig["entry_price"], so execution drift is auditable.
+                    sig.setdefault("planned_entry_price", float(new_trade.entry))
 
                     if self.mt5_executor:
                         try:
+                            import MetaTrader5 as _mt5
                             # Auto-select mode:
                             #   split  → 2+ TPs and PARTIAL_TP_MODE != "monitor"
                             #   monitor → 1 TP, or forced via PARTIAL_TP_MODE=monitor
@@ -1499,7 +1746,6 @@ class Core:
                             )
                             if use_split:
                                 # MK-style: calculate total volume once, then open N legs
-                                import MetaTrader5 as _mt5
                                 tick = _mt5.symbol_info_tick(symbol)
                                 if tick is None:
                                     raise RuntimeError(f"No tick for {symbol}")
@@ -1533,14 +1779,20 @@ class Core:
                                     )
                                 new_trade.volume = round(sum(l["volume"] for l in legs), 2)
                                 new_trade.volume_remaining = new_trade.volume
-                                new_trade.volume_per_tp = vols
+                                new_trade.volume_per_tp = [0.0] * len(tp_prices)
+                                for leg in legs:
+                                    idx = int(leg.get("tp_index") or 0) - 1
+                                    if 0 <= idx < len(new_trade.volume_per_tp):
+                                        new_trade.volume_per_tp[idx] = float(leg.get("volume") or 0.0)
                                 new_trade.split_legs = {}
                                 for leg in legs:
                                     # position_id is the ticket used by positions_get;
                                     # order ticket is retained as metadata for audits.
-                                    leg_ticket = leg.get("position_id") or leg.get("ticket")
+                                    leg_ticket = leg.get("position_id")
                                     if not leg_ticket:
-                                        continue
+                                        raise RuntimeError(
+                                            "Split entry returned a leg without an exact position_id"
+                                        )
                                     new_trade.split_legs[int(leg_ticket)] = {
                                         "tp_index": int(leg.get("tp_index") or 0),
                                         "tp": float(leg.get("tp") or 0.0),
@@ -1592,7 +1844,11 @@ class Core:
                                 )
                                 new_trade.volume = execution_payload.get("volume", 0.0)
                                 new_trade.volume_remaining = new_trade.volume
-                                new_trade.volume_per_tp = _compute_tp_volumes(new_trade.volume, len(tp_prices))
+                                _info = _mt5.symbol_info(symbol)
+                                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
+                                new_trade.volume_per_tp = _compute_tp_volumes(
+                                    new_trade.volume, len(tp_prices), step=_step or 0.01
+                                )
                                 print(
                                     f"[Core] {symbol} MONITOR entry: volume_per_tp={new_trade.volume_per_tp} "
                                     f"(total={new_trade.volume:.2f}, n_tps={len(tp_prices)})"
@@ -1635,6 +1891,9 @@ class Core:
                             print(f"[Core] Execution failed for {symbol}: {exc}. Cooldown {cooldown_sec:.0f}s")
                             continue
 
+                    # Stable identity makes journal retries idempotent without
+                    # letting an unrelated stale open row hide this new setup.
+                    sig.setdefault("setup_id", uuid.uuid4().hex)
                     self.active_trades[symbol] = new_trade
                     dirty = True
                     self._entries_today[symbol] = self._entries_today.get(symbol, 0) + 1

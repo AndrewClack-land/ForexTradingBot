@@ -17,6 +17,9 @@ except Exception:
     _cfg = None
 
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
+REJECTION_BLOCK_ENTRY_ENABLED = bool(
+    getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", True)
+)
 ORDERBLOCK_TOUCH_ATR_K = float(getattr(_cfg, "ORDERBLOCK_TOUCH_ATR_K", 0.15))
 ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.0005))
 ORDERBLOCK_MAX_AGE_BARS = int(getattr(_cfg, "ORDERBLOCK_MAX_AGE_BARS", 240))
@@ -144,6 +147,7 @@ class NarrativeStrategy:
     def __init__(self):
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
+        self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
 
         # 3 TPs at clean R-multiples. TP1 = 1R keeps the break-even trigger
         # consistently reachable (the old fixed-% TP1 override made it swing
@@ -390,10 +394,16 @@ class NarrativeStrategy:
                 score_short += weight
 
         zone_snippets: List[str] = []
-        if ctx.order_blocks_4h:
-            ob = ctx.order_blocks_4h[0]
+        active_order_blocks = [
+            ob for ob in (ctx.order_blocks_4h or [])
+            if not getattr(ob, "breaker", False)
+        ]
+        if active_order_blocks:
+            # Tracker output is recency-sorted, but max() keeps this robust for
+            # hydrated/tests/custom contexts and removes the old LONG-first bias.
+            ob = max(active_order_blocks, key=lambda item: int(item.created_idx))
             zone_snippets.append(
-                f"OB4H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}{' breaker' if ob.breaker else ''}"
+                f"OB4H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}"
             )
             if ob.side == "LONG":
                 score_long += 1
@@ -991,7 +1001,11 @@ class NarrativeStrategy:
         # bias регулирует FVG-режим 1H внутри calc_narrative.
         fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
 
-        entry = self.trigger_15m_rejection_block(df_15M, side_bias)
+        entry = (
+            self.trigger_15m_rejection_block(df_15M, side_bias)
+            if self.rejection_block_entry_enabled
+            else None
+        )
         if entry is None:
             entry = self.trigger_15m_turtle_soup(df_15M, side_bias)
         if entry is None:
@@ -1020,7 +1034,14 @@ class NarrativeStrategy:
             custom_stop=getattr(entry, "stop_override", None),
             symbol=symbol,
         )
-        rr_text = f"1:{float(self.rr_min):.2f}"
+        weighted_rr = sum(
+            ratio * rr
+            for ratio, rr in zip((0.50, 0.30, 0.20), self.tp_rr_levels)
+        )
+        rr_text = (
+            f"TP 1R/2R/3R (weighted 1:{weighted_rr:.2f}; "
+            f"AI floor 1:{float(self.rr_min):.2f})"
+        )
 
         payload: Dict[str, Any] = {
             "signal": "ENTER",
@@ -1038,6 +1059,9 @@ class NarrativeStrategy:
             "tp_prices": [round(float(x), 6) for x in tp_prices],  # 4 TPs
 
             "rr": rr_text,
+            "weighted_rr_numeric": float(weighted_rr),
+            # Kept conservative for the AI probability gate; weighted payoff is
+            # exposed separately above instead of pretending TP2 is still 1.5R.
             "rr_numeric": float(self.rr_min),
 
             "risk_percent": f"{self.risk_per_trade * 100:.2f}%",

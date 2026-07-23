@@ -70,7 +70,11 @@ class TelegramBot:
             configured_manage_poll = 3.0
         self.manage_poll_sec = max(1.0, min(5.0, configured_manage_poll))
 
-        self._tick_lock = asyncio.Lock()
+        # Signal generation may spend tens of seconds in blocking MT5/data/AI
+        # calls. Run it off the asyncio loop and keep broker management on an
+        # independent cadence; Core serializes the small shared lifecycle state.
+        self._signal_tick_lock = asyncio.Lock()
+        self._manage_tick_lock = asyncio.Lock()
 
         # send retries
         self._send_retries = 6
@@ -275,7 +279,43 @@ class TelegramBot:
         except Exception:
             traceback.print_exc()
 
+    async def _handle_time_exit(self, app, symbol: str, sig: Dict[str, Any]) -> None:
+        px = sig.get("exit_price")
+        px_str = f" @ {_fmt_price(symbol, float(px))}" if px is not None else ""
+        await self._reply(
+            app,
+            symbol,
+            f"⏱ {symbol}: позиция закрыта по времени{px_str}",
+            meta=sig,
+        )
+        try:
+            with self.profiler.section("journal_ingest"):
+                self.journal.ingest_signal(
+                    symbol=symbol,
+                    sig=sig,
+                    telegram_chat_id=self.channel_id,
+                    telegram_message_id=None,
+                    features=None,
+                )
+        except Exception:
+            traceback.print_exc()
+
     async def _post_enter(self, app, symbol: str, sig: Dict[str, Any]) -> None:
+        # Journal the executed setup independently from Telegram availability.
+        # Previously a failed send returned early and silently removed a real
+        # MT5 trade from every win-rate/P&L report.
+        try:
+            with self.profiler.section("journal_ingest"):
+                self.journal.ingest_signal(
+                    symbol=symbol,
+                    sig=sig,
+                    telegram_chat_id=self.channel_id,
+                    telegram_message_id=None,
+                    features=None,
+                )
+        except Exception:
+            traceback.print_exc()
+
         text = self._format_signal(symbol, sig)
 
         msg = await self._safe_send_message(
@@ -303,27 +343,15 @@ class TelegramBot:
         except Exception:
             pass
 
-        try:
-            with self.profiler.section("journal_ingest"):
-                self.journal.ingest_signal(
-                    symbol=symbol,
-                    sig=sig,
-                    telegram_chat_id=self.channel_id,
-                    telegram_message_id=msg.message_id,
-                    features=None,
-                )
-        except Exception:
-            traceback.print_exc()
-
     # ----------------- main tick loop -----------------
     async def _tick(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        if self._tick_lock.locked():
+        if self._signal_tick_lock.locked():
             return
 
-        async with self._tick_lock:
+        async with self._signal_tick_lock:
             try:
                 with self.profiler.section("core_get_signals"):
-                    signals = self.core.get_signals()
+                    signals = await asyncio.to_thread(self.core.get_signals)
             except Exception:
                 traceback.print_exc()
                 return
@@ -354,25 +382,7 @@ class TelegramBot:
                         continue
 
                     if st == "EXIT_TIME":
-                        px = sig.get("exit_price")
-                        px_str = f" @ {_fmt_price(symbol, float(px))}" if px is not None else ""
-                        await self._reply(
-                            app,
-                            symbol,
-                            f"⏱ {symbol}: позиция закрыта по времени{px_str}",
-                            meta=sig,
-                        )
-                        try:
-                            with self.profiler.section("journal_ingest"):
-                                self.journal.ingest_signal(
-                                    symbol=symbol,
-                                    sig=sig,
-                                    telegram_chat_id=self.channel_id,
-                                    telegram_message_id=None,
-                                    features=None,
-                                )
-                        except Exception:
-                            traceback.print_exc()
+                        await self._handle_time_exit(app, symbol, sig)
                         continue
 
                 except Exception:
@@ -381,17 +391,17 @@ class TelegramBot:
             self.profiler.dump(prefix="[Profiler:bot]")
 
     async def _manage_tick(self, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Fast broker-only pass; shares the lock with the 60s signal tick.
+        """Fast broker-only pass, independent from the 60s signal scan.
 
         Core.manage_active_trades() never generates entries or calls AI, so the
         only messages produced here are one-shot TP/BE lifecycle events and the
         final EXIT_BROKER (which is journaled exactly once).
         """
-        if self._tick_lock.locked():
+        if self._manage_tick_lock.locked():
             return
-        async with self._tick_lock:
+        async with self._manage_tick_lock:
             try:
-                signals = self.core.manage_active_trades()
+                signals = await asyncio.to_thread(self.core.manage_active_trades)
             except Exception:
                 traceback.print_exc()
                 return
@@ -403,6 +413,8 @@ class TelegramBot:
                         await self._handle_events(app, symbol, sig)
                     elif sig.get("signal") == "EXIT_BROKER":
                         await self._handle_broker_exit(app, symbol, sig)
+                    elif sig.get("signal") == "EXIT_TIME":
+                        await self._handle_time_exit(app, symbol, sig)
                 except Exception:
                     traceback.print_exc()
 
@@ -485,6 +497,7 @@ class TelegramBot:
 
         try:
             rows = self.journal.recent_trades(limit=limit)
+            metrics = self.journal.setup_metrics(limit=limit)
         except Exception:
             await update.message.reply_text("DB error while loading report (see logs).")
             traceback.print_exc()
@@ -494,7 +507,33 @@ class TelegramBot:
             await update.message.reply_text("No trades in DB yet.")
             return
 
-        lines = [f"Last {len(rows)} trades (newest first):\n"]
+        closed = int(metrics.get("closed_setups", 0))
+        wins = int(metrics.get("wins", 0))
+        losses = int(metrics.get("losses", 0))
+        breakeven = int(metrics.get("breakeven", 0))
+        unknown = int(metrics.get("unknown", 0))
+        net_known = int(metrics.get("net_known_setups", 0))
+        pf = metrics.get("profit_factor")
+        if pf is None:
+            pf_text = "n/a"
+        elif pf == float("inf"):
+            pf_text = "∞"
+        else:
+            pf_text = f"{float(pf):.2f}"
+
+        lines = [
+            f"Setup report: newest {len(rows)} (one setup, not MT5 legs)",
+            (
+                f"Closed={closed} | W/L/BE/?={wins}/{losses}/{breakeven}/{unknown} | "
+                f"WR={float(metrics.get('win_rate', 0.0)):.1%}"
+            ),
+            (
+                f"Net(known)={float(metrics.get('net_realized', 0.0)):+.2f} | "
+                f"P&L coverage={net_known}/{closed} | PF={pf_text} | "
+                f"TP1={float(metrics.get('tp1_rate', 0.0)):.1%}"
+            ),
+            "",
+        ]
         for r in rows:
             sym = r["symbol"]
             arrow, act = _side_to_text(r["side"])
@@ -503,8 +542,17 @@ class TelegramBot:
             stop = _fmt_price(sym, float(stop_cur))
             outcome = r.get("outcome") or "OPEN"
             exit_px = f" exit={_fmt_price(sym, r['exit'])}" if r.get("exit") is not None else ""
+            result = r.get("result") or "UNKNOWN"
+            net_text = (
+                f"net={float(r['realized_net']):+.2f}"
+                if r.get("pnl_complete") and r.get("realized_net") is not None
+                else "net=n/a"
+            )
+            release = str(r.get("strategy_version") or "legacy")
+            setup_id = str(r.get("setup_id") or r["id"])[:8]
             lines.append(
-                f"#{r['id']} {sym} {arrow} {act} | entry {entry} stop {stop} | {outcome}{exit_px} | tp_hit={r.get('tp_hit',0)}"
+                f"#{setup_id} {sym} {arrow} {act} | entry {entry} stop {stop} | "
+                f"{result}/{outcome}{exit_px} | {net_text} | tp_hit={r.get('tp_hit',0)} | v={release}"
             )
 
         msg = "\n".join(lines)
