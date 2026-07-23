@@ -48,6 +48,11 @@ from config import (
     DAILY_MAX_LOSS_PCT,
     MT5_MAX_VOLUME,
     MT5_COMMISSION_PER_LOT,
+    VOL_REGIME_FILTER_ENABLED,
+    VOL_REGIME_SYMBOLS,
+    VOL_REGIME_MAX_R,
+    EM_TP_MAX_RATIO,
+    VOL_REGIME_REFRESH_MIN,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -64,6 +69,7 @@ from core.m1.config import AIConfig
 from core.m1.store import TradeStore
 from core.m1.ai_live import AILive
 from core.state_store import save_active_trades, load_active_trades
+from core.vol_regime import VolContext, build_vol_context, entry_gate
 from core.profiler import TickProfiler
 from core.risk_rules import RiskRules
 from executors.mt5_executor import MT5Executor, MT5Settings
@@ -172,6 +178,10 @@ class Core:
         #   _day_baseline_balance / _daily_loss_stop — bot-wide daily loss brake
         self._counters_day: Optional[date] = None
         self._entries_today: Dict[str, int] = {}
+        # Vol-regime contexts per symbol: (computed_at_ts, VolContext | None).
+        # Recomputed at most every VOL_REGIME_REFRESH_MIN minutes — the 21-day
+        # realized vol underneath moves on daily candles, not on ticks.
+        self._vol_contexts: Dict[str, Tuple[float, Optional[VolContext]]] = {}
         self._trigger_signatures: Dict[str, set] = {}
         self._day_baseline_balance: Optional[float] = None
         self._daily_loss_stop: bool = False
@@ -1136,6 +1146,75 @@ class Core:
                 return new_sig
         return sig
 
+    def _get_vol_context(self, symbol: str, data: Dict[str, Any]) -> Optional[VolContext]:
+        """Cached 7-signal vol-surface context from the symbol's daily candles.
+        Returns None when daily data is missing/short — callers must fail open."""
+        cached = self._vol_contexts.get(symbol)
+        now = time.time()
+        if cached is not None and now - cached[0] < VOL_REGIME_REFRESH_MIN * 60.0:
+            return cached[1]
+
+        ctx: Optional[VolContext] = None
+        try:
+            df_d = data.get("D")
+            df_15m = data.get("15M")
+            spot = None
+            if df_15m is not None and not df_15m.empty:
+                spot = float(df_15m["close"].iloc[-1])
+            if df_d is not None and not df_d.empty:
+                ctx = build_vol_context(
+                    symbol, df_d["close"].to_list(), spot=spot, df_15m=df_15m
+                )
+        except Exception as exc:
+            print(f"[VolRegime] {symbol} context failed: {exc}")
+        if ctx is not None:
+            print(
+                f"[VolRegime] {symbol} R(t)={ctx.r_t:.1f} [{ctx.regime}] "
+                f"base={ctx.base_r_t:.1f} tape={ctx.tape_stress:.1f} "
+                f"IV={ctx.atm_iv:.1%} RV={ctx.rv:.1%} EM1D={ctx.em_1d:.5g}"
+            )
+        self._vol_contexts[symbol] = (now, ctx)
+        return ctx
+
+    def _apply_vol_regime_filter(
+        self, symbol: str, sig: Dict[str, Any], data: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """PANIC-score entry brake + expected-move TP sanity check (IV Surface port)."""
+        if not VOL_REGIME_FILTER_ENABLED or symbol.upper() not in VOL_REGIME_SYMBOLS:
+            return sig
+        if not isinstance(sig, dict) or sig.get("signal") != "ENTER":
+            return sig
+        ctx = self._get_vol_context(symbol, data)
+        if ctx is None:
+            return sig  # no daily data — the filter must not block trading
+
+        # Attach context to the signal for journaling / AI stats even when passing
+        sig = dict(sig)
+        sig["vol_R"] = round(ctx.r_t, 1)
+        sig["vol_regime"] = ctx.regime
+        sig["vol_em_1d"] = round(ctx.em_1d, 6)
+
+        tp_prices = sig.get("tp_prices") or (
+            [sig["tp_price"]] if sig.get("tp_price") is not None else []
+        )
+        try:
+            tp_prices = [float(x) for x in tp_prices if x is not None]
+        except (TypeError, ValueError):
+            tp_prices = []
+        ok, reason = entry_gate(
+            ctx,
+            sig.get("entry_price"),
+            tp_prices,
+            max_r=VOL_REGIME_MAX_R,
+            em_tp_ratio=EM_TP_MAX_RATIO,
+        )
+        if ok:
+            return sig
+        sig["signal"] = "SKIP_VOL_REGIME" if ctx.r_t >= VOL_REGIME_MAX_R else "SKIP_EM_TP"
+        sig["info"] = reason
+        print(f"[VolRegime] {symbol} entry blocked: {reason}")
+        return sig
+
     @staticmethod
     def _trigger_signature(sig: Dict[str, Any]) -> str:
         """Stable identity of a setup: side + trigger kind + its zone (or stop
@@ -1173,6 +1252,8 @@ class Core:
             info += f" | blocked_by={sig.get('session_blocked')}"
         if signal_type == "SKIP_BUDGET":
             info += f" | reason=time_budget_exceeded"
+        if signal_type in ("SKIP_VOL_REGIME", "SKIP_EM_TP"):
+            info += f" | reason={sig.get('info')} | vol_R={sig.get('vol_R')}"
         if signal_type == "NO_DATA":
             info += f" | reason=no_data_from_feed"
         if signal_type == "EXIT_BROKER":
@@ -1645,6 +1726,7 @@ class Core:
 
                 sig = self._apply_global_filters(symbol, sig)
                 sig = self._apply_session_filter(symbol, sig)
+                sig = self._apply_vol_regime_filter(symbol, sig, strategy_data)
 
                 if sig.get("signal") == "ENTER":
                     side = sig.get("side")

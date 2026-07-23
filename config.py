@@ -126,6 +126,26 @@ MAX_SETUPS_PER_SYMBOL_PER_DAY = _env_int("MAX_SETUPS_PER_SYMBOL_PER_DAY") or 3
 # When equity drops below balance*(1-limit), new entries stop until next day.
 DAILY_MAX_LOSS_PCT = _env_float("DAILY_MAX_LOSS_PCT", 0.03)
 
+# ================== VOL REGIME FILTER (IV Surface port) ==================
+# 7-signal volatility-surface score R(t) 0-100 computed from the symbol's own
+# daily candles (port of the GOLD IV Surface indicator). Entries are blocked
+# while R(t) >= VOL_REGIME_MAX_R (PANIC regime). Independently, EM_TP_MAX_RATIO
+# blocks setups whose TP1 is further than N x the IV-implied 1-day expected
+# move (unreachable before the daily flat close). Set ratio/threshold to 0 to
+# disable that half of the filter.
+VOL_REGIME_FILTER_ENABLED = os.getenv("VOL_REGIME_FILTER", "1").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+VOL_REGIME_SYMBOLS = [
+    s.strip().upper()
+    for s in os.getenv("VOL_REGIME_SYMBOLS", "GOLD,EURUSD,GBPUSD,USDCAD").split(",")
+    if s.strip()
+]
+VOL_REGIME_MAX_R = _env_float("VOL_REGIME_MAX_R", 60.0)
+EM_TP_MAX_RATIO = _env_float("EM_TP_MAX_RATIO", 1.0)
+# Recompute the vol context at most this often per symbol (RV moves slowly).
+VOL_REGIME_REFRESH_MIN = _env_int("VOL_REGIME_REFRESH_MIN") or 15
+
 # ================== EXECUTION SIZING GUARDS ==================
 # Cap on total volume (lots) per setup, applied on top of the broker maximum.
 MT5_MAX_VOLUME = _env_float("MT5_MAX_VOLUME", 10.0)
