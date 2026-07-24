@@ -334,7 +334,17 @@ sudo systemd-analyze verify /etc/systemd/system/forexbot-lse-import.service
 ```
 
 The default example uses paced REST for the long 2020–2026, three-symbol
-backfill and builds `1m`, `5m`, `15m`, `1h`, `4h` and `1d`. Leave
+backfill and builds `1m`, `5m`, `15m`, `1h`, `4h` and `1d`. REST requests use
+only provider-supported `YYYY-MM-DD` bounds: each request covers up to three
+complete UTC dates, and the importer filters the first/last partial dates back
+to the exact requested timestamps during normalization. Every ascending window
+is checked with a descending one-row tail probe. If a plan cap silently
+truncates the ascending result, the timestamps disagree and the run fails
+closed with a recommendation to use bulk export. Empty weekend windows are
+skipped without ending the backfill. This means two paced HTTP requests per
+UTC date window (plus any retry attempts), which is designed to keep the normal
+long run inside the unit's three-hour timeout at the default interval; repeated
+rate-limit retries can still extend it. Leave
 `LSE_DATASET=` empty to resolve and validate every symbol through the provider
 catalog (for example, Forex is `fx`, while gold is `commodity`). The
 `LSE_OUTPUT_DIR` target must not exist before the run; use a new versioned path

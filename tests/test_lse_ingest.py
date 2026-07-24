@@ -52,13 +52,11 @@ class FakeRestClient:
         self,
         rows,
         *,
-        inclusive=True,
         server_cap=None,
         catalog=None,
     ):
         self.rows = list(rows)
         self.calls = []
-        self.inclusive = inclusive
         self.server_cap = server_cap
         self.catalog_calls = 0
         symbols = {str(row["symbol"]) for row in self.rows}
@@ -85,6 +83,8 @@ class FakeRestClient:
         order,
         dataset,
     ):
+        assert len(start) == 10 and start[4] == "-" and start[7] == "-"
+        assert len(end) == 10 and end[4] == "-" and end[7] == "-"
         self.calls.append(
             {
                 "symbol": symbol,
@@ -96,19 +96,19 @@ class FakeRestClient:
                 "dataset": dataset,
             }
         )
-        lower = pd.Timestamp(start)
-        upper = pd.Timestamp(end)
+        lower = pd.Timestamp(start, tz="UTC")
+        upper = pd.Timestamp(end, tz="UTC")
         selected = [
             row
             for row in self.rows
             if str(row["symbol"]) == symbol
-            and (
-                (lower <= pd.Timestamp(row["timestamp"]))
-                if self.inclusive
-                else (lower < pd.Timestamp(row["timestamp"]))
-            )
+            and lower <= pd.Timestamp(row["timestamp"])
             and pd.Timestamp(row["timestamp"]) < upper
         ]
+        selected.sort(
+            key=lambda row: pd.Timestamp(row["timestamp"]),
+            reverse=order == "desc",
+        )
         effective_limit = min(limit, self.server_cap or limit)
         return selected[:effective_limit]
 
@@ -248,13 +248,13 @@ def test_rest_import_builds_immutable_snapshot_and_pages(tmp_path, monkeypatch):
         start="2026-07-01",
         end="2026-07-04",
         transport="rest",
-        page_limit=700,
+        page_limit=5000,
         rest_min_interval=0,
         client=client,
     )
 
     assert result.output == target.resolve()
-    assert len(client.calls) > 1
+    assert len(client.calls) == 2
     assert all(call["dataset"] == "fx" for call in client.calls)
     assert {path.name for path in target.glob("*.parquet")} == {
         "EURUSD_1m.parquet",
@@ -371,98 +371,91 @@ def test_normalization_rejects_mislabeled_series(column, bad_value, message):
         )
 
 
-@pytest.mark.parametrize("inclusive", [True, False])
-def test_rest_pagination_handles_server_cap_and_boundary_semantics(inclusive):
-    rows = _minute_rows("2026-01-01T00:00:00Z", 10)
-    client = FakeRestClient(rows, inclusive=inclusive, server_cap=3)
+def test_rest_uses_date_windows_and_filters_partial_days_later():
+    rows = _minute_rows("2026-01-01T00:00:00Z", 2 * 24 * 60)
+    client = FakeRestClient(rows)
 
     raw, report = fetch_lse_rest(
         client,
         provider_symbol="EUR/USD",
         dataset="fx",
-        start="2026-01-01T00:00:00Z",
-        end="2026-01-01T00:10:00Z",
+        start="2026-01-01T12:00:00Z",
+        end="2026-01-02T06:00:00Z",
         page_limit=5000,
         rest_min_interval=0,
     )
     minute, _ = normalize_lse_candles(
         raw,
         expected_provider_symbol="EUR/USD",
-        start="2026-01-01T00:00:00Z",
-        end="2026-01-01T00:10:00Z",
+        start="2026-01-01T12:00:00Z",
+        end="2026-01-02T06:00:00Z",
     )
 
-    assert len(minute) == 10
-    assert len(client.calls) > 1
-    assert pd.Timestamp(client.calls[0]["start"]) == pd.Timestamp(
-        "2025-12-31T23:59:00Z"
-    )
-    if inclusive:
-        assert report["pagination_overlap_rows"] > 0
-    else:
-        assert report["pagination_overlap_rows"] == 0
+    assert len(raw) == 2 * 24 * 60
+    assert len(minute) == 18 * 60
+    assert [(call["start"], call["end"], call["order"], call["limit"]) for call in client.calls] == [
+        ("2026-01-01", "2026-01-03", "asc", 5000),
+        ("2026-01-01", "2026-01-03", "desc", 1),
+    ]
+    assert report["utc_date_windows"] == 1
+    assert report["window_days"] == 3
+    assert report["tail_probes"] == 1
+    assert report["pagination_overlap_rows"] == 0
 
 
-def test_rest_pagination_handles_inclusive_one_row_server_cap():
-    rows = _minute_rows("2026-01-01T00:00:00Z", 10)
-    client = FakeRestClient(rows, inclusive=True, server_cap=1)
-    raw, _ = fetch_lse_rest(
+def test_rest_skips_empty_weekend_date_windows_and_continues():
+    rows = _minute_rows("2026-01-02T00:00:00Z", 2)
+    rows += _minute_rows("2026-01-05T00:00:00Z", 2)
+    client = FakeRestClient(rows)
+    raw, report = fetch_lse_rest(
         client,
         provider_symbol="EUR/USD",
         dataset="fx",
-        start="2026-01-01T00:00:00Z",
-        end="2026-01-01T00:10:00Z",
-        page_limit=5000,
+        start="2026-01-02",
+        end="2026-01-06",
+        page_limit=1441,
         rest_min_interval=0,
     )
-    minute, _ = normalize_lse_candles(
-        raw,
-        expected_provider_symbol="EUR/USD",
-        start="2026-01-01T00:00:00Z",
-        end="2026-01-01T00:10:00Z",
+
+    assert len(raw) == 4
+    assert report["utc_date_windows"] == 4
+    assert report["empty_utc_date_windows"] == 2
+    assert report["pages"] == 2
+    assert report["requests"] == 8
+    assert all(len(call["start"]) == 10 for call in client.calls)
+
+
+def test_rest_tail_probe_rejects_hidden_plan_cap():
+    client = FakeRestClient(
+        _minute_rows("2026-01-01T00:00:00Z", 10),
+        server_cap=3,
     )
-    assert len(minute) == 10
-    assert any(
-        pd.Timestamp(call["start"]).second == 1
-        for call in client.calls
-    )
-
-
-def test_rest_pagination_rejects_non_advancing_multirow_page():
-    class RepeatingClient(FakeRestClient):
-        def candles(self, *args, **kwargs):
-            self.calls.append(kwargs)
-            return self.rows[:3]
-
-    client = RepeatingClient(_minute_rows("2026-01-01T00:00:00Z", 10))
-    with pytest.raises(LSEIngestError, match="strictly advance"):
+    with pytest.raises(LSEIngestError, match="capped.*bulk export"):
         fetch_lse_rest(
             client,
             provider_symbol="EUR/USD",
             dataset="fx",
             start="2026-01-01T00:00:00Z",
             end="2026-01-01T00:10:00Z",
-            page_limit=3,
+            page_limit=5000,
             rest_min_interval=0,
         )
 
 
-def test_conflicting_rest_boundary_row_is_rejected():
-    class ConflictingBoundaryClient(FakeRestClient):
+def test_rest_tail_probe_rejects_conflicting_latest_candle():
+    class ConflictingTailClient(FakeRestClient):
         def candles(self, *args, **kwargs):
             rows = super().candles(*args, **kwargs)
-            if len(self.calls) == 2 and rows:
+            if kwargs["order"] == "desc" and rows:
                 rows = [dict(row) for row in rows]
                 rows[0]["close"] += 0.001
                 rows[0]["high"] += 0.001
             return rows
 
-    with pytest.raises(LSEIngestError, match="transport boundary"):
+    with pytest.raises(LSEIngestError, match="tail-probe candle conflicts"):
         fetch_lse_rest(
-            ConflictingBoundaryClient(
-                _minute_rows("2026-01-01T00:00:00Z", 10),
-                inclusive=True,
-                server_cap=3,
+            ConflictingTailClient(
+                _minute_rows("2026-01-01T00:00:00Z", 10)
             ),
             provider_symbol="EUR/USD",
             dataset="fx",
@@ -472,7 +465,118 @@ def test_conflicting_rest_boundary_row_is_rejected():
         )
 
 
-def test_rest_boundary_dedupe_does_not_hide_provider_duplicates():
+def test_rest_rejects_response_reaching_configured_window_limit():
+    rows = _minute_rows("2026-01-01T00:00:00Z", 1)
+    rows *= 1441
+    client = FakeRestClient(rows)
+    with pytest.raises(LSEIngestError, match="reached its row limit"):
+        fetch_lse_rest(
+            client,
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-01-01",
+            end="2026-01-02",
+            page_limit=1441,
+            rest_min_interval=0,
+        )
+    assert len(client.calls) == 1
+
+
+def test_rest_rejects_limit_that_cannot_hold_a_complete_m1_day():
+    client = FakeRestClient(_minute_rows("2026-01-01T00:00:00Z", 1))
+    with pytest.raises(LSEIngestError, match="at least 1441"):
+        fetch_lse_rest(
+            client,
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-01-01",
+            end="2026-01-02",
+            page_limit=1440,
+            rest_min_interval=0,
+        )
+    assert client.calls == []
+
+
+def test_rest_rejects_rows_outside_requested_date_window():
+    class DateIgnoringClient(FakeRestClient):
+        def candles(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            return self.rows[: kwargs["limit"]]
+
+    client = DateIgnoringClient(
+        _minute_rows("2026-01-02T00:00:00Z", 1)
+    )
+    with pytest.raises(LSEIngestError, match="outside.*UTC-day window"):
+        fetch_lse_rest(
+            client,
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-01-01",
+            end="2026-01-02",
+            rest_min_interval=0,
+        )
+
+
+def test_rest_rejects_null_sdk_response():
+    class NullClient(FakeRestClient):
+        def candles(self, *args, **kwargs):
+            self.calls.append(kwargs)
+            return None
+
+    client = NullClient(_minute_rows("2026-01-01T00:00:00Z", 1))
+    with pytest.raises(LSEIngestError, match="null ascending response"):
+        fetch_lse_rest(
+            client,
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-01-01",
+            end="2026-01-02",
+            rest_min_interval=0,
+        )
+    assert len(client.calls) == 1
+
+
+def test_rest_rejects_current_open_utc_day():
+    client = FakeRestClient(_minute_rows("2026-07-25T00:00:00Z", 1))
+    with pytest.raises(LSEIngestError, match="still-open UTC day"):
+        fetch_lse_rest(
+            client,
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-07-24",
+            end="2026-07-25T00:01:00Z",
+            rest_min_interval=0,
+            now="2026-07-25T12:00:00Z",
+        )
+    assert client.calls == []
+
+
+def test_rest_rejects_misaligned_tail_probe_timestamp():
+    class MisalignedTailClient(FakeRestClient):
+        def candles(self, *args, **kwargs):
+            rows = super().candles(*args, **kwargs)
+            if kwargs["order"] == "desc" and rows:
+                rows = [dict(row) for row in rows]
+                rows[0]["timestamp"] = (
+                    pd.Timestamp(rows[0]["timestamp"])
+                    + pd.Timedelta(seconds=30)
+                ).isoformat()
+            return rows
+
+    with pytest.raises(LSEIngestError, match="tail-probe.*exact UTC minute"):
+        fetch_lse_rest(
+            MisalignedTailClient(
+                _minute_rows("2026-01-01T00:00:00Z", 10)
+            ),
+            provider_symbol="EUR/USD",
+            dataset="fx",
+            start="2026-01-01T00:00:00Z",
+            end="2026-01-01T00:10:00Z",
+            rest_min_interval=0,
+        )
+
+
+def test_rest_date_windows_do_not_hide_provider_duplicates():
     rows = _minute_rows("2026-01-01T00:00:00Z", 3)
     rows.extend([dict(rows[0]), dict(rows[0])])
     raw, _ = fetch_lse_rest(
@@ -513,11 +617,12 @@ def test_rest_429_uses_configured_retry_delay():
         dataset="fx",
         start="2026-01-01T00:00:00Z",
         end="2026-01-01T00:02:00Z",
-        rest_min_interval=0,
+        rest_min_interval=0.35,
         retry_after_seconds=61,
         sleep=sleeps.append,
     )
     assert 61.0 in sleeps
+    assert sleeps.count(0.35) == 2
 
 
 def test_catalog_resolves_dataset_per_symbol_before_requests(tmp_path):

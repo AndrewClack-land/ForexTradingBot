@@ -33,6 +33,7 @@ DEFAULT_TARGET_TIMEFRAMES = ("1m", "5m", "15m", "1h", "4h", "1d")
 DEFAULT_BAR_TIMEZONE = "Europe/Athens"
 DEFAULT_REST_MIN_INTERVAL = 0.35
 DEFAULT_RETRY_AFTER_SECONDS = 60.0
+MIN_REST_DAY_LIMIT = 1441
 DEFAULT_MIN_BUCKET_COVERAGE = 0.95
 DEFAULT_MAX_EDGE_GAP_DAYS = 4.0
 DEFAULT_MAX_INTERNAL_GAP_DAYS = 4.0
@@ -680,14 +681,41 @@ def fetch_lse_rest(
     rest_min_interval: float = DEFAULT_REST_MIN_INTERVAL,
     retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
+    now: Any = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
-    """Fetch M1 pages with overlap-safe pagination and API pacing."""
+    """Fetch M1 candles through the provider's UTC date-window contract.
+
+    ``/vault/candles`` accepts ``YYYY-MM-DD`` bounds, with an inclusive start
+    date and an exclusive end date.  Each request therefore covers one to three
+    complete UTC calendar days.  A complete M1 day has at most 1,440 aligned
+    bars; the window is sized so its theoretical maximum remains below the
+    configured row limit.  Reaching the limit is treated as possible
+    server-side truncation.  Partial requested days are filtered later by
+    :func:`normalize_lse_candles`.
+    """
 
     start_utc = _utc_bound(start, name="start")
     end_utc = _utc_bound(end, name="end")
     if end_utc <= start_utc:
         raise LSEIngestError("end must be after start")
+    now_utc = (
+        pd.Timestamp.now(tz="UTC")
+        if now is None
+        else _utc_bound(now, name="now")
+    )
+    last_closed_utc_day = now_utc.normalize()
+    if end_utc > last_closed_utc_day:
+        raise LSEIngestError(
+            "REST snapshots cannot include the current, still-open UTC day; "
+            f"end must be no later than {last_closed_utc_day.isoformat()}"
+        )
     page_limit = min(max(int(page_limit), 1), 5000)
+    if page_limit < MIN_REST_DAY_LIMIT:
+        raise LSEIngestError(
+            "page_limit must be at least "
+            f"{MIN_REST_DAY_LIMIT} for a complete UTC M1 day"
+        )
+    window_days = min(3, max(1, (page_limit - 1) // 1440))
     if int(retries) < 0:
         raise LSEIngestError("retries must be non-negative")
     if (
@@ -701,88 +729,167 @@ def fetch_lse_rest(
     ):
         raise LSEIngestError("retry_after_seconds must be finite and non-negative")
 
-    # One-minute look-behind preserves the requested first bar whether the
-    # provider interprets ``start`` as inclusive or exclusive.
-    cursor = start_utc - _TARGET_DELTAS[SOURCE_TIMEFRAME]
-    previous_max: Optional[pd.Timestamp] = None
-    strict_after_boundary = False
-    pages: list[pd.DataFrame] = []
-    page_attempts = 0
-    api_requests = 0
-    while cursor < end_utc:
-        if page_attempts:
-            sleep(float(rest_min_interval))
-        page_attempts += 1
-        if page_attempts > 100_000:
-            raise LSEIngestError("LSE pagination exceeded its safety limit")
+    first_day = start_utc.normalize()
+    end_day = end_utc.normalize()
+    if end_utc != end_day:
+        end_day += pd.Timedelta(days=1)
 
-        def request_page():
-            nonlocal api_requests
-            api_requests += 1
-            return client.candles(
-                provider_symbol,
-                SOURCE_TIMEFRAME,
-                start=cursor.isoformat(),
-                end=end_utc.isoformat(),
-                limit=page_limit,
-                order="asc",
-                dataset=dataset,
+    pages: list[pd.DataFrame] = []
+    requested_windows = 0
+    empty_windows = 0
+    api_requests = 0
+    window_start = first_day
+    while window_start < end_day:
+        requested_windows += 1
+        window_end = min(
+            window_start + pd.Timedelta(days=window_days),
+            end_day,
+        )
+        request_start = window_start.strftime("%Y-%m-%d")
+        request_end = window_end.strftime("%Y-%m-%d")
+
+        def fetch_day(*, order: str, limit: int):
+            def request():
+                nonlocal api_requests
+                if api_requests and float(rest_min_interval) > 0:
+                    sleep(float(rest_min_interval))
+                api_requests += 1
+                return client.candles(
+                    provider_symbol,
+                    SOURCE_TIMEFRAME,
+                    start=request_start,
+                    end=request_end,
+                    limit=limit,
+                    order=order,
+                    dataset=dataset,
+                )
+
+            return _request_with_retry(
+                request,
+                retries=retries,
+                sleep=sleep,
+                retry_after_seconds=retry_after_seconds,
             )
 
-        rows = _request_with_retry(
-            request_page,
-            retries=retries,
-            sleep=sleep,
-            retry_after_seconds=retry_after_seconds,
+        rows = fetch_day(order="asc", limit=page_limit)
+        if rows is None:
+            raise LSEIngestError(
+                "LSE REST returned a null ascending response for "
+                f"{request_start}"
+            )
+        page = _lowercase_columns(
+            pd.DataFrame(rows)
         )
-        if not rows:
-            break
-        page = _lowercase_columns(pd.DataFrame(rows))
-        parsed = pd.to_datetime(_timestamp_values(page), utc=True, errors="coerce")
-        if parsed.isna().any():
-            raise LSEIngestError("LSE REST page contains invalid timestamps")
-        last = pd.Timestamp(parsed.max()).tz_convert("UTC")
-        if previous_max is not None and last <= previous_max:
-            unique_page_times = pd.DatetimeIndex(parsed).unique()
-            if len(unique_page_times) == 1 and unique_page_times[0] == previous_max:
-                if cursor > previous_max:
-                    # The provider still returned the same boundary after a
-                    # strict cursor. Treat it as EOF; edge/internal QC later
-                    # catches an unexpectedly truncated range.
-                    break
-                # A one-row server cap on an inclusive API can otherwise look
-                # exactly like EOF. Probe one second after the aligned M1
-                # boundary, then keep strict cursors for subsequent pages.
-                strict_after_boundary = True
-                cursor = previous_max + pd.Timedelta(seconds=1)
-                continue
-            raise LSEIngestError("LSE REST pagination did not strictly advance")
-        if last <= cursor:
-            raise LSEIngestError("LSE REST pagination did not strictly advance")
+        if len(page) >= page_limit:
+            raise LSEIngestError(
+                "LSE REST UTC-day response reached its row limit and may be "
+                f"truncated: {request_start}, rows={len(page)}, "
+                f"limit={page_limit}"
+            )
+
+        tail_rows = fetch_day(order="desc", limit=1)
+        if tail_rows is None:
+            raise LSEIngestError(
+                f"LSE REST returned a null tail-probe response for {request_start}"
+            )
+        tail = _lowercase_columns(
+            pd.DataFrame(tail_rows)
+        )
+        if len(tail) > 1:
+            raise LSEIngestError(
+                "LSE REST tail probe returned more than one candle for "
+                f"{request_start}"
+            )
+
+        def validate_day_response(
+            response: pd.DataFrame,
+            *,
+            label: str,
+        ) -> pd.DatetimeIndex:
+            if response.empty:
+                return pd.DatetimeIndex([], tz="UTC")
+            _validate_returned_identity(
+                response,
+                expected_provider_symbol=provider_symbol,
+                expected_timeframe=SOURCE_TIMEFRAME,
+            )
+            timestamps = pd.to_datetime(
+                _timestamp_values(response),
+                utc=True,
+                errors="coerce",
+            )
+            if timestamps.isna().any():
+                raise LSEIngestError(
+                    f"LSE REST {label} UTC-day response contains invalid "
+                    f"timestamps: {request_start}"
+                )
+            parsed_index = pd.DatetimeIndex(timestamps)
+            misaligned = parsed_index != parsed_index.floor("min")
+            if misaligned.any():
+                raise LSEIngestError(
+                    f"LSE REST {label} response contains timestamp(s) not "
+                    f"aligned to an exact UTC minute: {request_start}"
+                )
+            outside_window = (parsed_index < window_start) | (
+                parsed_index >= window_end
+            )
+            if outside_window.any():
+                raise LSEIngestError(
+                    f"LSE REST {label} response returned candle(s) outside "
+                    "the requested UTC-day window: "
+                    f"{request_start}..{request_end}"
+                )
+            return parsed_index
+
+        parsed = validate_day_response(page, label="ascending")
+        tail_parsed = validate_day_response(tail, label="tail-probe")
+        if page.empty != tail.empty:
+            raise LSEIngestError(
+                "LSE REST UTC-day response disagrees with its tail probe and "
+                f"may be truncated: {request_start}; use bulk export"
+            )
+        if page.empty:
+            empty_windows += 1
+            window_start = window_end
+            continue
+        if parsed.max() != tail_parsed.max():
+            raise LSEIngestError(
+                "LSE REST UTC-day response is capped before the provider's "
+                f"last candle: {request_start}; use bulk export"
+            )
+        latest_rows = page.loc[
+            pd.DatetimeIndex(parsed) == parsed.max()
+        ]
+        try:
+            _, matched_tail_rows = _deduplicate_transport_boundaries(
+                [latest_rows, tail]
+            )
+        except LSEIngestError as exc:
+            raise LSEIngestError(
+                "LSE REST tail-probe candle conflicts with the ascending "
+                f"response: {request_start}; use bulk export"
+            ) from exc
+        if matched_tail_rows != 1:
+            raise LSEIngestError(
+                "LSE REST tail probe did not match the ascending response: "
+                f"{request_start}; use bulk export"
+            )
         pages.append(page)
-        previous_max = last
-        if last + _TARGET_DELTAS[SOURCE_TIMEFRAME] >= end_utc:
-            break
-        # Deliberately overlap the last timestamp until an inclusive one-row
-        # server cap is detected. Afterwards a one-second cursor is safe
-        # because normalized source bars must be aligned to exact M1 opens.
-        next_cursor = (
-            last + pd.Timedelta(seconds=1)
-            if strict_after_boundary
-            else last
-        )
-        if next_cursor <= cursor:
-            raise LSEIngestError("LSE REST pagination cursor stalled")
-        cursor = next_cursor
+        window_start = window_end
 
     if not pages:
-        raise LSEIngestError("LSE REST returned no candle pages")
-    merged, overlap_rows = _deduplicate_transport_boundaries(pages)
+        raise LSEIngestError("LSE REST returned no candles in the UTC-day windows")
+    merged = pd.concat(pages, ignore_index=True, sort=False)
     return merged, {
         "transport": "rest",
         "requests": api_requests,
         "pages": len(pages),
-        "pagination_overlap_rows": overlap_rows,
+        "utc_date_windows": requested_windows,
+        "window_days": window_days,
+        "empty_utc_date_windows": empty_windows,
+        "tail_probes": requested_windows,
+        "pagination_overlap_rows": 0,
+        "page_limit": page_limit,
         "rest_min_interval": float(rest_min_interval),
     }
 

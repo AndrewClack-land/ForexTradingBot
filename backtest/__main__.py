@@ -76,7 +76,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "--transport",
         choices=("export", "rest"),
         default="rest",
-        help="paced paginated REST (default) or chunked bulk Parquet export",
+        help=(
+            "paced UTC date-window REST with tail truncation probes "
+            "(default), or chunked bulk Parquet export"
+        ),
     )
     lse_import.add_argument(
         "--dataset",
@@ -100,12 +103,23 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.001,
         help="fail when duplicate M1 timestamps exceed this fraction",
     )
-    lse_import.add_argument("--page-limit", type=int, default=5000)
+    lse_import.add_argument(
+        "--page-limit",
+        type=int,
+        default=5000,
+        help=(
+            "REST row limit; must exceed 1440 and reaching it fails closed "
+            "(default: 5000)"
+        ),
+    )
     lse_import.add_argument(
         "--rest-min-interval",
         type=float,
         default=0.35,
-        help="minimum seconds between REST pages (default stays below 200/min)",
+        help=(
+            "minimum seconds between every REST request, including tail "
+            "probes and retries (default stays below 200/min)"
+        ),
     )
     lse_import.add_argument(
         "--retry-after-seconds",
