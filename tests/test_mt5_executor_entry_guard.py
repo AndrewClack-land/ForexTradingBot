@@ -9,7 +9,11 @@ from executors import mt5_executor
 
 def _executor():
     executor = mt5_executor.MT5Executor.__new__(mt5_executor.MT5Executor)
-    executor.logger = SimpleNamespace(warning=lambda *args, **kwargs: None)
+    executor.logger = SimpleNamespace(
+        warning=lambda *args, **kwargs: None,
+        error=lambda *args, **kwargs: None,
+        info=lambda *args, **kwargs: None,
+    )
     return executor
 
 
@@ -85,12 +89,22 @@ def test_send_order_rejects_target_already_reached(monkeypatch, side, stop, targ
 def test_execute_entry_forwards_entry_zone(monkeypatch):
     _market(monkeypatch, bid=1.1000, ask=1.1002)
     executor = _executor()
-    executor._calc_volume = lambda symbol, entry, stop: 0.1
+    executor._calc_volume = lambda symbol, entry, stop, *, side: 0.1
     captured = {}
 
     def fake_send_order(*args, **kwargs):
         captured.update(kwargs)
-        return {"price": 1.1002, "deal": 44, "ticket": 33}
+        return {
+            "price": 1.1002,
+            "deal": 44,
+            "ticket": 33,
+            "volume": 0.1,
+            "stop_price": 1.0950,
+            "risk_amount": 10.0,
+            "risk_budget_amount": 10.0,
+            "risk_capital_base": 1000.0,
+            "risk_pct": 0.01,
+        }
 
     executor._send_order = fake_send_order
     executor._find_position_id_from_deal = lambda deal: 55
@@ -113,21 +127,45 @@ def test_execute_entry_forwards_entry_zone(monkeypatch):
 def test_split_subminimum_volumes_are_merged_into_tp1(monkeypatch):
     executor = _executor()
     executor.settings = SimpleNamespace(magic=123)
-    executor.logger = SimpleNamespace(
-        warning=lambda *args, **kwargs: None,
-        error=lambda *args, **kwargs: None,
-        info=lambda *args, **kwargs: None,
+    risk_limit = mt5_executor._RiskLimit(
+        capital_base=1000.0,
+        budget_amount=10.0,
+        fraction=0.01,
+        margin_free=1000.0,
+        account_currency="USD",
+    )
+    executor._risk_limit = lambda: risk_limit
+    executor._size_volume_for_risk = lambda *args, **kwargs: mt5_executor._RiskSizing(
+        volume=0.1,
+        risk_amount=10.0,
+        risk_per_lot=100.0,
+        limit=risk_limit,
     )
     monkeypatch.setattr(
         mt5_executor.mt5,
         "symbol_info",
-        lambda symbol: SimpleNamespace(volume_min=0.1),
+        lambda symbol: SimpleNamespace(volume_min=0.1, volume_step=0.01),
+    )
+    monkeypatch.setattr(
+        mt5_executor.mt5,
+        "symbol_info_tick",
+        lambda symbol: SimpleNamespace(bid=0.99, ask=1.0),
     )
     sent = []
 
     def fake_send(symbol, side, volume, entry, stop, tp, comment, **kwargs):
         sent.append((volume, tp))
-        return {"ticket": 10, "deal": 20, "price": entry}
+        return {
+            "ticket": 10,
+            "deal": 20,
+            "price": entry,
+            "volume": volume,
+            "stop_price": stop,
+            "risk_amount": volume * 100.0,
+            "risk_budget_amount": risk_limit.budget_amount,
+            "risk_capital_base": risk_limit.capital_base,
+            "risk_pct": risk_limit.fraction,
+        }
 
     executor._send_order = fake_send
     executor._find_position_id_from_deal = lambda deal: 30

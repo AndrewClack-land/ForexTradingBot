@@ -30,6 +30,7 @@ from config import (
     MT5_SERVER,
     MT5_MAGIC,
     MT5_RISK_PER_TRADE,
+    MT5_INITIAL_CAPITAL,
     MT5_SLIPPAGE,
     MT5_BRIDGE_SYMBOLS,
     MT5_BRIDGE_TIMEFRAMES,
@@ -72,7 +73,11 @@ from core.state_store import save_active_trades, load_active_trades
 from core.vol_regime import VolContext, build_vol_context, entry_gate
 from core.profiler import TickProfiler
 from core.risk_rules import RiskRules
-from executors.mt5_executor import MT5Executor, MT5Settings
+from executors.mt5_executor import (
+    MT5Executor,
+    MT5Settings,
+    RiskCapacityError,
+)
 from mt5_bridge.mt5_native_bridge import MT5NativeBridge, parse_symbol_spec, parse_timeframes
 
 
@@ -218,13 +223,18 @@ class Core:
                 password=MT5_PASSWORD,
                 server=MT5_SERVER,
                 risk_pct=MT5_RISK_PER_TRADE,
+                initial_capital=MT5_INITIAL_CAPITAL,
+                risk_state_path=str(AI_DATA_DIR / "risk_capital.json"),
                 magic=MT5_MAGIC,
                 slippage=MT5_SLIPPAGE,
                 max_volume=MT5_MAX_VOLUME,
                 commission_per_lot=MT5_COMMISSION_PER_LOT,
             )
             self.mt5_executor = MT5Executor(settings)
-            print(f"[MT5] Execution enabled (risk={MT5_RISK_PER_TRADE:.2%})")
+            print(
+                f"[MT5] Execution enabled (risk={MT5_RISK_PER_TRADE:.2%}, "
+                f"initial_capital={self.mt5_executor.initial_capital:.2f})"
+            )
             return True
         except Exception as exc:
             self.mt5_executor = None
@@ -1832,7 +1842,12 @@ class Core:
                                 if tick is None:
                                     raise RuntimeError(f"No tick for {symbol}")
                                 actual_entry = float(tick.ask if new_trade.side == "LONG" else tick.bid)
-                                total_vol = self.mt5_executor._calc_volume(symbol, actual_entry, new_trade.stop)
+                                total_vol = self.mt5_executor._calc_volume(
+                                    symbol,
+                                    actual_entry,
+                                    new_trade.stop,
+                                    side=new_trade.side,
+                                )
                                 # Sort TPs nearest-first: leg-0 (largest volume at 4+ TPs)
                                 # targets the nearest TP, not the furthest.
                                 tp_prices = (
@@ -1961,6 +1976,22 @@ class Core:
                                 f"active tp_prices={[round(t,5) for t in new_trade.tp_prices]}"
                             )
                             self._entry_cooldowns.pop(symbol, None)
+                        except RiskCapacityError as exc:
+                            # Keep the technical SL intact. The signal is retried
+                            # on the next tick and becomes executable when price
+                            # reaches the risk-compatible entry geometry.
+                            sig["signal"] = "WAIT_RISK_ENTRY"
+                            sig["info"] = str(exc)
+                            risk_adjustment = exc.to_payload()
+                            if risk_adjustment:
+                                sig["risk_adjustment"] = risk_adjustment
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            print(
+                                f"[Core] {symbol} waiting for risk-compatible "
+                                f"entry: {exc}"
+                            )
+                            continue
                         except Exception as exc:
                             err_str = str(exc)
                             is_stale = "Stale signal rejected" in err_str

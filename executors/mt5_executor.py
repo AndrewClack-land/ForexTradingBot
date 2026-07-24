@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
 import logging
 import math
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 import MetaTrader5 as mt5
@@ -31,12 +34,52 @@ def _send_request(request: Dict[str, Any]):
     return result
 
 
+def _calc_profit_request(
+    action: int,
+    symbol: str,
+    volume: float,
+    price_open: float,
+    price_close: float,
+):
+    """Call order_calc_profit across positional and named-only MT5 builds."""
+    named_retry = False
+    try:
+        result = mt5.order_calc_profit(
+            action,
+            symbol,
+            volume,
+            price_open,
+            price_close,
+        )
+    except TypeError:
+        result = None
+        named_retry = True
+    if result is None:
+        try:
+            error = mt5.last_error()
+        except Exception:
+            error = None
+        if named_retry or (error and error[0] == -2):
+            result = mt5.order_calc_profit(
+                action=action,
+                symbol=symbol,
+                volume=volume,
+                price_open=price_open,
+                price_close=price_close,
+            )
+    return result
+
+
 @dataclass
 class MT5Settings:
     login: int
     password: str
     server: str
     risk_pct: float = 0.01
+    # Fixed risk base. When omitted/zero, it is captured once from account
+    # balance and persisted at risk_state_path across bot/VPS restarts.
+    initial_capital: float = 0.0
+    risk_state_path: Optional[str] = None
     magic: int = 20260318
     slippage: int = 20
     retry_sec: float = 0.3
@@ -44,6 +87,59 @@ class MT5Settings:
     # commission per lot included in the risk-per-lot calculation.
     max_volume: float = 10.0
     commission_per_lot: float = 7.0
+
+
+@dataclass(frozen=True)
+class _RiskLimit:
+    capital_base: float
+    budget_amount: float
+    fraction: float
+    margin_free: float
+    account_currency: str
+
+
+@dataclass(frozen=True)
+class _RiskSizing:
+    volume: float
+    risk_amount: float
+    risk_per_lot: float
+    limit: _RiskLimit
+
+
+class RiskLimitError(RuntimeError):
+    """Entry rejected because its broker-side SL risk cannot fit the hard cap."""
+
+
+class RiskCapacityError(RiskLimitError):
+    """The signal remains valid but current entry geometry cannot fit min lot."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        target_entry: Optional[float] = None,
+        required_capital: Optional[float] = None,
+        minimum_volume: Optional[float] = None,
+    ):
+        super().__init__(message)
+        self.target_entry = target_entry
+        self.required_capital = required_capital
+        self.minimum_volume = minimum_volume
+
+    def to_payload(self) -> Dict[str, float]:
+        payload: Dict[str, float] = {}
+        if self.target_entry is not None:
+            payload["target_entry"] = float(self.target_entry)
+        if self.required_capital is not None:
+            payload["required_initial_capital"] = float(self.required_capital)
+        if self.minimum_volume is not None:
+            payload["broker_min_volume"] = float(self.minimum_volume)
+        return payload
+
+
+# This is a code-level ceiling, independent of .env. A lower configured value
+# remains valid, but no configuration can make a new setup risk more than 1%.
+_HARD_MAX_STOP_RISK_PCT = 0.01
 
 
 # Absolute floor (in price units) for the stop distance used in SIZING, and the
@@ -74,11 +170,17 @@ class MT5Executor:
         self.settings = settings
         self.logger = logging.getLogger("MT5Executor")
         self._fill_mode_cache: Dict[str, int] = {}  # symbol → last working fill mode
+        self._initial_capital: Optional[float] = None
         self._connect()
+        self._initial_capital = self._resolve_initial_capital()
 
     # ------------------------------------------------------------------
     # public API
     # ------------------------------------------------------------------
+    @property
+    def initial_capital(self) -> float:
+        return self._resolve_initial_capital()
+
     def execute_entry(self, symbol: str, *, side: str, entry_price: float, stop_price: float,
                       tp_price: Optional[float], comment: Optional[str] = None,
                       entry_min: Optional[float] = None,
@@ -88,7 +190,7 @@ class MT5Executor:
         if tick is None:
             raise RuntimeError(f"No tick data for {symbol} before entry")
         actual_entry = float(tick.ask if side.upper() == "LONG" else tick.bid)
-        volume = self._calc_volume(symbol, actual_entry, stop_price)
+        volume = self._calc_volume(symbol, actual_entry, stop_price, side=side)
 
         order_result = self._send_order(
             symbol,
@@ -114,8 +216,13 @@ class MT5Executor:
         return {
             "ticket": order_result["ticket"],
             "position_id": position_id,
-            "volume": volume,
+            "volume": order_result["volume"],
             "price": fill_price,   # actual broker fill price — not signal price
+            "stop_price": order_result["stop_price"],
+            "risk_amount": order_result["risk_amount"],
+            "risk_budget_amount": order_result["risk_budget_amount"],
+            "risk_capital_base": order_result["risk_capital_base"],
+            "risk_pct": order_result["risk_pct"],
             "comment": comment or "Signal",
         }
 
@@ -149,12 +256,51 @@ class MT5Executor:
         vol_min = float(getattr(info, "volume_min", 0.0) or 0.0) if info is not None else 0.0
         if vol_min <= 0:
             vol_min = 0.01
+        step = float(getattr(info, "volume_step", 0.0) or 0.0) if info is not None else 0.0
+        if step <= 0:
+            step = 0.01
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise RuntimeError(f"No tick data for {symbol} before split entry")
+        actual_entry = float(tick.ask if side.upper() == "LONG" else tick.bid)
+        risk_limit = self._risk_limit()
+
+        # Convert the requested allocation to broker-step units and, if price
+        # drift reduced the safe total since the caller sized it, scale the
+        # whole setup down before any leg reaches order_send().
+        raw_volumes = [max(0.0, float(value)) for value in volumes_per_tp]
+        requested_total = sum(raw_volumes)
+        if requested_total <= 0:
+            return []
+        preflight = self._size_volume_for_risk(
+            symbol,
+            side,
+            actual_entry,
+            stop_price,
+            requested_volume=requested_total,
+            risk_limit=risk_limit,
+        )
+        target_units = max(0, int(math.floor(preflight.volume / step + 1e-12)))
+        exact_units = [
+            target_units * value / requested_total
+            for value in raw_volumes
+        ]
+        units = [int(math.floor(value + 1e-12)) for value in exact_units]
+        remainder_units = target_units - sum(units)
+        allocation_order = sorted(
+            range(len(units)),
+            key=lambda idx: (exact_units[idx] - units[idx], -idx),
+            reverse=True,
+        )
+        for idx in allocation_order[:remainder_units]:
+            units[idx] += 1
+        normalized_volumes = [round(value * step, 8) for value in units]
 
         # Merge sub-minimum allocations toward the *nearest* target. Carrying
         # them forward would leave tiny setups with only TP3, which lowers the
         # chance of realizing any win. Reverse merging yields TP1-only when the
         # broker minimum permits just one leg.
-        normalized_volumes = [max(0.0, float(value)) for value in volumes_per_tp]
         for idx in range(len(normalized_volumes) - 1, 0, -1):
             if 0 < normalized_volumes[idx] < vol_min:
                 normalized_volumes[idx - 1] += normalized_volumes[idx]
@@ -180,6 +326,7 @@ class MT5Executor:
                     )
 
         carry = 0.0  # volume from legs too small to open, merged into the next leg
+        risk_used_amount = 0.0
         for i, (vol, tp) in enumerate(zip(normalized_volumes, tp_prices)):
             vol = round(vol + carry, 8)
             carry = 0.0
@@ -208,7 +355,21 @@ class MT5Executor:
                     comment=leg_comment,
                     entry_min=entry_min,
                     entry_max=entry_max,
+                    risk_limit=risk_limit,
+                    risk_used_amount=risk_used_amount,
                 )
+            except RiskLimitError:
+                # The final fresh-tick guard can leave too little budget for one
+                # more broker-minimum leg. Previously opened legs remain a valid,
+                # tracked setup below the cap; stop adding exposure.
+                if results:
+                    self.logger.warning(
+                        "Split entry stopped after %d/%d legs: remaining 1%% risk "
+                        "budget cannot fit another minimum leg",
+                        len(results), len(tp_prices),
+                    )
+                    break
+                raise
             except Exception:
                 # Roll back the legs opened so far — a half-opened split entry is not
                 # registered in active_trades and would be orphaned in the market.
@@ -242,15 +403,24 @@ class MT5Executor:
             results.append({
                 "ticket": order_result["ticket"],
                 "position_id": position_id,
-                "volume": vol,
+                "volume": order_result["volume"],
                 "price": order_result["price"],
+                "stop_price": order_result["stop_price"],
+                "risk_amount": order_result["risk_amount"],
+                "risk_budget_amount": order_result["risk_budget_amount"],
+                "risk_capital_base": order_result["risk_capital_base"],
+                "risk_pct": order_result["risk_pct"],
                 "tp": tp,
                 "tp_index": i + 1,
                 "comment": leg_comment,
             })
+            risk_used_amount += float(order_result["risk_amount"])
             self.logger.info(
-                "Split entry leg %d/%d: %s %s vol=%.2f tp=%.5f position_id=%s",
-                i + 1, len(tp_prices), symbol, side, vol, tp, position_id,
+                "Split entry leg %d/%d: %s %s vol=%.4f tp=%.5f "
+                "position_id=%s setup_risk=%.2f/%.2f %s",
+                i + 1, len(tp_prices), symbol, side, order_result["volume"], tp,
+                position_id, risk_used_amount, risk_limit.budget_amount,
+                risk_limit.account_currency,
             )
         if carry > 0:
             self.logger.warning(
@@ -546,79 +716,589 @@ class MT5Executor:
             and getattr(pos, "magic", None) == self.settings.magic
         }
 
-    def _calc_volume(self, symbol: str, entry_price: float, stop_price: float) -> float:
+    def _resolve_initial_capital(self, account=None) -> float:
+        cached = getattr(self, "_initial_capital", None)
+        if cached is not None:
+            cached = float(cached)
+            if math.isfinite(cached) and cached > 0:
+                return cached
+
+        configured_raw = getattr(self.settings, "initial_capital", 0.0)
+        try:
+            configured = float(configured_raw or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid MT5_INITIAL_CAPITAL {configured_raw!r}"
+            ) from exc
+        if not math.isfinite(configured) or configured < 0:
+            raise RiskLimitError(
+                f"Invalid MT5_INITIAL_CAPITAL {configured!r}"
+            )
+        if configured > 0:
+            self._initial_capital = configured
+            return configured
+
+        account = account or mt5.account_info()
+        if account is None:
+            raise RiskLimitError(f"MT5 account_info unavailable: {mt5.last_error()}")
+        try:
+            default_login = int(getattr(self.settings, "login", 0) or 0)
+            account_login = int(getattr(account, "login", default_login) or default_login)
+            account_server = str(
+                getattr(account, "server", None)
+                or getattr(self.settings, "server", "")
+                or ""
+            )
+            current_balance = float(account.balance)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RiskLimitError(f"Invalid MT5 account data: {exc}") from exc
+        if not math.isfinite(current_balance) or current_balance <= 0:
+            raise RiskLimitError(
+                f"Cannot capture initial capital from balance={current_balance!r}"
+            )
+
+        state_path_raw = getattr(self.settings, "risk_state_path", None)
+        state_path = Path(state_path_raw) if state_path_raw else None
+        if state_path is not None and state_path.exists():
+            try:
+                payload = json.loads(state_path.read_text(encoding="utf-8"))
+                stored_login = int(payload["account_login"])
+                stored_server = str(payload.get("account_server") or "")
+                stored_capital = float(payload["initial_capital"])
+            except Exception as exc:
+                raise RiskLimitError(
+                    f"Invalid persisted initial-capital state at {state_path}: {exc}"
+                ) from exc
+            if stored_login == account_login and stored_server == account_server:
+                if not math.isfinite(stored_capital) or stored_capital <= 0:
+                    raise RiskLimitError(
+                        f"Invalid persisted initial capital {stored_capital!r}"
+                    )
+                self._initial_capital = stored_capital
+                return stored_capital
+            self.logger.warning(
+                "Risk-capital state belongs to %s@%s; recapturing for %s@%s",
+                stored_login, stored_server, account_login, account_server,
+            )
+
+        captured = current_balance
+        if state_path is not None:
+            payload = {
+                "account_login": account_login,
+                "account_server": account_server,
+                "account_currency": str(getattr(account, "currency", "") or ""),
+                "initial_capital": captured,
+                "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            }
+            try:
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = state_path.with_name(f"{state_path.name}.tmp")
+                tmp_path.write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                tmp_path.replace(state_path)
+            except Exception as exc:
+                raise RiskLimitError(
+                    f"Cannot persist initial capital at {state_path}: {exc}"
+                ) from exc
+
+        self._initial_capital = captured
+        self.logger.warning(
+            "Initial risk capital fixed at %.2f %s",
+            captured,
+            str(getattr(account, "currency", "") or ""),
+        )
+        return captured
+
+    def _risk_limit(self) -> _RiskLimit:
+        account = mt5.account_info()
+        if account is None:
+            raise RiskLimitError(f"MT5 account_info unavailable: {mt5.last_error()}")
+
+        try:
+            balance = float(account.balance)
+            equity = float(account.equity)
+            margin_free = float(account.margin_free)
+            configured_pct = float(self.settings.risk_pct)
+        except (AttributeError, TypeError, ValueError) as exc:
+            raise RiskLimitError(f"Invalid MT5 account/risk data: {exc}") from exc
+
+        values = (balance, equity, margin_free, configured_pct)
+        if not all(math.isfinite(value) for value in values):
+            raise RiskLimitError("Non-finite MT5 account/risk data")
+        if balance <= 0 or equity <= 0:
+            raise RiskLimitError(
+                f"Cannot size risk with balance={balance:.2f}, equity={equity:.2f}"
+            )
+        if configured_pct <= 0:
+            raise RiskLimitError(
+                f"MT5_RISK_PCT must be positive, got {configured_pct!r}"
+            )
+
+        effective_pct = min(configured_pct, _HARD_MAX_STOP_RISK_PCT)
+        # The risk base is fixed once at strategy start and persisted. Later
+        # deposits, withdrawals, P/L, floating equity, and VPS restarts do not
+        # silently resize the monetary risk budget.
+        capital_base = self._resolve_initial_capital(account)
+        budget_amount = capital_base * effective_pct
+        if not math.isfinite(budget_amount) or budget_amount <= 0:
+            raise RiskLimitError(f"Invalid stop-risk budget {budget_amount!r}")
+
+        return _RiskLimit(
+            capital_base=capital_base,
+            budget_amount=budget_amount,
+            fraction=effective_pct,
+            margin_free=max(0.0, margin_free),
+            account_currency=str(getattr(account, "currency", "") or ""),
+        )
+
+    def _get_symbol_info(self, symbol: str):
         info = mt5.symbol_info(symbol)
         if info is None:
             raise RuntimeError(f"Unknown symbol {symbol} in MT5")
         if not info.visible:
-            mt5.symbol_select(symbol, True)
+            if not mt5.symbol_select(symbol, True):
+                raise RuntimeError(f"Cannot select symbol {symbol}")
             info = mt5.symbol_info(symbol)
         if info is None:
             raise RuntimeError(f"Cannot select symbol {symbol}")
+        return info
 
-        point = info.point or info.tick_size
-        if point <= 0:
-            raise RuntimeError(f"Bad point for {symbol}")
-        stop_distance = abs(entry_price - stop_price)
-        if stop_distance < point:
-            stop_distance = point
+    @staticmethod
+    def _floor_volume(volume: float, step: float) -> float:
+        if not math.isfinite(volume) or not math.isfinite(step) or step <= 0:
+            return 0.0
+        units = max(0, int(math.floor(volume / step + 1e-12)))
+        return round(units * step, 8)
 
-        # Size against a floored stop distance + expected slippage so a
-        # micro-stop cannot balloon the volume; commission is part of the
-        # per-lot risk. The actual SL order keeps the strategy's level.
-        sym_key = symbol.upper()
-        sizing_distance = max(stop_distance, _MIN_SIZING_STOP.get(sym_key, 0.0))
-        sizing_distance += _EXPECTED_SLIPPAGE.get(sym_key, 0.0)
+    @staticmethod
+    def _broker_min_gap(info) -> float:
+        point = float(
+            getattr(info, "point", 0.0)
+            or getattr(info, "trade_tick_size", 0.0)
+            or getattr(info, "tick_size", 0.0)
+            or 0.0
+        )
+        if not math.isfinite(point) or point <= 0:
+            return 0.0
+        stops_level = int(getattr(info, "trade_stops_level", 0) or 0)
+        spread_points = int(getattr(info, "spread", 0) or 0)
+        freeze_level = int(getattr(info, "trade_freeze_level", 0) or 0)
+        min_gap = float(max(stops_level, spread_points, freeze_level, 1) * point)
+        if stops_level == 0 and spread_points > 0:
+            min_gap = max(min_gap, float(spread_points * 2 * point))
+        return min_gap
 
-        ticks = sizing_distance / point
-        tick_value = getattr(info, "tick_value", None)
-        if not tick_value:
-            contract_size = getattr(info, "trade_contract_size", 1.0)
-            tick_value = contract_size * point
-        tick_value = max(tick_value, 1e-9)
-        commission = max(float(self.settings.commission_per_lot), 0.0)
-        risk_per_lot = max(ticks * tick_value + commission, 1e-6)
-
-        account = mt5.account_info()
-        if account is None:
-            raise RuntimeError("MT5 account_info unavailable")
-        risk_amount = max(account.equity * max(self.settings.risk_pct, 0.0001), 1.0)
-
-        volume = risk_amount / risk_per_lot
-        # info.volume_max can be None or 0 on some brokers — guard against an
-        # unbounded result that causes "Invalid volume" (e.g. 184467M lots).
-        vol_max = float(info.volume_max) if (getattr(info, "volume_max", None) and info.volume_max > 0) else 500.0
-        if self.settings.max_volume and self.settings.max_volume > 0:
-            vol_max = min(vol_max, float(self.settings.max_volume))
-        volume = max(info.volume_min or 0.01, min(volume, vol_max))
-        step = info.volume_step or 0.01
-        volume = math.floor(volume / step) * step
-        if volume < info.volume_min:
-            volume = info.volume_min
-
-        # Cap by available free margin (never use more than 80% of free margin on one trade)
+    def _risk_per_lot(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        stop_price: float,
+        *,
+        info=None,
+    ) -> float:
+        info = info or self._get_symbol_info(symbol)
+        side_key = str(side).upper()
+        if side_key not in {"LONG", "SHORT"}:
+            raise RiskLimitError(f"Unsupported entry side {side!r}")
         try:
-            order_type = mt5.ORDER_TYPE_BUY  # margin is direction-agnostic for most brokers
+            entry = float(entry_price)
+            stop = float(stop_price)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(f"Invalid entry/SL for {symbol}: {exc}") from exc
+        if not math.isfinite(entry) or not math.isfinite(stop) or entry <= 0 or stop <= 0:
+            raise RiskLimitError(
+                f"Non-finite or non-positive entry/SL for {symbol}: {entry!r}/{stop!r}"
+            )
+        if side_key == "LONG" and stop >= entry:
+            raise RiskLimitError(
+                f"LONG SL must be below entry for {symbol}: entry={entry}, sl={stop}"
+            )
+        if side_key == "SHORT" and stop <= entry:
+            raise RiskLimitError(
+                f"SHORT SL must be above entry for {symbol}: entry={entry}, sl={stop}"
+            )
+
+        point = float(
+            getattr(info, "point", 0.0)
+            or getattr(info, "trade_tick_size", 0.0)
+            or getattr(info, "tick_size", 0.0)
+            or 0.0
+        )
+        if not math.isfinite(point) or point <= 0:
+            raise RiskLimitError(f"Invalid point/tick size for {symbol}: {point!r}")
+
+        # Size against the actual broker-side SL, an absolute micro-stop floor,
+        # and expected adverse execution slippage. order_calc_profit converts
+        # the loss to the account currency for FX, metals, and CFDs.
+        stop_distance = abs(entry - stop)
+        sym_key = symbol.upper()
+        sizing_distance = max(
+            stop_distance,
+            point,
+            _MIN_SIZING_STOP.get(sym_key, 0.0),
+        )
+        expected_stop_slippage = _EXPECTED_SLIPPAGE.get(sym_key, 0.0)
+        try:
+            entry_deviation_points = max(float(self.settings.slippage), 0.0)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid MT5 slippage/deviation {self.settings.slippage!r}"
+            ) from exc
+        if not math.isfinite(entry_deviation_points):
+            raise RiskLimitError(
+                f"Invalid MT5 slippage/deviation {entry_deviation_points!r}"
+            )
+        # Reserve both the maximum accepted adverse entry deviation and the
+        # expected stop execution slippage. This keeps a normal within-deviation
+        # fill from consuming the reserve intended for the eventual SL exit.
+        sizing_distance += expected_stop_slippage + entry_deviation_points * point
+        adverse_stop = (
+            entry - sizing_distance
+            if side_key == "LONG"
+            else entry + sizing_distance
+        )
+        order_type = mt5.ORDER_TYPE_BUY if side_key == "LONG" else mt5.ORDER_TYPE_SELL
+        estimated_profit = _calc_profit_request(
+            order_type,
+            symbol,
+            1.0,
+            entry,
+            adverse_stop,
+        )
+        if estimated_profit is None:
+            raise RiskLimitError(
+                f"MT5 order_calc_profit failed for {symbol}: {mt5.last_error()}"
+            )
+        try:
+            estimated_profit = float(estimated_profit)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid order_calc_profit result for {symbol}: {estimated_profit!r}"
+            ) from exc
+        if not math.isfinite(estimated_profit) or estimated_profit >= 0:
+            raise RiskLimitError(
+                f"Invalid stop-loss estimate for {symbol}: {estimated_profit!r}"
+            )
+
+        commission = max(float(self.settings.commission_per_lot), 0.0)
+        if not math.isfinite(commission):
+            raise RiskLimitError(f"Invalid commission_per_lot {commission!r}")
+        risk_per_lot = -estimated_profit + commission
+        if not math.isfinite(risk_per_lot) or risk_per_lot <= 0:
+            raise RiskLimitError(
+                f"Invalid risk per lot for {symbol}: {risk_per_lot!r}"
+            )
+        return risk_per_lot
+
+    def _risk_compatible_entry(
+        self,
+        symbol: str,
+        side: str,
+        current_entry: float,
+        stop_price: float,
+        *,
+        minimum_volume: float,
+        available_risk: float,
+        info,
+    ) -> Optional[float]:
+        """Best price at which broker minimum volume can fit the risk budget.
+
+        The technical SL is never tightened. LONG waits for a lower entry closer
+        to SL; SHORT waits for a higher entry closer to SL.
+        """
+        side_key = str(side).upper()
+        entry = float(current_entry)
+        stop = float(stop_price)
+        point = float(
+            getattr(info, "point", 0.0)
+            or getattr(info, "trade_tick_size", 0.0)
+            or getattr(info, "tick_size", 0.0)
+            or 0.0
+        )
+        price_step = float(
+            getattr(info, "trade_tick_size", 0.0)
+            or getattr(info, "tick_size", 0.0)
+            or point
+        )
+        if (
+            side_key not in {"LONG", "SHORT"}
+            or not all(
+                math.isfinite(value)
+                for value in (
+                    entry,
+                    stop,
+                    point,
+                    price_step,
+                    minimum_volume,
+                    available_risk,
+                )
+            )
+            or point <= 0
+            or price_step <= 0
+            or minimum_volume <= 0
+            or available_risk <= 0
+        ):
+            return None
+
+        current_distance = abs(entry - stop)
+        minimum_distance = max(price_step, self._broker_min_gap(info))
+        if current_distance <= minimum_distance:
+            return None
+
+        def _entry_at(distance: float) -> float:
+            return stop + distance if side_key == "LONG" else stop - distance
+
+        closest_entry = _entry_at(minimum_distance)
+        if closest_entry <= 0:
+            return None
+        closest_risk = (
+            self._risk_per_lot(
+                symbol,
+                side_key,
+                closest_entry,
+                stop,
+                info=info,
+            )
+            * minimum_volume
+        )
+        if closest_risk > available_risk + max(1e-8, available_risk * 1e-10):
+            return None
+
+        low = minimum_distance
+        high = current_distance
+        best = low
+        for _ in range(48):
+            middle = (low + high) / 2.0
+            candidate_entry = _entry_at(middle)
+            candidate_risk = (
+                self._risk_per_lot(
+                    symbol,
+                    side_key,
+                    candidate_entry,
+                    stop,
+                    info=info,
+                )
+                * minimum_volume
+            )
+            if candidate_risk <= available_risk:
+                best = middle
+                low = middle
+            else:
+                high = middle
+
+        digits = int(getattr(info, "digits", 0) or 0)
+        if digits <= 0:
+            point_text = f"{price_step:.10f}".rstrip("0")
+            digits = (
+                len(point_text.split(".", 1)[1])
+                if "." in point_text
+                else 0
+            )
+        raw_target = _entry_at(best)
+        if side_key == "LONG":
+            aligned_target = (
+                math.floor(raw_target / price_step + 1e-12) * price_step
+            )
+        else:
+            aligned_target = (
+                math.ceil(raw_target / price_step - 1e-12) * price_step
+            )
+        return round(aligned_target, digits)
+
+    def _size_volume_for_risk(
+        self,
+        symbol: str,
+        side: str,
+        entry_price: float,
+        stop_price: float,
+        *,
+        requested_volume: Optional[float] = None,
+        risk_limit: Optional[_RiskLimit] = None,
+        risk_used_amount: float = 0.0,
+    ) -> _RiskSizing:
+        info = self._get_symbol_info(symbol)
+        limit = risk_limit or self._risk_limit()
+        try:
+            used = float(risk_used_amount)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(f"Invalid used risk {risk_used_amount!r}") from exc
+        if not math.isfinite(used) or used < 0:
+            raise RiskLimitError(f"Invalid used risk {used!r}")
+
+        available_risk = limit.budget_amount - used
+        tolerance = max(1e-8, limit.budget_amount * 1e-10)
+        if available_risk <= tolerance:
+            raise RiskLimitError(
+                f"Stop-risk budget exhausted for {symbol}: "
+                f"{used:.2f}/{limit.budget_amount:.2f} {limit.account_currency}"
+            )
+
+        risk_per_lot = self._risk_per_lot(
+            symbol,
+            side,
+            entry_price,
+            stop_price,
+            info=info,
+        )
+        step = float(getattr(info, "volume_step", 0.0) or 0.0)
+        vol_min = float(getattr(info, "volume_min", 0.0) or 0.0)
+        vol_max = float(getattr(info, "volume_max", 0.0) or 0.0)
+        if not all(math.isfinite(value) for value in (step, vol_min, vol_max)):
+            raise RiskLimitError(f"Non-finite broker volume rules for {symbol}")
+        if step <= 0 or vol_min <= 0 or vol_max <= 0 or vol_max < vol_min:
+            raise RiskLimitError(
+                f"Invalid broker volume rules for {symbol}: "
+                f"min={vol_min}, max={vol_max}, step={step}"
+            )
+        try:
+            configured_max_volume = float(self.settings.max_volume)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid configured max volume {self.settings.max_volume!r}"
+            ) from exc
+        if not math.isfinite(configured_max_volume):
+            raise RiskLimitError(
+                f"Invalid configured max volume {configured_max_volume!r}"
+            )
+        if configured_max_volume > 0:
+            vol_max = min(vol_max, configured_max_volume)
+        if vol_max < vol_min:
+            raise RiskLimitError(
+                f"Configured max volume {vol_max} is below broker minimum {vol_min}"
+            )
+
+        risk_capacity_volume = min(available_risk / risk_per_lot, vol_max)
+        if risk_capacity_volume + 1e-12 < vol_min:
+            min_lot_risk = vol_min * risk_per_lot
+            target_entry = self._risk_compatible_entry(
+                symbol,
+                side,
+                entry_price,
+                stop_price,
+                minimum_volume=vol_min,
+                available_risk=available_risk,
+                info=info,
+            )
+            required_capital = (
+                (used + min_lot_risk) / limit.fraction
+                if limit.fraction > 0
+                else None
+            )
+            target_text = (
+                f"; wait for entry near {target_entry:g}"
+                if target_entry is not None
+                else "; no broker-valid entry fits the current minimum lot"
+            )
+            raise RiskCapacityError(
+                f"Risk-optimized entry pending for {symbol}: broker minimum "
+                f"{vol_min:g} lot risks {min_lot_risk:.2f} "
+                f"{limit.account_currency}, available {available_risk:.2f}"
+                f"{target_text}",
+                target_entry=target_entry,
+                required_capital=required_capital,
+                minimum_volume=vol_min,
+            )
+
+        volume = risk_capacity_volume
+        if requested_volume is not None:
+            try:
+                requested = float(requested_volume)
+            except (TypeError, ValueError) as exc:
+                raise RiskLimitError(
+                    f"Invalid requested volume {requested_volume!r}"
+                ) from exc
+            if not math.isfinite(requested) or requested <= 0:
+                raise RiskLimitError(f"Invalid requested volume {requested!r}")
+            volume = min(volume, requested)
+
+        # Cap by available free margin (never use more than 80% on one setup).
+        try:
+            order_type = (
+                mt5.ORDER_TYPE_BUY
+                if str(side).upper() == "LONG"
+                else mt5.ORDER_TYPE_SELL
+            )
             margin_per_lot = mt5.order_calc_margin(order_type, symbol, 1.0, entry_price)
-            if margin_per_lot and margin_per_lot > 0:
-                max_vol_by_margin = math.floor((account.margin_free * 0.8) / margin_per_lot / step) * step
-                if max_vol_by_margin > 0 and volume > max_vol_by_margin:
+            if margin_per_lot is not None:
+                margin_per_lot = float(margin_per_lot)
+            if margin_per_lot and math.isfinite(margin_per_lot) and margin_per_lot > 0:
+                max_vol_by_margin = self._floor_volume(
+                    (limit.margin_free * 0.8) / margin_per_lot,
+                    step,
+                )
+                if volume > max_vol_by_margin:
                     self.logger.warning(
-                        "Volume capped by margin: %s lots → %s (free_margin=%.2f, margin_per_lot=%.2f)",
-                        volume, max_vol_by_margin, account.margin_free, margin_per_lot,
+                        "Volume capped by margin: %.8f lots → %.8f "
+                        "(free_margin=%.2f, margin_per_lot=%.2f)",
+                        volume, max_vol_by_margin, limit.margin_free, margin_per_lot,
                     )
                     volume = max_vol_by_margin
         except Exception:
-            pass
+            # Margin calculation is a separate broker check; the SL-risk guard
+            # remains authoritative and order_send will reject insufficient margin.
+            self.logger.warning("MT5 order_calc_margin failed for %s", symbol)
 
-        volume = max(info.volume_min or 0.01, volume)
-        return round(volume, 2)
+        volume = self._floor_volume(volume, step)
+        if volume + 1e-12 < vol_min:
+            raise RiskLimitError(
+                f"Broker minimum {vol_min:g} lot for {symbol} cannot fit "
+                "the requested allocation or available free margin"
+            )
+
+        risk_amount = volume * risk_per_lot
+        if risk_amount > available_risk + tolerance:
+            # Defensive loop for unusual floating-point/step combinations.
+            volume = self._floor_volume(volume - step, step)
+            risk_amount = volume * risk_per_lot
+        if volume + 1e-12 < vol_min or risk_amount > available_risk + tolerance:
+            raise RiskLimitError(
+                f"Cannot fit broker-valid volume for {symbol} under "
+                f"{available_risk:.2f} {limit.account_currency} stop-risk budget"
+            )
+
+        return _RiskSizing(
+            volume=volume,
+            risk_amount=risk_amount,
+            risk_per_lot=risk_per_lot,
+            limit=limit,
+        )
+
+    def _calc_volume(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_price: float,
+        *,
+        side: str = "LONG",
+    ) -> float:
+        sizing = self._size_volume_for_risk(
+            symbol,
+            side,
+            entry_price,
+            stop_price,
+        )
+        self.logger.info(
+            "Risk sizing: %s %s volume=%.4f stop_risk=%.2f/%.2f %s (%.4f%%)",
+            symbol,
+            side,
+            sizing.volume,
+            sizing.risk_amount,
+            sizing.limit.budget_amount,
+            sizing.limit.account_currency,
+            sizing.limit.fraction * 100.0,
+        )
+        return sizing.volume
 
     def _send_order(self, symbol: str, side: str, volume: float,
                     planned_entry: float,
                     stop_price: Optional[float], tp_price: Optional[float], comment: Optional[str],
                     *, entry_min: Optional[float] = None,
-                    entry_max: Optional[float] = None) -> Dict[str, Any]:
+                    entry_max: Optional[float] = None,
+                    risk_limit: Optional[_RiskLimit] = None,
+                    risk_used_amount: float = 0.0) -> Dict[str, Any]:
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
             raise RuntimeError(f"No tick data for {symbol}")
@@ -717,6 +1397,24 @@ class MT5Executor:
                     f"< 30% of planned {original_sl_distance:.5f})"
                 )
 
+        if stop_price is None:
+            raise RiskLimitError(f"Entry rejected for {symbol}: broker-side SL is required")
+        sizing = self._size_volume_for_risk(
+            symbol,
+            side,
+            float(price),
+            float(stop_price),
+            requested_volume=volume,
+            risk_limit=risk_limit,
+            risk_used_amount=risk_used_amount,
+        )
+        if sizing.volume + 1e-12 < float(volume):
+            self.logger.warning(
+                "Final 1%% stop-risk guard reduced %s %s volume %.8f → %.8f",
+                symbol, side, volume, sizing.volume,
+            )
+        volume = sizing.volume
+
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -732,6 +1430,10 @@ class MT5Executor:
         fill_modes = self._resolve_fill_modes(symbol)
         last_result = None
         unsupported_code = getattr(mt5, "TRADE_RETCODE_INVALID_FILLING", 10030)
+        success_codes = {
+            mt5.TRADE_RETCODE_DONE,
+            getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010),
+        }
         for fill_mode in fill_modes:
             request["type_filling"] = fill_mode
             result = _send_request(request)
@@ -739,12 +1441,30 @@ class MT5Executor:
             # ready to take requests yet — e.g. right after a cold start.
             if result is None:
                 raise RuntimeError(f"MT5 order_send returned None: {mt5.last_error()}")
-            if result.retcode == mt5.TRADE_RETCODE_DONE:
+            if result.retcode in success_codes:
                 self._fill_mode_cache[symbol] = fill_mode
+                filled_volume = float(getattr(result, "volume", 0.0) or volume)
+                if not math.isfinite(filled_volume) or filled_volume <= 0:
+                    filled_volume = volume
+                if filled_volume > volume + 1e-8:
+                    # A broker must not fill more than requested. Do not hide the
+                    # anomaly: return it for tracking and surface it in logs.
+                    self.logger.error(
+                        "Broker overfill anomaly for %s: requested %.8f, filled %.8f",
+                        symbol, volume, filled_volume,
+                    )
+                filled_risk = sizing.risk_per_lot * filled_volume
                 return {
                     "ticket": int(result.order),
                     "price": float(result.price),   # actual broker fill price
                     "deal": int(result.deal),
+                    "volume": filled_volume,
+                    "stop_price": float(stop_price),
+                    "risk_amount": filled_risk,
+                    "risk_budget_amount": sizing.limit.budget_amount,
+                    "risk_capital_base": sizing.limit.capital_base,
+                    "risk_pct": sizing.limit.fraction,
+                    "partial_fill": result.retcode != mt5.TRADE_RETCODE_DONE,
                 }
             last_result = result
             if result.retcode != unsupported_code:

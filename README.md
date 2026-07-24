@@ -60,13 +60,23 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 
 - **Стоп** — за фрактал Вильямса на 1H с ATR-буфером, риск ограничен коридором min/max ATR
   (min 0.75×ATR — микро-стопы не раздувают объём);
-- **Сайзинг** — от риска на сделку с учётом комиссии и ожидаемого проскальзывания,
-  потолок объёма `MT5_MAX_VOLUME` (по умолчанию 10 лотов на сетап);
+- **Жёсткий лимит SL-риска** — суммарный номинальный убыток до брокерского Stop Loss
+  для одного сетапа не превышает 1% от зафиксированного стартового капитала.
+  При `MT5_INITIAL_CAPITAL=0` баланс фиксируется один раз в
+  `ai_data/risk_capital.json` и не меняется после сделок или перезапуска VPS;
+  явное значение `MT5_INITIAL_CAPITAL` переопределяет этот снимок;
+- **Сайзинг** — денежный убыток рассчитывается через MT5 `order_calc_profit` в
+  валюте счёта после применения брокерской минимальной дистанции SL, с учётом
+  комиссии и резерва ожидаемого проскальзывания. Объём всегда округляется вниз
+  по `volume_step`; если минимальный лот временно не помещается в бюджет, бот
+  сохраняет технический SL, рассчитывает риск-совместимую цену и ждёт её вместо
+  открытия завышенного риска;
+- потолок объёма `MT5_MAX_VOLUME` — по умолчанию 10 лотов на сетап;
 - **4 тейк-профита** по уровням RR (1.0 / rr_min / 2.0 / 3.0);
 - **Split-TP** — каждая цель открывается отдельной позицией со своим брокерским TP,
-  промежуточные тейки исполняет сам брокер точно по цене;
+  но все ноги делят единый 1%-й риск-бюджет; перед каждой отправкой проверяется
+  оставшийся суммарный риск;
 - **Безубыток** — после TP1 стопы всех оставшихся ног переносятся на цену входа;
-- объём считается от риска на сделку (`MT5_RISK_PCT`, по умолчанию 1% на сделку);
 - **AI-фильтр** (`core/m1/`) — статистическая оценка p(TP) по истории символа, может отклонить вход.
 
 ## Структура
@@ -167,13 +177,22 @@ Checked in order; the first one that fires produces an ENTER signal:
 
 - **Stop** — behind a 1H Williams fractal with an ATR buffer; risk clamped to a min/max ATR corridor
   (min 0.75×ATR — micro-stops cannot balloon the volume);
-- **Sizing** — from per-trade risk including commission and expected slippage,
-  volume capped by `MT5_MAX_VOLUME` (default 10 lots per setup);
+- **Hard SL-risk cap** — the aggregate nominal loss to the broker-side Stop Loss
+  for one setup cannot exceed 1% of fixed starting capital. With
+  `MT5_INITIAL_CAPITAL=0`, balance is captured once in
+  `ai_data/risk_capital.json` and survives trades and VPS restarts; an explicit
+  `MT5_INITIAL_CAPITAL` overrides that snapshot;
+- **Sizing** — monetary loss is calculated with MT5 `order_calc_profit` in the
+  account currency after applying the broker minimum SL distance, including
+  commission and an expected-slippage reserve. Volume is always rounded down
+  to `volume_step`; when `volume_min` temporarily exceeds budget, the bot keeps
+  the technical SL, calculates a risk-compatible entry, and waits for that price;
+- volume is additionally capped by `MT5_MAX_VOLUME` (default 10 lots per setup);
 - **4 take-profits** at RR levels (1.0 / rr_min / 2.0 / 3.0);
 - **Split-TP** — each target is opened as a separate position with its own broker-side TP,
-  so intermediate TPs are filled by the broker exactly at price;
+  but all legs share one 1% risk budget and the remaining aggregate risk is
+  checked before every order submission;
 - **Break-even** — after TP1 the stops of all remaining legs move to the entry price;
-- volume is sized from per-trade risk (`MT5_RISK_PCT`, default 1% per trade);
 - **AI filter** (`core/m1/`) — statistical p(TP) estimate from the symbol's history; may reject an entry.
 
 ### Project layout

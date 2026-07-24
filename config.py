@@ -49,7 +49,12 @@ MT5_LOGIN = _env_int("MT5_LOGIN")
 MT5_PASSWORD = os.getenv("MT5_PASSWORD", "")
 MT5_SERVER = os.getenv("MT5_SERVER", "FxPro-MT5 Demo")
 MT5_MAGIC = _env_int("MT5_MAGIC") or 20260318
-MT5_RISK_PER_TRADE = _env_float("MT5_RISK_PCT", 0.01)
+# A smaller configured value is allowed; values above 1% are hard-clamped.
+# The executor enforces the same ceiling again at the final broker request.
+MT5_RISK_PER_TRADE = min(max(_env_float("MT5_RISK_PCT", 0.01), 0.0), 0.01)
+# Optional explicit strategy starting capital. Zero means: capture account
+# balance once and persist it in ai_data/risk_capital.json.
+MT5_INITIAL_CAPITAL = _env_float("MT5_INITIAL_CAPITAL", 0.0)
 MT5_SLIPPAGE = _env_int("MT5_SLIPPAGE") or 20
 
 if MT5_EXECUTION_ENABLED and (MT5_LOGIN is None or not MT5_PASSWORD or not MT5_SERVER):
@@ -149,7 +154,7 @@ VOL_REGIME_REFRESH_MIN = _env_int("VOL_REGIME_REFRESH_MIN") or 15
 # ================== EXECUTION SIZING GUARDS ==================
 # Cap on total volume (lots) per setup, applied on top of the broker maximum.
 MT5_MAX_VOLUME = _env_float("MT5_MAX_VOLUME", 10.0)
-# Round-turn commission per 1.0 lot (USD) — included in position sizing so a
+# Round-turn commission per 1.0 lot in the account currency — included in sizing so a
 # tight stop cannot balloon volume past the planned risk.
 MT5_COMMISSION_PER_LOT = _env_float("MT5_COMMISSION_PER_LOT", 7.0)
 
