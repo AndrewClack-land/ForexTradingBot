@@ -116,6 +116,151 @@ def test_parquet_loader_supports_timestamp_index_and_filename_key(tmp_path):
     assert causal.iloc[0]["open"] == 100.0
 
 
+def test_explicit_bar_close_time_controls_causal_visibility(tmp_path):
+    frame = pd.DataFrame(
+        {
+            "timestamp": [pd.Timestamp("2026-03-28T22:00:00Z")],
+            "bar_close_time": [pd.Timestamp("2026-03-29T21:00:00Z")],
+            "open": [1.0],
+            "high": [1.1],
+            "low": [0.9],
+            "close": [1.05],
+        }
+    )
+    frame.to_parquet(tmp_path / "EURUSD_1d.parquet", index=False)
+
+    dataset = HistoricalDataset.load(tmp_path)
+    assert dataset.frame_asof(
+        "EURUSD", "1d", "2026-03-29T20:59:59Z"
+    ).empty
+    visible = dataset.frame_asof(
+        "EURUSD", "1d", "2026-03-29T21:00:00Z"
+    )
+    assert len(visible) == 1
+    assert "bar_close_time" not in visible.columns
+
+
+def test_mixed_legacy_and_explicit_close_shards_fill_legacy_close(tmp_path):
+    legacy_dir = tmp_path / "legacy"
+    explicit_dir = tmp_path / "explicit"
+    legacy_dir.mkdir()
+    explicit_dir.mkdir()
+    _write_json(
+        legacy_dir / "EURUSD_1d.json",
+        [
+            {
+                **_record("2026-03-27T22:00:00Z", 1.0),
+                "tf": "1d",
+            }
+        ],
+    )
+    _write_json(
+        explicit_dir / "EURUSD_1d.json",
+        [
+            {
+                **_record("2026-03-28T22:00:00Z", 1.1),
+                "tf": "1d",
+                "bar_close_time": "2026-03-29T21:00:00Z",
+            }
+        ],
+    )
+
+    dataset = HistoricalDataset.load(tmp_path)
+    frame = dataset.get_frame("EURUSD", "1d")
+    assert frame["bar_close_time"].isna().sum() == 0
+    assert list(frame["bar_close_time"]) == [
+        pd.Timestamp("2026-03-28T22:00:00Z"),
+        pd.Timestamp("2026-03-29T21:00:00Z"),
+    ]
+
+
+def test_duplicate_legacy_row_cannot_replace_explicit_dst_close(tmp_path):
+    explicit_dir = tmp_path / "a_explicit"
+    legacy_dir = tmp_path / "z_legacy"
+    explicit_dir.mkdir()
+    legacy_dir.mkdir()
+    open_time = "2026-10-24T21:00:00Z"
+    _write_json(
+        explicit_dir / "EURUSD_1d.json",
+        [
+            {
+                **_record(open_time, 1.0),
+                "tf": "1d",
+                "bar_close_time": "2026-10-25T22:00:00Z",
+            }
+        ],
+    )
+    _write_json(
+        legacy_dir / "EURUSD_1d.json",
+        [{**_record(open_time, 1.0), "tf": "1d"}],
+    )
+
+    dataset = HistoricalDataset.load(tmp_path)
+    frame = dataset.get_frame("EURUSD", "1d")
+    assert frame["bar_close_time"].iloc[0] == pd.Timestamp(
+        "2026-10-25T22:00:00Z"
+    )
+    assert dataset.frame_asof(
+        "EURUSD", "1d", "2026-10-25T21:30:00Z"
+    ).empty
+
+
+def test_conflicting_explicit_closes_for_duplicate_open_are_rejected(tmp_path):
+    for folder, close_time in (
+        ("first", "2026-10-25T21:00:00Z"),
+        ("second", "2026-10-25T22:00:00Z"),
+    ):
+        directory = tmp_path / folder
+        directory.mkdir()
+        _write_json(
+            directory / "EURUSD_1d.json",
+            [
+                {
+                    **_record("2026-10-24T21:00:00Z", 1.0),
+                    "tf": "1d",
+                    "bar_close_time": close_time,
+                }
+            ],
+        )
+
+    with pytest.raises(DataValidationError, match="Conflicting explicit"):
+        HistoricalDataset.load(tmp_path)
+
+
+def test_explicit_close_with_wrong_timeframe_duration_is_rejected(tmp_path):
+    _write_json(
+        tmp_path / "EURUSD_1h.json",
+        [
+            {
+                **_record("2026-01-01T00:00:00Z", 1.0),
+                "bar_close_time": "2026-01-01T00:01:00Z",
+            }
+        ],
+    )
+
+    with pytest.raises(DataValidationError, match="invalid 1h bar close duration"):
+        HistoricalDataset.load(tmp_path)
+
+
+def test_explicit_close_cannot_overlap_next_candle_open(tmp_path):
+    records = [
+        {
+            **_record("2026-01-01T00:00:00Z", 1.0),
+            "tf": "4h",
+            "bar_close_time": "2026-01-01T05:00:00Z",
+        },
+        {
+            **_record("2026-01-01T04:00:00Z", 1.1),
+            "tf": "4h",
+            "bar_close_time": "2026-01-01T08:00:00Z",
+        },
+    ]
+    _write_json(tmp_path / "EURUSD_4h.json", records)
+
+    with pytest.raises(DataValidationError, match="overlapping candle"):
+        HistoricalDataset.load(tmp_path)
+
+
 def test_invalid_ohlc_is_rejected(tmp_path):
     bad = _record("2026-01-01T00:00:00Z", 1.0)
     bad["high"] = 0.5
@@ -146,8 +291,11 @@ def test_readiness_requires_both_365_d1_bars_and_twelve_months(tmp_path):
     start = pd.Timestamp("2025-01-01T00:00:00Z")
     records = [
         {
-            **_record((start + pd.Timedelta(hours=12 * index)).isoformat(), 1.0),
+            **_record((start + pd.Timedelta(hours=23 * index)).isoformat(), 1.0),
             "tf": "1d",
+            "bar_close_time": (
+                start + pd.Timedelta(hours=23 * (index + 1))
+            ).isoformat(),
         }
         for index in range(365)
     ]
@@ -171,3 +319,84 @@ def test_readiness_accepts_full_year_with_365_d1_bars(tmp_path):
     readiness = HistoricalDataset.load(tmp_path).audit_readiness()
     assert readiness["wfo_ready"] is True
     assert readiness["reasons"] == []
+
+
+def test_readiness_uses_explicit_final_d1_close(tmp_path):
+    records = [
+        {
+            **_record("2025-01-01T01:00:00Z", 1.0),
+            "tf": "1d",
+            "bar_close_time": "2025-01-02T01:00:00Z",
+        },
+        {
+            **_record("2025-01-31T00:00:00Z", 1.1),
+            "tf": "1d",
+            "bar_close_time": "2025-02-01T01:00:00Z",
+        },
+    ]
+    _write_json(tmp_path / "EURUSD_1d.json", records)
+
+    readiness = HistoricalDataset.load(tmp_path).audit_readiness(
+        min_d1_bars=2,
+        min_months=1,
+    )
+    assert readiness["wfo_ready"] is True
+    assert readiness["symbols"]["EURUSD"]["end"] == "2025-02-01T01:00:00+00:00"
+
+
+def test_source_manifest_is_hashed_as_provenance_without_being_parsed(tmp_path):
+    _write_json(
+        tmp_path / "EURUSD_1h.json",
+        [_record("2026-01-01T00:00:00Z", 1.0)],
+    )
+    source_manifest = tmp_path / "source_manifest.json"
+    source_manifest.write_text(
+        json.dumps({"provider": "lse", "snapshot": "first"}),
+        encoding="utf-8",
+    )
+
+    first = HistoricalDataset.load(tmp_path)
+    provenance = [
+        item
+        for item in first.manifest["files"]
+        if item["path"] == "source_manifest.json"
+    ]
+    assert len(provenance) == 1
+    assert provenance[0]["kind"] == "metadata"
+
+    source_manifest.write_text(
+        json.dumps({"provider": "lse", "snapshot": "changed"}),
+        encoding="utf-8",
+    )
+    second = HistoricalDataset.load(tmp_path)
+    assert first.manifest_sha256 != second.manifest_sha256
+
+
+def test_stored_manifest_rejects_snapshot_tampering(tmp_path):
+    candle_path = tmp_path / "EURUSD_1h.json"
+    records = [_record("2026-01-01T00:00:00Z", 1.0)]
+    _write_json(candle_path, records)
+    dataset = HistoricalDataset.load(tmp_path)
+    dataset.write_manifest(tmp_path / "manifest.json")
+
+    records[0]["open"] = 1.01
+    records[0]["high"] = 1.02
+    records[0]["close"] = 1.015
+    _write_json(candle_path, records)
+
+    with pytest.raises(DataValidationError, match="stored manifest does not match"):
+        HistoricalDataset.load(tmp_path)
+
+
+def test_verify_command_requires_and_checks_stored_manifest(tmp_path, capsys):
+    candle_path = tmp_path / "EURUSD_1h.json"
+    records = [_record("2026-01-01T00:00:00Z", 1.0)]
+    _write_json(candle_path, records)
+
+    assert cli_main(["verify", "--data", str(tmp_path)]) == 2
+    assert "stored manifest.json is missing" in capsys.readouterr().err
+
+    dataset = HistoricalDataset.load(tmp_path)
+    dataset.write_manifest(tmp_path / "manifest.json")
+    assert cli_main(["verify", "--data", str(tmp_path)]) == 0
+    assert "SNAPSHOT VERIFIED" in capsys.readouterr().out

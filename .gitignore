@@ -9,7 +9,15 @@ ai_data/
 *.parquet
 *.csv
 *.json
-.env
+.env*
+*.env
+!/.env.example
+*.secrets
+secrets/
+*.pem
+*.key
+*.p12
+/.codex_tmp/
 
 # SSH-ключ доступа к VPS — приватный, никогда не коммитить
 deploy/keys/

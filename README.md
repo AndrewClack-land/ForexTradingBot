@@ -246,6 +246,196 @@ code review, SSH deployments to the VPS, headless MT5 debugging under Wine/Xvfb,
 persistent project memory across sessions. There is no LLM inside the bot itself —
 only a statistical p(TP) filter built on its own trade journal.
 
+### LSE historical snapshots
+
+London Strategic Edge is integrated only as an offline research/backfill
+source. It is deliberately isolated from the live MT5 `DataFeed`; LSE candles
+must not be treated as FxPro Bid/Ask execution quotes.
+
+The importer has its own non-login OS account, Python 3.13 virtual environment,
+application tree, secret file and private state directory. Do not put
+`LSE_API_KEY` in the project's `.env` or `.env.example`.
+
+#### One-time VPS installation
+
+Create the unprivileged account and root-owned application directories:
+
+```bash
+getent passwd forexbot-backtest >/dev/null || \
+  sudo useradd --system --user-group \
+    --home-dir /var/lib/forexbot-backtest --no-create-home \
+    --shell /usr/sbin/nologin forexbot-backtest
+sudo install -d -o root -g root -m 0755 /opt/forexbot-backtest/app
+sudo install -d -o forexbot-backtest -g forexbot-backtest -m 0700 \
+  /var/lib/forexbot-backtest
+sudo install -d -o root -g forexbot-backtest -m 0550 \
+  /srv/forexbot-backtest/snapshots
+```
+
+From the repository checkout, install only files tracked by the selected Git
+commit. This deliberately excludes ignored or untracked `.env` files:
+
+```bash
+release_commit="$(git rev-parse --verify HEAD)"
+git archive --format=tar "$release_commit" \
+  backtest requirements-backtest.txt | \
+  sudo tar --extract --file=- --directory=/opt/forexbot-backtest/app
+printf '%s\n' "$release_commit" | \
+  sudo tee /opt/forexbot-backtest/RELEASE_COMMIT >/dev/null
+sudo chown -R root:root /opt/forexbot-backtest/app
+sudo chmod -R go-w /opt/forexbot-backtest/app
+if sudo find /opt/forexbot-backtest/app -name '.env*' -print -quit | grep -q .; then
+  echo "ERROR: an environment file reached the isolated app tree"
+  exit 1
+fi
+```
+
+Build an isolated Python 3.13 environment. Direct dependencies are version
+pinned; `installed.freeze.txt` records the complete resolved environment for
+the deployment, but is not a cryptographic hash lock:
+
+```bash
+sudo python3.13 -m venv /opt/forexbot-backtest/venv
+sudo /opt/forexbot-backtest/venv/bin/python -m pip install \
+  --only-binary=:all: \
+  -r /opt/forexbot-backtest/app/requirements-backtest.txt
+sudo /opt/forexbot-backtest/venv/bin/python -m pip check
+sudo sh -c '/opt/forexbot-backtest/venv/bin/python -m pip freeze --all \
+  > /opt/forexbot-backtest/installed.freeze.txt'
+sudo chown -R root:root /opt/forexbot-backtest
+sudo chmod -R go-w /opt/forexbot-backtest
+```
+
+Keep the API key only in the existing root-only secret file. `sudoedit` should
+leave exactly one `LSE_API_KEY=...` line; do not print or source that file:
+
+```bash
+sudo install -d -o root -g root -m 0700 /etc/forexbot
+if ! sudo test -e /etc/forexbot/lse.env; then
+  sudo install -o root -g root -m 0600 /dev/null /etc/forexbot/lse.env
+fi
+sudo chown root:root /etc/forexbot/lse.env
+sudo chmod 0600 /etc/forexbot/lse.env
+sudoedit /etc/forexbot/lse.env
+sudo stat -c '%U:%G %a %n' /etc/forexbot/lse.env
+sudo grep -Eq '^LSE_API_KEY=.+$' /etc/forexbot/lse.env
+```
+
+Install the non-secret job configuration and hardened oneshot unit:
+
+```bash
+sudo install -o root -g root -m 0644 deploy/lse-import.env.example \
+  /etc/forexbot/lse-import.env
+sudoedit /etc/forexbot/lse-import.env
+sudo install -m 0644 deploy/forexbot-lse-import.service \
+  /etc/systemd/system/forexbot-lse-import.service
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/forexbot-lse-import.service
+```
+
+The default example uses paced REST for the long 2020–2026, three-symbol
+backfill and builds `1m`, `5m`, `15m`, `1h`, `4h` and `1d`. Leave
+`LSE_DATASET=` empty to resolve and validate every symbol through the provider
+catalog (for example, Forex is `fx`, while gold is `commodity`). The
+`LSE_OUTPUT_DIR` target must not exist before the run; use a new versioned path
+for every snapshot.
+
+For a deliberately short bulk export, use settings such as these instead:
+
+```ini
+LSE_OUTPUT_DIR=/var/lib/forexbot-backtest/incoming/eurusd-2025-v1
+LSE_SYMBOLS=EURUSD
+LSE_START=2025-01-01
+LSE_END=2026-06-01
+LSE_TRANSPORT=export
+LSE_DATASET=fx
+```
+
+That interval is shorter than the importer's 600-day export chunk and needs
+one job. The importer preflights a maximum of five export jobs per run to stay
+within the currently observed hourly account limit. For long or multi-symbol
+ranges, keep the paced REST configuration.
+
+#### Remove the key from the live bot
+
+If the temporary live-service drop-in was used while testing the credential,
+inspect it, remove that exact drop-in, and restart the live service:
+
+```bash
+sudo systemctl cat forexbot.service
+sudo rm -f -- /etc/systemd/system/forexbot.service.d/override.conf
+sudo systemctl daemon-reload
+sudo systemctl restart forexbot.service
+sudo systemctl is-active --quiet forexbot.service
+sudo bash -c 'pid="$(systemctl show -p MainPID --value forexbot.service)"; \
+  if grep -zq "^LSE_API_KEY=" "/proc/$pid/environ"; then \
+    echo "ERROR: live bot still has LSE_API_KEY"; exit 1; \
+  else echo "OK: live bot has no LSE_API_KEY"; fi'
+```
+
+After this verification, only `forexbot-lse-import.service` receives the key;
+the live Wine/MT5 process does not import the network-facing SDK.
+
+#### Create and seal a snapshot
+
+Start each import intentionally and inspect its result:
+
+```bash
+sudo systemctl start forexbot-lse-import.service
+sudo systemctl show forexbot-lse-import.service \
+  -p Result -p ExecMainStatus
+sudo journalctl -u forexbot-lse-import.service --no-pager -n 200
+```
+
+The importer downloads M1, validates UTC/OHLC/duplicates, and rebuilds
+5M/M15/H1/H4/D1. It rejects truncated range edges and internal source gaps
+larger than the configured holiday/weekend tolerance, and drops derived bars
+with less than 95% of their expected M1 source rows. H4 and D1 use
+`Europe/Athens` wall-clock boundaries by default, matching an EET/EEST broker
+session without hard-coding a summer `+3` offset. Every Parquet candle stores
+its explicit UTC close time, so 23/25-hour DST days remain causal in
+`HistoricalDataset.frame_asof`.
+
+The production example intentionally starts with the three FX pairs. Before
+adding `GOLD=XAU/USD`, verify both the catalog's available date range and the
+provider's daily maintenance calendar: a scheduled break can require a
+symbol-aware H4 completeness rule. Do not lower the global quality threshold
+just to force incomplete gold bars through validation.
+
+After a successful run, move the exact new snapshot from the writable incoming
+area to a root-owned archive. The archive directory itself is not writable by
+the importer, so the importer cannot rename or delete a sealed snapshot:
+
+```bash
+incoming=/var/lib/forexbot-backtest/incoming/fx-2020-2026-v1
+snapshot=/srv/forexbot-backtest/snapshots/fx-2020-2026-v1
+sudo test -d "$incoming"
+sudo test ! -e "$snapshot"
+sudo install -d -o root -g forexbot-backtest -m 0550 \
+  /srv/forexbot-backtest/snapshots
+sudo chown -R root:forexbot-backtest "$incoming"
+sudo find "$incoming" -type d -exec chmod 0550 {} +
+sudo find "$incoming" -type f -exec chmod 0440 {} +
+sudo mv -- "$incoming" "$snapshot"
+sudo -u forexbot-backtest env PYTHONPATH=/opt/forexbot-backtest/app \
+  /opt/forexbot-backtest/venv/bin/python \
+  -m backtest verify --data "$snapshot"
+sudo -u forexbot-backtest test ! -w "$snapshot"
+sudo -u forexbot-backtest test ! -w /srv/forexbot-backtest/snapshots
+```
+
+This is operational immutability against the importer account; `root` can
+still deliberately administer the files. `source_manifest.json` records
+provider/version, the requested half-open interval, quality counters and data
+file hashes; it never contains `LSE_API_KEY`. Its `runtime_environment` also
+binds the snapshot to the exact deployed Git commit and the SHA-256 of
+`installed.freeze.txt`; a copy is embedded as `environment.freeze.txt`.
+The final `manifest.json` hashes both that lock and the provenance file, and
+subsequent loads fail if the stored manifest no longer matches the snapshot.
+
+No timer is installed or recommended: each run consumes provider quota and
+must be started deliberately.
+
 ### Disclaimer
 
 For research purposes. Forex trading carries high risk — use a demo account;

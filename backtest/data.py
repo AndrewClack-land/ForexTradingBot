@@ -54,6 +54,9 @@ _STRATEGY_KEYS: Dict[str, str] = {
 }
 
 _REQUIRED_OHLC = ("open", "high", "low", "close")
+_BAR_CLOSE_COLUMN = "bar_close_time"
+_HASHED_METADATA_FILES = {"source_manifest.json", "environment.freeze.txt"}
+_IGNORED_METADATA_FILES = {"manifest.json", *_HASHED_METADATA_FILES}
 
 
 class DataValidationError(ValueError):
@@ -161,10 +164,16 @@ def _validate_ohlc(frame: pd.DataFrame, *, source: Path) -> None:
             raise DataValidationError(f"{source}: invalid volume value(s)")
 
 
-def _normalize_frame(frame: pd.DataFrame, *, source: Path) -> pd.DataFrame:
+def _normalize_frame(
+    frame: pd.DataFrame,
+    *,
+    source: Path,
+    timeframe: str,
+) -> pd.DataFrame:
     if frame is None or frame.empty:
         raise DataValidationError(f"{source}: empty candle file")
     out = frame.copy()
+    tf = normalize_timeframe(timeframe)
 
     if "timestamp" in out.columns:
         index = _parse_timestamp_column(out["timestamp"], source=source)
@@ -175,13 +184,47 @@ def _normalize_frame(frame: pd.DataFrame, *, source: Path) -> pd.DataFrame:
     else:
         raise DataValidationError(f"{source}: no timestamp/time column or datetime index")
 
+    explicit_close: Optional[pd.DatetimeIndex] = None
+    if _BAR_CLOSE_COLUMN in out.columns:
+        explicit_close = _parse_timestamp_column(
+            out[_BAR_CLOSE_COLUMN],
+            source=source,
+        )
+        durations = explicit_close - index
+        if tf in {"1m", "5m", "15m", "1h"}:
+            allowed_durations = (_TF_DURATIONS[tf],)
+        elif tf == "4h":
+            allowed_durations = tuple(
+                pd.Timedelta(hours=hours) for hours in (3, 4, 5)
+            )
+        else:
+            allowed_durations = tuple(
+                pd.Timedelta(hours=hours) for hours in (23, 24, 25)
+            )
+        invalid_duration = ~durations.isin(allowed_durations)
+        if invalid_duration.any():
+            expected = ", ".join(str(value) for value in allowed_durations)
+            raise DataValidationError(
+                f"{source}: {int(invalid_duration.sum())} invalid {tf} bar close "
+                f"duration(s); expected one of: {expected}"
+            )
+
     _validate_ohlc(out, source=source)
     columns = list(_REQUIRED_OHLC)
     if "volume" in out.columns:
         columns.append("volume")
     out = out[columns].copy()
     out.index = index
+    if explicit_close is not None:
+        out[_BAR_CLOSE_COLUMN] = explicit_close
     return out
+
+
+def _frame_close_times(frame: pd.DataFrame, timeframe: str) -> pd.DatetimeIndex:
+    tf = normalize_timeframe(timeframe)
+    if _BAR_CLOSE_COLUMN in frame.columns:
+        return pd.DatetimeIndex(frame[_BAR_CLOSE_COLUMN])
+    return frame.index + _TF_DURATIONS[tf]
 
 
 def _read_file(path: Path) -> pd.DataFrame:
@@ -261,7 +304,12 @@ class HistoricalDataset:
             for path in base.rglob("*")
             if path.is_file()
             and path.suffix.lower() in {".json", ".parquet", ".pq"}
-            and path.name.lower() != "manifest.json"
+            and path.name.lower() not in _IGNORED_METADATA_FILES
+        )
+        metadata_paths = sorted(
+            path
+            for path in base.rglob("*")
+            if path.is_file() and path.name.lower() in _HASHED_METADATA_FILES
         )
         if not paths:
             raise FileNotFoundError(f"No JSON/Parquet candle files found under {base}")
@@ -291,7 +339,11 @@ class HistoricalDataset:
                 )
 
             for key, part in keyed_frames:
-                normalized = _normalize_frame(part, source=path)
+                normalized = _normalize_frame(
+                    part,
+                    source=path,
+                    timeframe=key[1],
+                )
                 grouped.setdefault(key, []).append(normalized)
                 raw_counts[key] = raw_counts.get(key, 0) + len(normalized)
 
@@ -303,23 +355,99 @@ class HistoricalDataset:
                 }
             )
 
+        for path in metadata_paths:
+            source_files.append(
+                {
+                    "path": path.relative_to(base).as_posix(),
+                    "size": int(path.stat().st_size),
+                    "sha256": _sha256_file(path),
+                    "kind": "metadata",
+                }
+            )
+
         frames: Dict[Tuple[str, str], pd.DataFrame] = {}
         for key, parts in grouped.items():
             combined = pd.concat(parts, axis=0)
             combined = combined.sort_index(kind="stable")
+            explicit_by_timestamp: Dict[pd.Timestamp, pd.Timestamp] = {}
+            if (
+                _BAR_CLOSE_COLUMN in combined.columns
+                and combined.index.duplicated(keep=False).any()
+            ):
+                duplicate_closes = combined.loc[
+                    combined.index.duplicated(keep=False),
+                    _BAR_CLOSE_COLUMN,
+                ]
+                for timestamp, values in duplicate_closes.groupby(level=0, sort=False):
+                    explicit = pd.DatetimeIndex(values.dropna().unique())
+                    if len(explicit) > 1:
+                        raise DataValidationError(
+                            f"Conflicting explicit bar close times for {key} "
+                            f"at {pd.Timestamp(timestamp).isoformat()}"
+                        )
+                    if len(explicit) == 1:
+                        explicit_by_timestamp[pd.Timestamp(timestamp)] = explicit[0]
             combined = combined[~combined.index.duplicated(keep="last")]
+            if (
+                _BAR_CLOSE_COLUMN in combined.columns
+                and explicit_by_timestamp
+            ):
+                for timestamp, close_time in explicit_by_timestamp.items():
+                    combined.loc[timestamp, _BAR_CLOSE_COLUMN] = close_time
             if combined.empty:
                 raise DataValidationError(f"No candles remain after dedupe for {key}")
             if not combined.index.is_monotonic_increasing or not combined.index.is_unique:
                 raise DataValidationError(f"Timestamp normalization failed for {key}")
+            if _BAR_CLOSE_COLUMN in combined.columns:
+                fallback_closes = pd.Series(
+                    combined.index + _TF_DURATIONS[key[1]],
+                    index=combined.index,
+                )
+                combined[_BAR_CLOSE_COLUMN] = pd.to_datetime(
+                    combined[_BAR_CLOSE_COLUMN],
+                    utc=True,
+                    errors="coerce",
+                ).fillna(fallback_closes)
+                close_times = pd.DatetimeIndex(combined[_BAR_CLOSE_COLUMN])
+                if close_times.hasnans:
+                    raise DataValidationError(
+                        f"Invalid/empty bar close time remains after merge for {key}"
+                    )
+            close_times = _frame_close_times(combined, key[1])
+            if not close_times.is_monotonic_increasing:
+                raise DataValidationError(
+                    f"Bar close times are not monotonic for {key}"
+                )
+            overlaps = close_times[:-1] > combined.index[1:]
+            if overlaps.any():
+                raise DataValidationError(
+                    f"{int(overlaps.sum())} overlapping candle(s) for {key}: "
+                    "bar close is after the next bar open"
+                )
             frames[key] = combined
 
-        return cls(
+        dataset = cls(
             base,
             frames,
             source_files=source_files,
             raw_counts=raw_counts,
         )
+        stored_manifest_path = base / "manifest.json"
+        if stored_manifest_path.is_file():
+            try:
+                stored_manifest = json.loads(
+                    stored_manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DataValidationError(
+                    f"{stored_manifest_path}: invalid stored manifest"
+                ) from exc
+            if stored_manifest != dataset.manifest:
+                raise DataValidationError(
+                    f"{stored_manifest_path}: stored manifest does not match "
+                    "the current snapshot content"
+                )
+        return dataset
 
     @property
     def symbols(self) -> Tuple[str, ...]:
@@ -359,7 +487,7 @@ class HistoricalDataset:
                     duplicate_rows=max(0, raw_rows - len(frame)),
                     start=frame.index[0],
                     end_open=frame.index[-1],
-                    end_close=frame.index[-1] + _TF_DURATIONS[tf],
+                    end_close=_frame_close_times(frame, tf)[-1],
                 )
             )
         return tuple(items)
@@ -389,9 +517,11 @@ class HistoricalDataset:
         if frame is None:
             return pd.DataFrame(columns=list(_REQUIRED_OHLC))
         decision_time = _utc_timestamp(at)
-        close_times = frame.index + _TF_DURATIONS[tf]
+        close_times = _frame_close_times(frame, tf)
         causal = frame.loc[close_times <= decision_time]
-        return causal.tail(int(limit)).copy()
+        return causal.drop(columns=[_BAR_CLOSE_COLUMN], errors="ignore").tail(
+            int(limit)
+        ).copy()
 
     def frames_asof(
         self,
@@ -430,7 +560,7 @@ class HistoricalDataset:
                 per_symbol[symbol] = {"d1_bars": 0, "months": 0.0, "ready": False}
                 continue
             start = frame.index[0]
-            end = frame.index[-1] + _TF_DURATIONS["1d"]
+            end = _frame_close_times(frame, "1d")[-1]
             days = max(0.0, (end - start).total_seconds() / 86400.0)
             months = days / (365.2425 / 12.0)
             symbol_reasons: list[str] = []
