@@ -77,6 +77,17 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
   но все ноги делят единый 1%-й риск-бюджет; перед каждой отправкой проверяется
   оставшийся суммарный риск;
 - **Безубыток** — после TP1 стопы всех оставшихся ног переносятся на цену входа;
+- **Position Adding** (`core/position_adding.py`, по умолчанию выключено,
+  `POSITION_ADDING_ENABLED=1`) — поэтапный набор объёма в одну идею: вход 1 с
+  риском 1%, каждое новое подтверждение того же направления добавляет ещё 1%, а
+  совокупный риск идеи никогда не превышает `IDEA_MAX_RISK_PCT` (2%). Перед
+  входом, который не помещается в лимит, самые ранние входы переводятся в
+  безубыток (методика: перед третьим входом первый уходит в БУ, второй остаётся
+  со своим стопом). Добавка требует подтверждения ценой (`ADDON_MIN_PROGRESS_R`,
+  0.5R от последнего входа) и запрещена после `ADDON_MAX_PROGRESS_PCT` (50%)
+  пути до финального TP — правило пирамидинга Kolachi. Максимум
+  `IDEA_MAX_ENTRIES` входов (3), каждый со своими split-ногами, БУ и TP;
+  неудачная идея стоит ≈2%, а не сумму входов;
 - **AI-фильтр** (`core/m1/`) — статистическая оценка p(TP) по истории символа, может отклонить вход.
 
 ## Структура
@@ -193,6 +204,17 @@ Checked in order; the first one that fires produces an ENTER signal:
   but all legs share one 1% risk budget and the remaining aggregate risk is
   checked before every order submission;
 - **Break-even** — after TP1 the stops of all remaining legs move to the entry price;
+- **Position Adding** (`core/position_adding.py`, off by default, enable with
+  `POSITION_ADDING_ENABLED=1`) — staged entries into one idea: entry 1 risks 1%,
+  every later confirmation of the same direction adds another 1%, and the idea's
+  aggregate risk never exceeds `IDEA_MAX_RISK_PCT` (2%). Before an entry that
+  would not fit, the oldest entries are moved to break-even (per the
+  methodology: the third entry puts entry 1 at BE while entry 2 keeps its stop).
+  An add-on needs price confirmation (`ADDON_MIN_PROGRESS_R`, 0.5R from the last
+  entry) and is refused past `ADDON_MAX_PROGRESS_PCT` (50%) of the way to the
+  final TP — the Kolachi pyramiding rule. At most `IDEA_MAX_ENTRIES` entries (3),
+  each with its own split legs, break-even and TPs; a failed idea costs ≈2%
+  rather than the sum of its entries;
 - **AI filter** (`core/m1/`) — statistical p(TP) estimate from the symbol's history; may reject an entry.
 
 ### Project layout

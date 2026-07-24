@@ -126,6 +126,31 @@ class ActiveTrade:
     # SL moved to break-even (entry) after TP1 — done at most once per trade.
     moved_to_be: bool = False
 
+    # Every leg of this entry is confirmed gone from the broker. Sticky, because
+    # an idea with several entries needs each entry's finality to hold until the
+    # last one is confirmed too; cleared if a ticket reappears.
+    broker_closed: bool = False
+
+    # ================== POSITION ADDING ==================
+    # A trading idea is one primary entry plus the add-on entries opened on later
+    # confirmations of the same direction. Add-ons live inside the primary trade
+    # as full ActiveTrade objects, so every per-entry routine (split lifecycle,
+    # break-even, close, journaling) applies to each of them unchanged.
+    # Entries share ``idea_id``; ``entry_index`` is 1 for the primary trade.
+    idea_id: Optional[str] = None
+    entry_index: int = 1
+    addons: List["ActiveTrade"] = field(default_factory=list)
+    # Trigger signatures already consumed by this idea — an add-on must come from
+    # a genuinely new confirmation, not from the trigger that opened entry 1.
+    idea_trigger_signatures: List[str] = field(default_factory=list)
+    # Set on an add-on that was force-moved to break-even to keep the idea's
+    # aggregate risk within the cap before the next entry was opened.
+    be_for_idea_risk: bool = False
+
+    def entries(self) -> List["ActiveTrade"]:
+        """The idea's entries in open order: primary first, then add-ons."""
+        return [self] + list(self.addons or [])
+
 
 # ================== STRATEGY ==================
 

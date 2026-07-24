@@ -54,6 +54,8 @@ from config import (
     VOL_REGIME_MAX_R,
     EM_TP_MAX_RATIO,
     VOL_REGIME_REFRESH_MIN,
+    POSITION_ADDING_ENABLED,
+    IDEA_MAX_ENTRIES,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -73,6 +75,7 @@ from core.state_store import save_active_trades, load_active_trades
 from core.vol_regime import VolContext, build_vol_context, entry_gate
 from core.profiler import TickProfiler
 from core.risk_rules import RiskRules
+from core.position_adding import PyramidRiskError, build_manager as build_pyramid_manager
 from executors.mt5_executor import (
     MT5Executor,
     MT5Settings,
@@ -124,6 +127,12 @@ def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> 
     return [round(value * step, 8) for value in units]
 
 
+def _entry_label(entry: ActiveTrade) -> str:
+    """' entry#N' for a position-adding add-on, empty for a plain setup."""
+    index = int(getattr(entry, "entry_index", 1) or 1)
+    return f" entry#{index}" if index > 1 else ""
+
+
 class Core:
     def __init__(self):
         self.universe = dict(UNIVERSE)
@@ -164,6 +173,13 @@ class Core:
         self.global_context: Dict[str, Any] = {"session": "ALL", "session_allowed": True}
         self.log_tick = LOG_TICK
         self.risk_rules = RiskRules()
+        # Position Adding: staged entries into one idea under a shared risk cap.
+        self.pyramid = build_pyramid_manager()
+        if POSITION_ADDING_ENABLED:
+            print(
+                f"[Pyramid] Position Adding enabled: max {IDEA_MAX_ENTRIES} entries/idea, "
+                f"idea risk cap {self.pyramid.settings.max_idea_risk_pct:.2%}"
+            )
 
         # Grace period after startup: block MT5 closes for 90s to let state sync
         self._startup_time: float = time.time()
@@ -282,28 +298,63 @@ class Core:
             is_split = was_split or len(all_tickets) > 1 or comment_marks_split
 
             if trade:
-                updated = False
-                if is_split:
-                    if self._ensure_split_leg_mapping(trade, positions=sym_positions):
-                        trade.mt5_position_id = all_tickets[0]
-                        trade.mt5_ticket = all_tickets[0]
-                        updated = True
-                else:
-                    ticket = all_tickets[0] if all_tickets else None
-                    if ticket and trade.mt5_position_id != ticket:
-                        trade.mt5_position_id = ticket
-                        trade.mt5_ticket = ticket
-                        updated = True
-                if abs(float(trade.volume or 0.0) - total_volume) > 1e-6:
-                    trade.volume = total_volume
-                    updated = True
-                if updated:
-                    relinked += 1
-                    print(
-                        f"[Core] relinked {symbol}: split_ids={all_tickets}, vol={total_volume}"
-                        if is_split else
-                        f"[Core] relinked {symbol}: ticket={all_tickets[0] if all_tickets else None}, vol={total_volume}"
+                # A position-adding idea holds several entries on one symbol, so
+                # the broker rows are first split by the tickets each entry
+                # already owns. Unclaimed rows fall back to the primary entry —
+                # the pre-pyramid behaviour for an ordinary single-entry setup.
+                for entry, entry_positions in self._partition_positions_by_entry(
+                    trade, sym_positions
+                ):
+                    if not entry_positions:
+                        # No visible legs for this entry — leave its persisted
+                        # state alone and let the lifecycle poll confirm the
+                        # closes against deal history.
+                        continue
+                    entry_tickets = [
+                        int(p["ticket"]) for p in entry_positions if p.get("ticket")
+                    ]
+                    entry_volume = round(
+                        sum(float(p.get("volume", 0.0) or 0.0) for p in entry_positions), 2
                     )
+                    entry_is_split = bool(
+                        self._is_split_trade(entry)
+                        or len(entry_tickets) > 1
+                        or any(
+                            re.search(
+                                r"(?:^|\s)TP\s*\d+(?:\s|$)",
+                                str(p.get("comment") or ""),
+                                re.IGNORECASE,
+                            )
+                            for p in entry_positions
+                        )
+                    )
+                    updated = False
+                    if entry_is_split:
+                        if self._ensure_split_leg_mapping(entry, positions=entry_positions):
+                            entry.mt5_position_id = entry_tickets[0]
+                            entry.mt5_ticket = entry_tickets[0]
+                            updated = True
+                    else:
+                        ticket = entry_tickets[0] if entry_tickets else None
+                        if ticket and entry.mt5_position_id != ticket:
+                            entry.mt5_position_id = ticket
+                            entry.mt5_ticket = ticket
+                            updated = True
+                    if abs(float(entry.volume or 0.0) - entry_volume) > 1e-6:
+                        entry.volume = entry_volume
+                        updated = True
+                    if updated:
+                        relinked += 1
+                        label = (
+                            symbol
+                            if int(getattr(entry, "entry_index", 1) or 1) <= 1
+                            else f"{symbol} entry#{entry.entry_index}"
+                        )
+                        print(
+                            f"[Core] relinked {label}: split_ids={entry_tickets}, vol={entry_volume}"
+                            if entry_is_split else
+                            f"[Core] relinked {label}: ticket={entry_tickets[0] if entry_tickets else None}, vol={entry_volume}"
+                        )
                 continue
 
             # Position(s) not in active_trades — hydrate from MT5
@@ -346,6 +397,48 @@ class Core:
             getattr(trade, "split_legs", {})
             or getattr(trade, "split_position_ids", [])
         )
+
+    @staticmethod
+    def _idea_entries(trade: ActiveTrade) -> List[ActiveTrade]:
+        """All entries of one idea: primary first, then position-adding add-ons."""
+        entries = getattr(trade, "entries", None)
+        if callable(entries):
+            return entries()
+        return [trade]
+
+    @staticmethod
+    def _partition_positions_by_entry(
+        trade: ActiveTrade,
+        positions: List[Dict[str, Any]],
+    ) -> List[Tuple[ActiveTrade, List[Dict[str, Any]]]]:
+        """Assign broker rows to the idea entry that already owns their ticket.
+
+        Persisted state wins over broker grouping: only tickets no entry claims
+        are handed to the primary entry, which keeps single-entry setups (and
+        genuinely unknown positions) behaving exactly as before.
+        """
+        entries = Core._idea_entries(trade)
+        buckets: List[Tuple[ActiveTrade, List[Dict[str, Any]]]] = [
+            (entry, []) for entry in entries
+        ]
+        owner_by_ticket: Dict[int, int] = {}
+        for idx, entry in enumerate(entries):
+            known = set(int(t) for t in (getattr(entry, "split_legs", {}) or {}))
+            known.update(int(t) for t in (getattr(entry, "split_position_ids", []) or []))
+            for attr in ("mt5_position_id", "mt5_ticket"):
+                value = getattr(entry, attr, None)
+                if value:
+                    known.add(int(value))
+            for ticket in known:
+                owner_by_ticket.setdefault(ticket, idx)
+
+        for pos in positions or []:
+            try:
+                ticket = int(pos.get("ticket") or 0)
+            except (TypeError, ValueError):
+                ticket = 0
+            buckets[owner_by_ticket.get(ticket, 0)][1].append(pos)
+        return buckets
 
     def _ensure_split_leg_mapping(
         self,
@@ -488,6 +581,7 @@ class Core:
         trade: ActiveTrade,
         *,
         last_price: Optional[float] = None,
+        state_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Reconcile one split setup against open positions and deal history.
 
@@ -631,12 +725,128 @@ class Core:
             trade.volume_remaining = 0.0
             result["changed"] = True
 
+        # Each entry of a position-adding idea confirms its own disappearance,
+        # so the absence counter is keyed per entry, not per symbol. The
+        # confirmation is then latched: an idea closes only once every entry is
+        # confirmed gone, and the per-entry confirmations rarely land on the
+        # same tick.
+        missing_key = state_key or symbol
         if remaining:
-            self._broker_missing_counts.pop(symbol, None)
-        elif self._position_gone_confirmed(symbol, query_failed=False):
-            self._broker_missing_counts.pop(symbol, None)
+            self._broker_missing_counts.pop(missing_key, None)
+            if getattr(trade, "broker_closed", False):
+                trade.broker_closed = False
+                result["changed"] = True
+        elif getattr(trade, "broker_closed", False):
+            result["final"] = True
+        elif self._position_gone_confirmed(missing_key, query_failed=False):
+            self._broker_missing_counts.pop(missing_key, None)
+            trade.broker_closed = True
+            result["changed"] = True
             result["final"] = True
         return result
+
+    def _poll_idea_lifecycle(
+        self,
+        symbol: str,
+        trade: ActiveTrade,
+        *,
+        last_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Reconcile every entry of one idea against the broker.
+
+        The idea is final only once all of its entries are, so a closed add-on
+        never terminates a still-open primary entry (or the other way round).
+        Events carry the entry index they came from.
+        """
+        aggregate: Dict[str, Any] = {
+            "events": [],
+            "changed": False,
+            "final": True,
+            "query_failed": False,
+            "pending_history": False,
+            "visible_open_count": 0,
+        }
+        for entry in self._idea_entries(trade):
+            index = int(getattr(entry, "entry_index", 1) or 1)
+            state_key = symbol if index <= 1 else f"{symbol}#{index}"
+            if self._is_split_trade(entry):
+                result = self._poll_split_lifecycle(
+                    symbol, entry, last_price=last_price, state_key=state_key
+                )
+            else:
+                # An entry without broker-managed legs still has to reach a
+                # terminal state, or the whole idea would never close.
+                result = self._poll_single_position(symbol, entry, state_key=state_key)
+            for event in result.get("events") or []:
+                if index > 1:
+                    event.setdefault("entry_index", index)
+            aggregate["events"].extend(result.get("events") or [])
+            aggregate["changed"] = aggregate["changed"] or bool(result.get("changed"))
+            aggregate["query_failed"] = aggregate["query_failed"] or bool(result.get("query_failed"))
+            aggregate["pending_history"] = aggregate["pending_history"] or bool(result.get("pending_history"))
+            aggregate["visible_open_count"] += int(result.get("visible_open_count") or 0)
+            aggregate["final"] = aggregate["final"] and bool(result.get("final"))
+        return aggregate
+
+    def _poll_single_position(
+        self, symbol: str, entry: ActiveTrade, *, state_key: str
+    ) -> Dict[str, Any]:
+        """Lifecycle of one entry that is a single broker position, not split legs."""
+        result: Dict[str, Any] = {
+            "events": [],
+            "changed": False,
+            "final": False,
+            "query_failed": False,
+            "pending_history": False,
+            "visible_open_count": 0,
+        }
+        if not self.mt5_executor:
+            return result
+        pos_id = getattr(entry, "mt5_position_id", None) or getattr(entry, "mt5_ticket", None)
+        if not pos_id:
+            return result
+        if self.mt5_executor.get_position(symbol, pos_id) is not None:
+            result["visible_open_count"] = 1
+            self._broker_missing_counts.pop(state_key, None)
+            if getattr(entry, "broker_closed", False):
+                entry.broker_closed = False
+                result["changed"] = True
+            return result
+        if getattr(entry, "broker_closed", False):
+            result["final"] = True
+            return result
+        if self._position_gone_confirmed(state_key, query_failed=False):
+            self._broker_missing_counts.pop(state_key, None)
+            entry.broker_closed = True
+            result["changed"] = True
+            result["final"] = True
+        return result
+
+    def _move_idea_entries_to_breakeven(
+        self, symbol: str, trade: ActiveTrade
+    ) -> List[Dict[str, Any]]:
+        """Run the TP1 break-even rule for each entry that has hit its own TP1."""
+        events: List[Dict[str, Any]] = []
+        for entry in self._idea_entries(trade):
+            if getattr(entry, "moved_to_be", False):
+                continue
+            if int(getattr(entry, "tp_hit", 0) or 0) < 1:
+                continue
+            if self._is_split_trade(entry):
+                # Nothing left to modify once every leg is gone.
+                if not getattr(entry, "split_position_ids", []):
+                    continue
+            elif not (
+                getattr(entry, "mt5_position_id", None) or getattr(entry, "mt5_ticket", None)
+            ):
+                continue
+            if self._move_to_breakeven(symbol, entry):
+                event: Dict[str, Any] = {"type": "BE", "price": float(entry.entry)}
+                index = int(getattr(entry, "entry_index", 1) or 1)
+                if index > 1:
+                    event["entry_index"] = index
+                events.append(event)
+        return events
 
     def manage_active_trades(self) -> Dict[str, dict]:
         """Fast broker-only management pass (safe to run every 1–5 seconds).
@@ -675,18 +885,14 @@ class Core:
                 if not self._is_split_trade(trade):
                     continue
                 last_price = self.mt5_executor.get_current_price(symbol, trade.side)
-                lifecycle = self._poll_split_lifecycle(symbol, trade, last_price=last_price)
+                lifecycle = self._poll_idea_lifecycle(symbol, trade, last_price=last_price)
                 dirty = dirty or bool(lifecycle.get("changed"))
                 events = list(lifecycle.get("events") or [])
 
-                if (
-                    not getattr(trade, "moved_to_be", False)
-                    and int(getattr(trade, "tp_hit", 0) or 0) >= 1
-                    and getattr(trade, "split_position_ids", [])
-                ):
-                    if self._move_to_breakeven(symbol, trade):
-                        dirty = True
-                        events.append({"type": "BE", "price": float(trade.entry)})
+                be_events = self._move_idea_entries_to_breakeven(symbol, trade)
+                if be_events:
+                    dirty = True
+                    events.extend(be_events)
 
                 if lifecycle.get("final"):
                     manage = {
@@ -746,59 +952,66 @@ class Core:
         }
         failed = False
         closed_position_ids: List[int] = []
-        split_ids = list(getattr(trade, "split_position_ids", []) or [])
-        if split_ids:
-            remaining: List[int] = []
-            closed_count = 0
-            for pid in split_ids:
-                try:
-                    if self.mt5_executor.close_trade(symbol, position_id=pid, volume=None):
-                        closed_count += 1
-                        closed_position_ids.append(int(pid))
-                    else:
+        any_split_ids = False
+        complete_id_set = True
+        # Every entry of a position-adding idea is flattened; the idea counts as
+        # closed only once each of them is confirmed closed by the broker.
+        for entry in self._idea_entries(trade):
+            split_ids = list(getattr(entry, "split_position_ids", []) or [])
+            entry_closed_ids: List[int] = []
+            if split_ids:
+                any_split_ids = True
+                remaining: List[int] = []
+                closed_count = 0
+                for pid in split_ids:
+                    try:
+                        if self.mt5_executor.close_trade(symbol, position_id=pid, volume=None):
+                            closed_count += 1
+                            entry_closed_ids.append(int(pid))
+                        else:
+                            remaining.append(pid)
+                    except Exception as exc:
                         remaining.append(pid)
-                except Exception as exc:
-                    remaining.append(pid)
-                    manage.setdefault("execution_error", str(exc))
-            trade.split_position_ids = remaining
-            manage["execution"]["mt5_closed_split"] = closed_count
-            failed = bool(remaining)
-        else:
-            pos_id = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
-            if not pos_id:
-                failed = True
-                manage["execution_error"] = "No broker position id to close"
+                        manage.setdefault("execution_error", str(exc))
+                entry.split_position_ids = remaining
+                manage["execution"]["mt5_closed_split"] = (
+                    int(manage["execution"].get("mt5_closed_split") or 0) + closed_count
+                )
+                failed = failed or bool(remaining)
+                known_split_legs = getattr(entry, "split_legs", {}) or {}
+                if not (known_split_legs and len(entry_closed_ids) == len(known_split_legs)):
+                    complete_id_set = False
             else:
-                try:
-                    volume = float(getattr(trade, "volume_remaining", 0.0) or trade.volume or 0.0)
-                    closed = self.mt5_executor.close_trade(
-                        symbol, position_id=pos_id, volume=volume or None
-                    )
-                    manage["execution"]["mt5_closed"] = bool(closed)
-                    failed = not bool(closed)
-                    if closed:
-                        closed_position_ids.append(int(pos_id))
-                except Exception as exc:
+                pos_id = getattr(entry, "mt5_position_id", None) or getattr(entry, "mt5_ticket", None)
+                if not pos_id:
                     failed = True
-                    manage["execution_error"] = str(exc)
+                    manage["execution_error"] = "No broker position id to close"
+                else:
+                    try:
+                        volume = float(getattr(entry, "volume_remaining", 0.0) or entry.volume or 0.0)
+                        closed = self.mt5_executor.close_trade(
+                            symbol, position_id=pos_id, volume=volume or None
+                        )
+                        manage["execution"]["mt5_closed"] = bool(closed)
+                        failed = failed or not bool(closed)
+                        if closed:
+                            entry_closed_ids.append(int(pos_id))
+                    except Exception as exc:
+                        failed = True
+                        manage["execution_error"] = str(exc)
+            closed_position_ids.extend(entry_closed_ids)
 
         if failed:
             manage["signal"] = "HOLD"
             manage["info"] = f"{label}: broker close not confirmed; retrying"
             trade.last_price_ts = time.time()
-        else:
-            known_split_legs = getattr(trade, "split_legs", {}) or {}
-            complete_id_set = not split_ids or (
-                bool(known_split_legs)
-                and len(closed_position_ids) == len(known_split_legs)
-            )
-            if complete_id_set:
-                self._attach_position_close_metrics(manage, closed_position_ids)
+        elif not any_split_ids or complete_id_set:
+            self._attach_position_close_metrics(manage, closed_position_ids)
         self._log_signal(symbol, manage)
         return manage, not failed
 
 
-    def _position_gone_confirmed(self, symbol: str, query_failed: bool) -> bool:
+    def _position_gone_confirmed(self, state_key: str, query_failed: bool) -> bool:
         """True only after N consecutive ticks where the position is absent AND the
         MT5 connection is verifiably alive. Any failed/untrusted query resets nothing
         and confirms nothing — better to hold a closed trade one extra tick than to
@@ -807,8 +1020,8 @@ class Core:
             return False
         if not (self.mt5_executor and self.mt5_executor.connection_alive()):
             return False
-        count = self._broker_missing_counts.get(symbol, 0) + 1
-        self._broker_missing_counts[symbol] = count
+        count = self._broker_missing_counts.get(state_key, 0) + 1
+        self._broker_missing_counts[state_key] = count
         return count >= self._broker_missing_confirm
 
     @staticmethod
@@ -839,29 +1052,33 @@ class Core:
                 out[tf] = df
         return out
 
-    def _move_to_breakeven(self, symbol: str, trade: ActiveTrade) -> bool:
-        """Move SL to the entry (fill) price after TP1. Returns True on success.
+    def _move_entry_to_breakeven(
+        self, symbol: str, entry: ActiveTrade, *, reason: str
+    ) -> bool:
+        """Move one entry's SL to its own fill price. Returns True on success.
 
-        Split mode: updates every remaining leg. Monitor mode: updates the single
-        position. move_stop() itself clamps the level to the broker's minimum
-        stop distance, so this never produces [Invalid stops].
+        Split mode: updates every remaining leg of that entry. Monitor mode:
+        updates the single position. move_stop() itself clamps the level to the
+        broker's minimum stop distance, so this never produces [Invalid stops].
+        Each entry of a position-adding idea has its own fill price, so the level
+        is always taken from the entry being moved — never from the idea's first.
         """
-        if not (MOVE_BE_AFTER_TP1 and self.mt5_executor):
+        if not self.mt5_executor:
             return False
-        if getattr(trade, "moved_to_be", False):
+        if getattr(entry, "moved_to_be", False):
             return False
-        be_price = float(trade.entry)
+        be_price = float(entry.entry)
         if be_price <= 0:
             return False
         try:
-            split_ids = list(getattr(trade, "split_position_ids", []) or [])
+            split_ids = list(getattr(entry, "split_position_ids", []) or [])
             if split_ids:
                 updated = self.mt5_executor.move_stop_all(symbol, position_ids=split_ids, new_stop=be_price)
                 # A partial success is not completion: leave moved_to_be=False
                 # so the remaining tickets are retried on the next fast poll.
                 ok = updated == len(split_ids)
             else:
-                pos_id = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
+                pos_id = getattr(entry, "mt5_position_id", None) or getattr(entry, "mt5_ticket", None)
                 if not pos_id:
                     return False
                 ok = self.mt5_executor.move_stop(symbol, position_id=pos_id, new_stop=be_price)
@@ -869,14 +1086,20 @@ class Core:
             print(f"[Core] {symbol} BE move failed: {exc}")
             return False
         if ok:
-            trade.moved_to_be = True
-            if trade.side == "LONG":
-                trade.stop = max(float(trade.stop or 0.0), be_price)
+            entry.moved_to_be = True
+            if entry.side == "LONG":
+                entry.stop = max(float(entry.stop or 0.0), be_price)
             else:
-                current = float(trade.stop or 0.0)
-                trade.stop = min(current, be_price) if current > 0 else be_price
-            print(f"[Core] {symbol} TP1 hit — SL moved to break-even {be_price:.5f}")
+                current = float(entry.stop or 0.0)
+                entry.stop = min(current, be_price) if current > 0 else be_price
+            print(f"[Core] {symbol}{_entry_label(entry)} SL moved to break-even {be_price:.5f} ({reason})")
         return ok
+
+    def _move_to_breakeven(self, symbol: str, trade: ActiveTrade) -> bool:
+        """TP1-driven break-even for one entry (config-gated)."""
+        if not MOVE_BE_AFTER_TP1:
+            return False
+        return self._move_entry_to_breakeven(symbol, trade, reason="TP1 hit")
 
     def _attach_position_close_metrics(
         self,
@@ -927,7 +1150,12 @@ class Core:
         so without this neither the journal nor the AI filter ever sees outcomes."""
         if not self.mt5_executor:
             return
-        split_legs = getattr(trade, "split_legs", {}) or {}
+        # A position-adding idea is journaled as one result: every entry's legs
+        # contribute to the same realized P&L and outcome.
+        entries = self._idea_entries(trade)
+        split_legs: Dict[int, Dict[str, Any]] = {}
+        for entry in entries:
+            split_legs.update(getattr(entry, "split_legs", {}) or {})
         ids = [int(pid) for pid in split_legs]
         closed_meta = [
             meta for meta in split_legs.values()
@@ -950,12 +1178,13 @@ class Core:
                 for meta in closed_meta
             ) / total_close_volume
         outcome: Optional[str] = None
-        planned_leg_count = sum(
-            1 for volume in (getattr(trade, "volume_per_tp", []) or [])
-            if float(volume or 0.0) > 0.0
-        )
-        if planned_leg_count <= 0:
-            planned_leg_count = len(trade.tp_prices or [])
+        planned_leg_count = 0
+        for entry in entries:
+            entry_legs = sum(
+                1 for volume in (getattr(entry, "volume_per_tp", []) or [])
+                if float(volume or 0.0) > 0.0
+            )
+            planned_leg_count += entry_legs or len(entry.tp_prices or [])
         complete_mapping = bool(split_legs) and len(split_legs) >= planned_leg_count
         pnl_complete = complete_mapping and len(closed_meta) == len(split_legs)
         manage["pnl_complete"] = pnl_complete
@@ -968,14 +1197,20 @@ class Core:
                 outcome = "SL"
             else:
                 outcome = "BE"
-        elif int(getattr(trade, "tp_hit", 0) or 0) > 0:
+        elif any(int(getattr(entry, "tp_hit", 0) or 0) > 0 for entry in entries):
             # Legacy state may only know the still-open final leg. Confirmed
             # earlier TPs must not be reclassified as a loss when that leg exits
             # at the break-even stop.
             outcome = "TP"
         if not ids:
-            pid = getattr(trade, "mt5_position_id", None) or getattr(trade, "mt5_ticket", None)
-            ids = [pid] if pid else []
+            ids = [
+                pid
+                for pid in (
+                    getattr(entry, "mt5_position_id", None) or getattr(entry, "mt5_ticket", None)
+                    for entry in entries
+                )
+                if pid
+            ]
         if not split_legs and self._attach_position_close_metrics(manage, ids):
             outcome = str(manage.get("outcome") or "") or None
         if outcome is None:
@@ -1225,6 +1460,193 @@ class Core:
         print(f"[VolRegime] {symbol} entry blocked: {reason}")
         return sig
 
+    def _try_position_add(
+        self,
+        symbol: str,
+        trade: ActiveTrade,
+        data: Dict[str, Any],
+        last_price: float,
+    ) -> Optional[Dict[str, Any]]:
+        """Stage one more entry into the open idea when it is confirmed again.
+
+        Returns the executed add-on signal, or None when nothing was opened —
+        the caller keeps reporting the idea's HOLD either way. Every gate that
+        applies to a first entry applies here too; on top of them the pyramid
+        manager enforces the idea's aggregate risk cap and moves older entries
+        to break-even before the new risk is added.
+        """
+        if not (POSITION_ADDING_ENABLED and self.mt5_executor):
+            return None
+        if PARTIAL_TP_MODE == "monitor":
+            return None
+        entries = self._idea_entries(trade)
+        if len(entries) >= IDEA_MAX_ENTRIES:
+            return None
+        # Add-ons rely on broker-side split legs for their own SL/TP management.
+        if not all(self._is_split_trade(entry) for entry in entries):
+            return None
+        if any(
+            int(getattr(entry, "tp_hit", 0) or 0) >= len(entry.tp_prices or [])
+            and (entry.tp_prices or [])
+            for entry in entries
+        ):
+            return None
+
+        strategy_data = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
+        raw_sig = self.strategy.generate_signal(strategy_data, symbol=symbol)
+        if raw_sig.get("signal") != "ENTER":
+            return None
+        sig = self.ai.on_signal(symbol, raw_sig, data, self.active_trades)
+        if raw_sig.get("tp_prices") and not sig.get("tp_prices"):
+            sig["tp_prices"] = raw_sig["tp_prices"]
+        sig = self._apply_global_filters(symbol, sig)
+        sig = self._apply_session_filter(symbol, sig)
+        sig = self._apply_vol_regime_filter(symbol, sig, strategy_data)
+        if sig.get("signal") != "ENTER" or not sig.get("side"):
+            return None
+        # An add-on must open as broker-managed split legs like the entries it
+        # joins; a single-TP signal would land in monitor mode inside an
+        # otherwise split idea.
+        if len([x for x in (sig.get("tp_prices") or []) if x is not None]) < 2:
+            return None
+
+        side = sig.get("side")
+        trig_sig = self._trigger_signature(sig)
+        if self._apply_entry_guards(symbol, sig, side=side, trig_sig=trig_sig):
+            print(f"[Pyramid] {symbol} add-on blocked: {sig.get('signal')} {sig.get('info', '')}")
+            return None
+
+        try:
+            decision = self.pyramid.evaluate(
+                trade,
+                sig,
+                executor=self.mt5_executor,
+                last_price=last_price,
+                trigger_signature=trig_sig,
+            )
+        except PyramidRiskError as exc:
+            print(f"[Pyramid] {symbol} add-on skipped: {exc}")
+            return None
+        if not decision.allowed:
+            print(f"[Pyramid] {symbol} add-on rejected: {decision.reason}")
+            return None
+
+        # Free the required room BEFORE new risk enters the market. A failed
+        # break-even means the idea would exceed its cap, so nothing is opened.
+        be_moved: List[ActiveTrade] = []
+        for entry in decision.entries_to_breakeven:
+            if not self._move_entry_to_breakeven(
+                symbol, entry, reason=f"освобождение риска под вход {decision.entry_index}"
+            ):
+                print(
+                    f"[Pyramid] {symbol} add-on cancelled: не удалось перевести "
+                    f"вход #{getattr(entry, 'entry_index', 1)} в безубыток"
+                )
+                return None
+            entry.be_for_idea_risk = True
+            be_moved.append(entry)
+
+        try:
+            addon = self._execute_entry_signal(symbol, sig)
+        except RiskCapacityError as exc:
+            print(f"[Pyramid] {symbol} add-on waiting for risk-compatible entry: {exc}")
+            return None
+        except Exception as exc:
+            err_str = str(exc)
+            is_stale = "Stale signal rejected" in err_str
+            cooldown_sec = self._stale_cooldown_sec if is_stale else self._entry_cooldown_sec
+            self._entry_cooldowns[symbol] = time.time() + cooldown_sec
+            print(f"[Pyramid] {symbol} add-on execution failed: {exc}. Cooldown {cooldown_sec:.0f}s")
+            return None
+
+        addon.idea_id = trade.idea_id
+        addon.entry_index = decision.entry_index
+        trade.addons.append(addon)
+        trade.idea_trigger_signatures.append(trig_sig)
+        self._entries_today[symbol] = self._entries_today.get(symbol, 0) + 1
+        self._trigger_signatures.setdefault(symbol, set()).add(trig_sig)
+
+        sig.setdefault("setup_id", uuid.uuid4().hex)
+        sig["idea_id"] = trade.idea_id
+        sig["entry_index"] = decision.entry_index
+        sig["idea_entries"] = len(trade.addons) + 1
+        sig["idea_max_entries"] = IDEA_MAX_ENTRIES
+        sig["idea_risk_pct"] = round(decision.projected_risk_pct, 5)
+        sig["position_add"] = True
+        if be_moved:
+            sig["idea_be_entries"] = [
+                int(getattr(entry, "entry_index", 1) or 1) for entry in be_moved
+            ]
+        print(
+            f"[Pyramid] {symbol} entry {decision.entry_index}/{IDEA_MAX_ENTRIES} opened, "
+            f"idea risk {decision.idea_risk_pct:.2%} → {decision.projected_risk_pct:.2%}"
+            + (f", BE: {sig['idea_be_entries']}" if be_moved else "")
+        )
+        return sig
+
+    def _apply_entry_guards(
+        self, symbol: str, sig: Dict[str, Any], *, side: str, trig_sig: str
+    ) -> bool:
+        """Per-symbol entry brakes. Rewrites ``sig`` in place and returns True
+        when the entry must not be opened.
+
+        Shared by first entries and position-adding add-ons: an add-on is new
+        risk in the market and passes exactly the same frequency, hedging and
+        correlation checks as any other entry.
+        """
+        # Skip if this symbol is in cooldown (failed execution or stop-out)
+        cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
+        if time.time() < cooldown_until:
+            sig["signal"] = "WAIT_COOLDOWN"
+            sig["info"] = f"Entry cooldown ({cooldown_until - time.time():.0f}s left)"
+            return True
+
+        # Daily frequency brakes: setup cap per symbol + one-shot triggers
+        if self._entries_today.get(symbol, 0) >= MAX_SETUPS_PER_SYMBOL_PER_DAY:
+            sig["signal"] = "SKIP_DAILY_LIMIT"
+            sig["info"] = f"Достигнут лимит {MAX_SETUPS_PER_SYMBOL_PER_DAY} сетапов/день"
+            return True
+
+        if trig_sig in self._trigger_signatures.get(symbol, set()):
+            sig["signal"] = "SKIP_DUP_TRIGGER"
+            sig["info"] = f"Зона/бар триггера уже отторгована сегодня ({trig_sig})"
+            return True
+
+        # Anti-hedging guard: block entry if opposite MT5 position is open
+        if self.mt5_executor:
+            import MetaTrader5 as _mt5
+            _open_pos = _mt5.positions_get(symbol=symbol) or []
+            _expected_type = _mt5.POSITION_TYPE_BUY if side == "LONG" else _mt5.POSITION_TYPE_SELL
+            _opposite = [p for p in _open_pos if p.magic == self.mt5_executor.settings.magic and p.type != _expected_type]
+            if _opposite:
+                sig["signal"] = "SKIP_HEDGE"
+                sig["info"] = f"Opposite MT5 position still open ({len(_opposite)} legs)"
+                print(f"[Core] {symbol} anti-hedge block: {len(_opposite)} opposite leg(s) still open in MT5")
+                return True
+
+        # Correlation guard: same-direction trades on correlated symbols
+        # (e.g. EURUSD + GBPUSD) double the risk on a single idea.
+        _corr_partner = None
+        for _group in CORRELATED_GROUPS:
+            if symbol.upper() not in _group:
+                continue
+            for _other in _group:
+                if _other == symbol.upper():
+                    continue
+                _other_trade = self.active_trades.get(_other)
+                if _other_trade is not None and _other_trade.side == side:
+                    _corr_partner = _other
+                    break
+            if _corr_partner:
+                break
+        if _corr_partner:
+            sig["signal"] = "SKIP_CORRELATED"
+            sig["info"] = f"Коррелированный {_corr_partner} уже открыт в ту же сторону ({side})"
+            print(f"[Core] {symbol} correlation block: {_corr_partner} already open {side}")
+            return True
+
+        return False
+
     @staticmethod
     def _trigger_signature(sig: Dict[str, Any]) -> str:
         """Stable identity of a setup: side + trigger kind + its zone (or stop
@@ -1352,6 +1774,186 @@ class Core:
             "narrative": trade.narrative,
         }
 
+    def _execute_entry_signal(self, symbol: str, sig: Dict[str, Any]) -> ActiveTrade:
+        """Build an ActiveTrade from a validated ENTER signal and execute it in MT5.
+
+        The caller has already applied every entry guard (side, cooldowns, daily
+        limits, hedge/correlation checks). Mutates ``sig`` in place with the
+        execution payload, the actual fill price and the surviving tp_prices.
+        Raises RiskCapacityError while the entry geometry cannot fit the risk
+        budget, or any other exception on execution failure — cooldown/retry
+        policy and trade registration stay with the caller.
+        """
+        side = sig.get("side")
+        tp_prices = sig.get("tp_prices") or [sig.get("tp_price")]
+        tp_prices = [float(x) for x in tp_prices if x is not None]
+
+        new_trade = ActiveTrade(
+            side=side,
+            entry=float(sig.get("entry_price", 0.0)),
+            stop=float(sig.get("stop_price", 0.0)),
+            tp_prices=tp_prices,
+            tf=str(sig.get("tf", "")),
+            narrative=str(sig.get("narrative", "")),
+            symbol=symbol,
+            ts_open=time.time(),
+            last_price_ts=time.time(),
+        )
+        # Keep the strategy's intended entry before the broker fill
+        # replaces sig["entry_price"], so execution drift is auditable.
+        sig.setdefault("planned_entry_price", float(new_trade.entry))
+
+        if self.mt5_executor:
+            import MetaTrader5 as _mt5
+            # Auto-select mode:
+            #   split  → 2+ TPs and PARTIAL_TP_MODE != "monitor"
+            #   monitor → 1 TP, or forced via PARTIAL_TP_MODE=monitor
+            use_split = (
+                len(tp_prices) > 1
+                and PARTIAL_TP_MODE != "monitor"
+            )
+            if use_split:
+                # MK-style: calculate total volume once, then open N legs
+                tick = _mt5.symbol_info_tick(symbol)
+                if tick is None:
+                    raise RuntimeError(f"No tick for {symbol}")
+                actual_entry = float(tick.ask if new_trade.side == "LONG" else tick.bid)
+                total_vol = self.mt5_executor._calc_volume(
+                    symbol,
+                    actual_entry,
+                    new_trade.stop,
+                    side=new_trade.side,
+                )
+                # Sort TPs nearest-first: leg-0 (largest volume at 4+ TPs)
+                # targets the nearest TP, not the furthest.
+                tp_prices = (
+                    sorted(tp_prices)
+                    if new_trade.side == "LONG"
+                    else sorted(tp_prices, reverse=True)
+                )
+                new_trade.tp_prices = tp_prices
+                _info = _mt5.symbol_info(symbol)
+                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
+                vols = _compute_tp_volumes(total_vol, len(tp_prices), step=_step or 0.01)
+                legs = self.mt5_executor.execute_split_entry(
+                    symbol,
+                    side=new_trade.side,
+                    entry_price=new_trade.entry,
+                    stop_price=new_trade.stop,
+                    tp_prices=tp_prices,
+                    volumes_per_tp=vols,
+                    comment=new_trade.narrative[:20] if new_trade.narrative else None,
+                    entry_min=sig.get("entry_min"),
+                    entry_max=sig.get("entry_max"),
+                )
+                if not legs:
+                    raise RuntimeError(
+                        "Split entry opened no legs (all volumes below broker minimum)"
+                    )
+                new_trade.volume = round(sum(l["volume"] for l in legs), 2)
+                new_trade.volume_remaining = new_trade.volume
+                new_trade.volume_per_tp = [0.0] * len(tp_prices)
+                for leg in legs:
+                    idx = int(leg.get("tp_index") or 0) - 1
+                    if 0 <= idx < len(new_trade.volume_per_tp):
+                        new_trade.volume_per_tp[idx] = float(leg.get("volume") or 0.0)
+                new_trade.split_legs = {}
+                for leg in legs:
+                    # position_id is the ticket used by positions_get;
+                    # order ticket is retained as metadata for audits.
+                    leg_ticket = leg.get("position_id")
+                    if not leg_ticket:
+                        raise RuntimeError(
+                            "Split entry returned a leg without an exact position_id"
+                        )
+                    new_trade.split_legs[int(leg_ticket)] = {
+                        "tp_index": int(leg.get("tp_index") or 0),
+                        "tp": float(leg.get("tp") or 0.0),
+                        "volume": float(leg.get("volume") or 0.0),
+                        "order_ticket": int(leg.get("ticket") or 0),
+                        "status": "open",
+                    }
+                new_trade.split_position_ids = [
+                    ticket
+                    for ticket, _ in sorted(
+                        new_trade.split_legs.items(),
+                        key=lambda item: (
+                            int(item[1].get("tp_index") or 10**6),
+                            item[0],
+                        ),
+                    )
+                ]
+                # anchor mt5_position_id to first leg for backward compat
+                if new_trade.split_position_ids:
+                    new_trade.mt5_position_id = new_trade.split_position_ids[0]
+                new_trade.mt5_ticket = legs[0]["ticket"] if legs else None
+                new_trade.execution_comment = legs[0].get("comment") if legs else None
+                sig["execution"] = {"legs": legs, "mode": "split"}
+                # Update entry to actual volume-weighted fill price
+                _fill_vols = [l["volume"] for l in legs]
+                _fill_prices = [l["price"] for l in legs]
+                _total_vol = sum(_fill_vols)
+                if _total_vol > 0:
+                    _avg_fill = sum(p * v for p, v in zip(_fill_prices, _fill_vols)) / _total_vol
+                    new_trade.entry = round(_avg_fill, 6)
+                    sig["entry_price"] = new_trade.entry
+                print(
+                    f"[Core] {symbol} SPLIT entry: {len(legs)} legs, "
+                    f"vols={vols}, total={new_trade.volume:.2f}, "
+                    f"position_ids={new_trade.split_position_ids}"
+                )
+            else:
+                execution_payload = self.mt5_executor.execute_entry(
+                    symbol,
+                    side=new_trade.side,
+                    entry_price=new_trade.entry,
+                    stop_price=new_trade.stop,
+                    # Pass LAST TP as hard broker TP so intermediate TPs
+                    # are handled by the bot via partial market closes.
+                    tp_price=tp_prices[-1] if tp_prices else None,
+                    comment=new_trade.narrative[:28] if new_trade.narrative else None,
+                    entry_min=sig.get("entry_min"),
+                    entry_max=sig.get("entry_max"),
+                )
+                new_trade.volume = execution_payload.get("volume", 0.0)
+                new_trade.volume_remaining = new_trade.volume
+                _info = _mt5.symbol_info(symbol)
+                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
+                new_trade.volume_per_tp = _compute_tp_volumes(
+                    new_trade.volume, len(tp_prices), step=_step or 0.01
+                )
+                print(
+                    f"[Core] {symbol} MONITOR entry: volume_per_tp={new_trade.volume_per_tp} "
+                    f"(total={new_trade.volume:.2f}, n_tps={len(tp_prices)})"
+                )
+                new_trade.mt5_ticket = execution_payload.get("ticket")
+                new_trade.mt5_position_id = execution_payload.get("position_id")
+                new_trade.execution_comment = execution_payload.get("comment")
+                sig["execution"] = execution_payload
+                # Update entry to actual broker fill price
+                _fill = execution_payload.get("price")
+                if _fill:
+                    new_trade.entry = round(float(_fill), 6)
+                    sig["entry_price"] = new_trade.entry
+
+            # Strip TPs that the fill price has already passed.
+            # Slippage can push the fill beyond near TPs, causing the bot
+            # to immediately mark them as hit even though MT5 never triggered.
+            _e = new_trade.entry
+            if new_trade.side == "LONG":
+                new_trade.tp_prices = [t for t in new_trade.tp_prices if t > _e]
+            else:
+                new_trade.tp_prices = [t for t in new_trade.tp_prices if t < _e]
+            sig["tp_prices"] = [round(t, 6) for t in new_trade.tp_prices]
+            if new_trade.tp_prices:
+                sig["tp_price"] = round(new_trade.tp_prices[-1], 6)
+            print(
+                f"[Core] {symbol} after fill={new_trade.entry:.5f}: "
+                f"active tp_prices={[round(t,5) for t in new_trade.tp_prices]}"
+            )
+            self._entry_cooldowns.pop(symbol, None)
+        return new_trade
+
     def get_signals(self) -> Dict[str, dict]:
         results: Dict[str, dict] = {}
         symbols = self._get_symbols()
@@ -1431,7 +2033,7 @@ class Core:
                             # durable map makes this call idempotent if the fast job
                             # already consumed a close event.
                             with self._management_lock:
-                                lifecycle = self._poll_split_lifecycle(
+                                lifecycle = self._poll_idea_lifecycle(
                                     symbol, trade, last_price=last_price
                                 )
                             leg_events.extend(lifecycle.get("events") or [])
@@ -1615,16 +2217,11 @@ class Core:
                     # Move SL to break-even once TP1 is reached. tp_hit is persisted, so
                     # a failed modify retries every tick until it succeeds. Works for both
                     # modes: split (all remaining legs) and monitor (single position).
-                    if (
-                        not getattr(trade, "moved_to_be", False)
-                        and int(getattr(trade, "tp_hit", 0) or 0) >= 1
-                        and manage.get("signal") not in ("EXIT_SL", "EXIT_TP", "EXIT_TIME", "EXIT_BROKER")
-                    ):
-                        if self._move_to_breakeven(symbol, trade):
+                    if manage.get("signal") not in ("EXIT_SL", "EXIT_TP", "EXIT_TIME", "EXIT_BROKER"):
+                        be_events = self._move_idea_entries_to_breakeven(symbol, trade)
+                        if be_events:
                             dirty = True
-                            manage.setdefault("events", []).append(
-                                {"type": "BE", "price": float(trade.entry)}
-                            )
+                            manage.setdefault("events", []).extend(be_events)
 
                     # Daily/Friday flat close: hard rule — force exit all positions at
                     # DAILY_CLOSE_HOUR (every day) / FRIDAY_CLOSE_HOUR UTC+3. Placed
@@ -1655,44 +2252,48 @@ class Core:
                                 exec_block = {}
                                 manage["execution"] = exec_block
                             conn_ok = self.mt5_executor.connection_alive()
-                            split_ids = getattr(trade, "split_position_ids", [])
-                            if split_ids:
-                                # Close any remaining split legs (already-hit TPs are gone)
-                                closed_count = 0
-                                remaining_legs: List[int] = []
-                                for pid in split_ids:
-                                    try:
-                                        ok = self.mt5_executor.close_trade(symbol, position_id=pid, volume=None)
-                                        if ok:
-                                            closed_count += 1
-                                        else:
-                                            # Any unconfirmed close is retried. A transient
-                                            # ticket lookup failure is not proof that the
-                                            # broker position is gone, even on a live link.
+                            # Closing the idea means closing every entry it holds.
+                            for _entry in self._idea_entries(trade):
+                                split_ids = getattr(_entry, "split_position_ids", [])
+                                if split_ids:
+                                    # Close any remaining split legs (already-hit TPs are gone)
+                                    closed_count = 0
+                                    remaining_legs: List[int] = []
+                                    for pid in split_ids:
+                                        try:
+                                            ok = self.mt5_executor.close_trade(symbol, position_id=pid, volume=None)
+                                            if ok:
+                                                closed_count += 1
+                                            else:
+                                                # Any unconfirmed close is retried. A transient
+                                                # ticket lookup failure is not proof that the
+                                                # broker position is gone, even on a live link.
+                                                remaining_legs.append(pid)
+                                        except Exception as exc:
+                                            manage.setdefault("execution_error", str(exc))
                                             remaining_legs.append(pid)
+                                    exec_block["mt5_closed_split"] = (
+                                        int(exec_block.get("mt5_closed_split") or 0) + closed_count
+                                    )
+                                    if remaining_legs:
+                                        close_failed = True
+                                        _entry.split_position_ids = remaining_legs
+                                elif getattr(_entry, "mt5_position_id", None):
+                                    try:
+                                        close_vol = getattr(_entry, "volume_remaining", 0.0) or _entry.volume
+                                        closed = self.mt5_executor.close_trade(
+                                            symbol,
+                                            position_id=_entry.mt5_position_id,
+                                            volume=close_vol,
+                                        )
+                                        exec_block["mt5_closed"] = closed
+                                        if not closed:
+                                            close_failed = True
+                                        else:
+                                            closed_position_ids.append(int(_entry.mt5_position_id))
                                     except Exception as exc:
                                         manage.setdefault("execution_error", str(exc))
-                                        remaining_legs.append(pid)
-                                exec_block["mt5_closed_split"] = closed_count
-                                if remaining_legs:
-                                    close_failed = True
-                                    trade.split_position_ids = remaining_legs
-                            elif getattr(trade, "mt5_position_id", None):
-                                try:
-                                    close_vol = getattr(trade, "volume_remaining", 0.0) or trade.volume
-                                    closed = self.mt5_executor.close_trade(
-                                        symbol,
-                                        position_id=trade.mt5_position_id,
-                                        volume=close_vol,
-                                    )
-                                    exec_block["mt5_closed"] = closed
-                                    if not closed:
                                         close_failed = True
-                                    else:
-                                        closed_position_ids.append(int(trade.mt5_position_id))
-                                except Exception as exc:
-                                    manage.setdefault("execution_error", str(exc))
-                                    close_failed = True
                         if close_failed:
                             # Keep the trade tracked and retry next tick — deleting it
                             # here would leave a live position unmanaged in the market.
@@ -1717,6 +2318,28 @@ class Core:
                         continue
 
                     trade.last_price_ts = time.time()
+
+                    # Position Adding: a still-working idea may be confirmed
+                    # again and earn one more entry under the shared risk cap.
+                    if manage.get("signal") == "HOLD" and not _in_grace:
+                        addon_sig = self._try_position_add(symbol, trade, data, last_price)
+                        if addon_sig is not None:
+                            dirty = True
+                            manage = dict(manage)
+                            manage.setdefault("events", []).append({
+                                "type": "POSITION_ADD",
+                                "entry_index": addon_sig.get("entry_index"),
+                                "idea_entries": addon_sig.get("idea_entries"),
+                                "idea_max_entries": addon_sig.get("idea_max_entries"),
+                                "idea_risk_pct": addon_sig.get("idea_risk_pct"),
+                                "be_entries": addon_sig.get("idea_be_entries") or [],
+                                "entry_price": addon_sig.get("entry_price"),
+                                "stop_price": addon_sig.get("stop_price"),
+                                "tp_prices": addon_sig.get("tp_prices") or [],
+                                "volume": addon_sig.get("execution", {}).get("volume"),
+                            })
+                            manage["position_add"] = addon_sig
+
                     results[symbol] = manage
                     self._log_signal(symbol, manage)
                     continue
@@ -1746,267 +2369,52 @@ class Core:
                         self._log_signal(symbol, sig)
                         continue
 
-                    # Skip if this symbol is in cooldown (failed execution or stop-out)
-                    cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
-                    if time.time() < cooldown_until:
-                        sig["signal"] = "WAIT_COOLDOWN"
-                        sig["info"] = f"Entry cooldown ({cooldown_until - time.time():.0f}s left)"
-                        results[symbol] = sig
-                        self._log_signal(symbol, sig)
-                        continue
-
-                    # Daily frequency brakes: setup cap per symbol + one-shot triggers
-                    if self._entries_today.get(symbol, 0) >= MAX_SETUPS_PER_SYMBOL_PER_DAY:
-                        sig["signal"] = "SKIP_DAILY_LIMIT"
-                        sig["info"] = f"Достигнут лимит {MAX_SETUPS_PER_SYMBOL_PER_DAY} сетапов/день"
-                        results[symbol] = sig
-                        self._log_signal(symbol, sig)
-                        continue
-
                     trig_sig = self._trigger_signature(sig)
-                    if trig_sig in self._trigger_signatures.get(symbol, set()):
-                        sig["signal"] = "SKIP_DUP_TRIGGER"
-                        sig["info"] = f"Зона/бар триггера уже отторгована сегодня ({trig_sig})"
+                    if self._apply_entry_guards(symbol, sig, side=side, trig_sig=trig_sig):
                         results[symbol] = sig
                         self._log_signal(symbol, sig)
                         continue
 
-                    # Anti-hedging guard: block entry if opposite MT5 position is open
-                    if self.mt5_executor:
-                        import MetaTrader5 as _mt5
-                        _open_pos = _mt5.positions_get(symbol=symbol) or []
-                        _expected_type = _mt5.POSITION_TYPE_BUY if side == "LONG" else _mt5.POSITION_TYPE_SELL
-                        _opposite = [p for p in _open_pos if p.magic == self.mt5_executor.settings.magic and p.type != _expected_type]
-                        if _opposite:
-                            sig["signal"] = "SKIP_HEDGE"
-                            sig["info"] = f"Opposite MT5 position still open ({len(_opposite)} legs)"
-                            results[symbol] = sig
-                            self._log_signal(symbol, sig)
-                            print(f"[Core] {symbol} anti-hedge block: {len(_opposite)} opposite leg(s) still open in MT5")
-                            continue
-
-                    # Correlation guard: same-direction trades on correlated symbols
-                    # (e.g. EURUSD + GBPUSD) double the risk on a single idea.
-                    _corr_partner = None
-                    for _group in CORRELATED_GROUPS:
-                        if symbol.upper() not in _group:
-                            continue
-                        for _other in _group:
-                            if _other == symbol.upper():
-                                continue
-                            _other_trade = self.active_trades.get(_other)
-                            if _other_trade is not None and _other_trade.side == side:
-                                _corr_partner = _other
-                                break
-                        if _corr_partner:
-                            break
-                    if _corr_partner:
-                        sig["signal"] = "SKIP_CORRELATED"
-                        sig["info"] = f"Коррелированный {_corr_partner} уже открыт в ту же сторону ({side})"
+                    try:
+                        new_trade = self._execute_entry_signal(symbol, sig)
+                    except RiskCapacityError as exc:
+                        # Keep the technical SL intact. The signal is retried
+                        # on the next tick and becomes executable when price
+                        # reaches the risk-compatible entry geometry.
+                        sig["signal"] = "WAIT_RISK_ENTRY"
+                        sig["info"] = str(exc)
+                        risk_adjustment = exc.to_payload()
+                        if risk_adjustment:
+                            sig["risk_adjustment"] = risk_adjustment
                         results[symbol] = sig
                         self._log_signal(symbol, sig)
-                        print(f"[Core] {symbol} correlation block: {_corr_partner} already open {side}")
+                        print(
+                            f"[Core] {symbol} waiting for risk-compatible "
+                            f"entry: {exc}"
+                        )
                         continue
-
-                    tp_prices = sig.get("tp_prices") or [sig.get("tp_price")]
-                    tp_prices = [float(x) for x in tp_prices if x is not None]
-
-                    new_trade = ActiveTrade(
-                        side=side,
-                        entry=float(sig.get("entry_price", 0.0)),
-                        stop=float(sig.get("stop_price", 0.0)),
-                        tp_prices=tp_prices,
-                        tf=str(sig.get("tf", "")),
-                        narrative=str(sig.get("narrative", "")),
-                        symbol=symbol,
-                        ts_open=time.time(),
-                        last_price_ts=time.time(),
-                    )
-                    # Keep the strategy's intended entry before the broker fill
-                    # replaces sig["entry_price"], so execution drift is auditable.
-                    sig.setdefault("planned_entry_price", float(new_trade.entry))
-
-                    if self.mt5_executor:
-                        try:
-                            import MetaTrader5 as _mt5
-                            # Auto-select mode:
-                            #   split  → 2+ TPs and PARTIAL_TP_MODE != "monitor"
-                            #   monitor → 1 TP, or forced via PARTIAL_TP_MODE=monitor
-                            use_split = (
-                                len(tp_prices) > 1
-                                and PARTIAL_TP_MODE != "monitor"
-                            )
-                            if use_split:
-                                # MK-style: calculate total volume once, then open N legs
-                                tick = _mt5.symbol_info_tick(symbol)
-                                if tick is None:
-                                    raise RuntimeError(f"No tick for {symbol}")
-                                actual_entry = float(tick.ask if new_trade.side == "LONG" else tick.bid)
-                                total_vol = self.mt5_executor._calc_volume(
-                                    symbol,
-                                    actual_entry,
-                                    new_trade.stop,
-                                    side=new_trade.side,
-                                )
-                                # Sort TPs nearest-first: leg-0 (largest volume at 4+ TPs)
-                                # targets the nearest TP, not the furthest.
-                                tp_prices = (
-                                    sorted(tp_prices)
-                                    if new_trade.side == "LONG"
-                                    else sorted(tp_prices, reverse=True)
-                                )
-                                new_trade.tp_prices = tp_prices
-                                _info = _mt5.symbol_info(symbol)
-                                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
-                                vols = _compute_tp_volumes(total_vol, len(tp_prices), step=_step or 0.01)
-                                legs = self.mt5_executor.execute_split_entry(
-                                    symbol,
-                                    side=new_trade.side,
-                                    entry_price=new_trade.entry,
-                                    stop_price=new_trade.stop,
-                                    tp_prices=tp_prices,
-                                    volumes_per_tp=vols,
-                                    comment=new_trade.narrative[:20] if new_trade.narrative else None,
-                                    entry_min=sig.get("entry_min"),
-                                    entry_max=sig.get("entry_max"),
-                                )
-                                if not legs:
-                                    raise RuntimeError(
-                                        "Split entry opened no legs (all volumes below broker minimum)"
-                                    )
-                                new_trade.volume = round(sum(l["volume"] for l in legs), 2)
-                                new_trade.volume_remaining = new_trade.volume
-                                new_trade.volume_per_tp = [0.0] * len(tp_prices)
-                                for leg in legs:
-                                    idx = int(leg.get("tp_index") or 0) - 1
-                                    if 0 <= idx < len(new_trade.volume_per_tp):
-                                        new_trade.volume_per_tp[idx] = float(leg.get("volume") or 0.0)
-                                new_trade.split_legs = {}
-                                for leg in legs:
-                                    # position_id is the ticket used by positions_get;
-                                    # order ticket is retained as metadata for audits.
-                                    leg_ticket = leg.get("position_id")
-                                    if not leg_ticket:
-                                        raise RuntimeError(
-                                            "Split entry returned a leg without an exact position_id"
-                                        )
-                                    new_trade.split_legs[int(leg_ticket)] = {
-                                        "tp_index": int(leg.get("tp_index") or 0),
-                                        "tp": float(leg.get("tp") or 0.0),
-                                        "volume": float(leg.get("volume") or 0.0),
-                                        "order_ticket": int(leg.get("ticket") or 0),
-                                        "status": "open",
-                                    }
-                                new_trade.split_position_ids = [
-                                    ticket
-                                    for ticket, _ in sorted(
-                                        new_trade.split_legs.items(),
-                                        key=lambda item: (
-                                            int(item[1].get("tp_index") or 10**6),
-                                            item[0],
-                                        ),
-                                    )
-                                ]
-                                # anchor mt5_position_id to first leg for backward compat
-                                if new_trade.split_position_ids:
-                                    new_trade.mt5_position_id = new_trade.split_position_ids[0]
-                                new_trade.mt5_ticket = legs[0]["ticket"] if legs else None
-                                new_trade.execution_comment = legs[0].get("comment") if legs else None
-                                sig["execution"] = {"legs": legs, "mode": "split"}
-                                # Update entry to actual volume-weighted fill price
-                                _fill_vols = [l["volume"] for l in legs]
-                                _fill_prices = [l["price"] for l in legs]
-                                _total_vol = sum(_fill_vols)
-                                if _total_vol > 0:
-                                    _avg_fill = sum(p * v for p, v in zip(_fill_prices, _fill_vols)) / _total_vol
-                                    new_trade.entry = round(_avg_fill, 6)
-                                    sig["entry_price"] = new_trade.entry
-                                print(
-                                    f"[Core] {symbol} SPLIT entry: {len(legs)} legs, "
-                                    f"vols={vols}, total={new_trade.volume:.2f}, "
-                                    f"position_ids={new_trade.split_position_ids}"
-                                )
-                            else:
-                                execution_payload = self.mt5_executor.execute_entry(
-                                    symbol,
-                                    side=new_trade.side,
-                                    entry_price=new_trade.entry,
-                                    stop_price=new_trade.stop,
-                                    # Pass LAST TP as hard broker TP so intermediate TPs
-                                    # are handled by the bot via partial market closes.
-                                    tp_price=tp_prices[-1] if tp_prices else None,
-                                    comment=new_trade.narrative[:28] if new_trade.narrative else None,
-                                    entry_min=sig.get("entry_min"),
-                                    entry_max=sig.get("entry_max"),
-                                )
-                                new_trade.volume = execution_payload.get("volume", 0.0)
-                                new_trade.volume_remaining = new_trade.volume
-                                _info = _mt5.symbol_info(symbol)
-                                _step = float(getattr(_info, "volume_step", 0.0) or 0.0) if _info else 0.0
-                                new_trade.volume_per_tp = _compute_tp_volumes(
-                                    new_trade.volume, len(tp_prices), step=_step or 0.01
-                                )
-                                print(
-                                    f"[Core] {symbol} MONITOR entry: volume_per_tp={new_trade.volume_per_tp} "
-                                    f"(total={new_trade.volume:.2f}, n_tps={len(tp_prices)})"
-                                )
-                                new_trade.mt5_ticket = execution_payload.get("ticket")
-                                new_trade.mt5_position_id = execution_payload.get("position_id")
-                                new_trade.execution_comment = execution_payload.get("comment")
-                                sig["execution"] = execution_payload
-                                # Update entry to actual broker fill price
-                                _fill = execution_payload.get("price")
-                                if _fill:
-                                    new_trade.entry = round(float(_fill), 6)
-                                    sig["entry_price"] = new_trade.entry
-
-                            # Strip TPs that the fill price has already passed.
-                            # Slippage can push the fill beyond near TPs, causing the bot
-                            # to immediately mark them as hit even though MT5 never triggered.
-                            _e = new_trade.entry
-                            if new_trade.side == "LONG":
-                                new_trade.tp_prices = [t for t in new_trade.tp_prices if t > _e]
-                            else:
-                                new_trade.tp_prices = [t for t in new_trade.tp_prices if t < _e]
-                            sig["tp_prices"] = [round(t, 6) for t in new_trade.tp_prices]
-                            if new_trade.tp_prices:
-                                sig["tp_price"] = round(new_trade.tp_prices[-1], 6)
-                            print(
-                                f"[Core] {symbol} after fill={new_trade.entry:.5f}: "
-                                f"active tp_prices={[round(t,5) for t in new_trade.tp_prices]}"
-                            )
-                            self._entry_cooldowns.pop(symbol, None)
-                        except RiskCapacityError as exc:
-                            # Keep the technical SL intact. The signal is retried
-                            # on the next tick and becomes executable when price
-                            # reaches the risk-compatible entry geometry.
-                            sig["signal"] = "WAIT_RISK_ENTRY"
-                            sig["info"] = str(exc)
-                            risk_adjustment = exc.to_payload()
-                            if risk_adjustment:
-                                sig["risk_adjustment"] = risk_adjustment
-                            results[symbol] = sig
-                            self._log_signal(symbol, sig)
-                            print(
-                                f"[Core] {symbol} waiting for risk-compatible "
-                                f"entry: {exc}"
-                            )
-                            continue
-                        except Exception as exc:
-                            err_str = str(exc)
-                            is_stale = "Stale signal rejected" in err_str
-                            cooldown_sec = self._stale_cooldown_sec if is_stale else self._entry_cooldown_sec
-                            self._entry_cooldowns[symbol] = time.time() + cooldown_sec
-                            sig["signal"] = "EXECUTION_ERROR"
-                            sig["execution_error"] = err_str
-                            results[symbol] = sig
-                            self._log_signal(symbol, sig)
-                            print(f"[Core] Execution failed for {symbol}: {exc}. Cooldown {cooldown_sec:.0f}s")
-                            continue
+                    except Exception as exc:
+                        err_str = str(exc)
+                        is_stale = "Stale signal rejected" in err_str
+                        cooldown_sec = self._stale_cooldown_sec if is_stale else self._entry_cooldown_sec
+                        self._entry_cooldowns[symbol] = time.time() + cooldown_sec
+                        sig["signal"] = "EXECUTION_ERROR"
+                        sig["execution_error"] = err_str
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        print(f"[Core] Execution failed for {symbol}: {exc}. Cooldown {cooldown_sec:.0f}s")
+                        continue
 
                     # Stable identity makes journal retries idempotent without
                     # letting an unrelated stale open row hide this new setup.
                     sig.setdefault("setup_id", uuid.uuid4().hex)
+                    # Idea identity — shared by every position-adding entry that
+                    # later joins this setup.
+                    new_trade.idea_id = uuid.uuid4().hex
+                    new_trade.entry_index = 1
+                    new_trade.idea_trigger_signatures = [trig_sig]
+                    sig["idea_id"] = new_trade.idea_id
+                    sig["entry_index"] = 1
                     self.active_trades[symbol] = new_trade
                     dirty = True
                     self._entries_today[symbol] = self._entries_today.get(symbol, 0) + 1

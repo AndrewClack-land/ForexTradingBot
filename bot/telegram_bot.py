@@ -190,21 +190,52 @@ class TelegramBot:
 
         for e in events:
             et = e.get("type")
+            entry_idx = e.get("entry_index")
+            entry_tag = f" (вход {int(entry_idx)})" if entry_idx else ""
             if et == "TP":
                 idx = int(e.get("tp_index", 0))
                 tp_price = e.get("tp_price")
                 if tp_price is None:
                     continue
-                await self._reply(app, symbol, f"✅Тп {idx}: {_fmt_price(symbol, float(tp_price))}", meta=meta)
+                await self._reply(
+                    app, symbol,
+                    f"✅Тп {idx}{entry_tag}: {_fmt_price(symbol, float(tp_price))}",
+                    meta=meta,
+                )
             elif et == "BE":
                 price = e.get("price")
                 if price is None:
                     continue
                 await self._reply(
                     app, symbol,
-                    f"🔒 Стоп перенесён в безубыток: {_fmt_price(symbol, float(price))}",
+                    f"🔒 Стоп перенесён в безубыток{entry_tag}: {_fmt_price(symbol, float(price))}",
                     meta=meta,
                 )
+            elif et == "POSITION_ADD":
+                index = int(e.get("entry_index") or 0)
+                total = int(e.get("idea_max_entries") or 0)
+                entry_price = e.get("entry_price")
+                stop_price = e.get("stop_price")
+                lines = [f"➕ Добавление объёма: вход {index}/{total} по идее"]
+                if entry_price is not None:
+                    lines.append(f"Вход: {_fmt_price(symbol, float(entry_price))}")
+                if stop_price is not None:
+                    lines.append(f"Стоп: {_fmt_price(symbol, float(stop_price))}")
+                tps = [float(x) for x in (e.get("tp_prices") or [])]
+                if tps:
+                    lines.append(
+                        "ТП: " + " / ".join(_fmt_price(symbol, tp) for tp in tps)
+                    )
+                be_entries = [int(x) for x in (e.get("be_entries") or [])]
+                if be_entries:
+                    lines.append(
+                        "В безубытке: "
+                        + ", ".join(f"вход {idx}" for idx in be_entries)
+                    )
+                risk = e.get("idea_risk_pct")
+                if risk is not None:
+                    lines.append(f"Риск по идее: {float(risk):.2%}")
+                await self._reply(app, symbol, "\n".join(lines), meta=meta)
 
     async def _handle_exit(self, app, symbol: str, sig: Dict[str, Any]) -> None:
         st = sig.get("signal")
@@ -316,6 +347,17 @@ class TelegramBot:
         except Exception:
             traceback.print_exc()
 
+        if sig.get("idea_id"):
+            try:
+                self.journal.update_open_trade_state(
+                    symbol,
+                    idea_id=sig.get("idea_id"),
+                    idea_entries=1,
+                    idea_volume=sig.get("execution", {}).get("volume"),
+                )
+            except Exception:
+                pass
+
         text = self._format_signal(symbol, sig)
 
         msg = await self._safe_send_message(
@@ -342,6 +384,30 @@ class TelegramBot:
                 )
         except Exception:
             pass
+
+    def _journal_position_add(self, symbol: str, addon: Dict[str, Any]) -> None:
+        """Fold an add-on entry into the idea's open journal row.
+
+        The journal keys one open row per symbol and closes it with the idea's
+        aggregate broker P&L, so an add-on must grow that row rather than open a
+        second one that would never be closed.
+        """
+        trade = self.core.active_trades.get(symbol)
+        total_volume = None
+        if trade is not None:
+            entries = trade.entries() if hasattr(trade, "entries") else [trade]
+            total_volume = sum(float(getattr(e, "volume", 0.0) or 0.0) for e in entries)
+        try:
+            with self.profiler.section("journal_update"):
+                self.journal.update_open_trade_state(
+                    symbol,
+                    idea_id=addon.get("idea_id"),
+                    idea_entries=addon.get("idea_entries"),
+                    idea_volume=total_volume,
+                    idea_risk_pct=addon.get("idea_risk_pct"),
+                )
+        except Exception:
+            traceback.print_exc()
 
     # ----------------- main tick loop -----------------
     async def _tick(self, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -370,6 +436,8 @@ class TelegramBot:
                     if st == "HOLD" and sig.get("events"):
                         with self.profiler.section("handle_events"):
                             await self._handle_events(app, symbol, sig)
+                        if sig.get("position_add"):
+                            self._journal_position_add(symbol, sig["position_add"])
                         continue
 
                     if st in ("EXIT_SL", "EXIT_TP"):

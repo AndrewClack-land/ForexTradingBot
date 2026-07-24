@@ -811,6 +811,46 @@ class MT5Executor:
         )
         return captured
 
+    def risk_capital_base(self) -> float:
+        """Fixed capital every risk percentage is measured against."""
+        return self._resolve_initial_capital()
+
+    def planned_entry_risk_fraction(self) -> float:
+        """Risk fraction a fresh entry is sized to (configured value, hard-capped)."""
+        return min(float(self.settings.risk_pct), _HARD_MAX_STOP_RISK_PCT)
+
+    def open_risk_amount(
+        self,
+        symbol: str,
+        *,
+        side: str,
+        entry_price: float,
+        stop_price: float,
+        volume: float,
+    ) -> float:
+        """Money still at risk on an open position, in the account currency.
+
+        Returns 0.0 once the stop sits at or beyond the entry: a position moved
+        to break-even no longer consumes the idea's risk budget, which is what
+        lets position adding open another entry without raising total exposure.
+        Uses the same risk-per-lot model as sizing, so a freshly opened entry
+        measures back at (just under) the risk fraction it was sized to.
+        """
+        try:
+            volume = float(volume)
+            entry = float(entry_price)
+            stop = float(stop_price)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(f"Invalid open-risk inputs for {symbol}: {exc}") from exc
+        if not all(math.isfinite(v) for v in (volume, entry, stop)) or volume <= 0:
+            return 0.0
+        side_key = str(side).upper()
+        if side_key == "LONG" and stop >= entry:
+            return 0.0
+        if side_key == "SHORT" and stop <= entry:
+            return 0.0
+        return self._risk_per_lot(symbol, side_key, entry, stop) * volume
+
     def _risk_limit(self) -> _RiskLimit:
         account = mt5.account_info()
         if account is None:

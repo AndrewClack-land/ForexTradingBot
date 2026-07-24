@@ -200,7 +200,14 @@ class TradeJournal:
                     exit_signal TEXT,
                     realized_net REAL,
                     pnl_complete INTEGER DEFAULT 0,
-                    close_meta_json TEXT
+                    close_meta_json TEXT,
+
+                    -- Position adding: one row stays one idea, and these track
+                    -- how many entries it ended up carrying.
+                    idea_id TEXT,
+                    idea_entries INTEGER DEFAULT 1,
+                    idea_volume REAL,
+                    idea_risk_pct REAL
                 );
                 """
             )
@@ -256,6 +263,11 @@ class TradeJournal:
                 "realized_net": "REAL",
                 "pnl_complete": "INTEGER DEFAULT 0",
                 "close_meta_json": "TEXT",
+
+                "idea_id": "TEXT",
+                "idea_entries": "INTEGER DEFAULT 1",
+                "idea_volume": "REAL",
+                "idea_risk_pct": "REAL",
             }
             for col, ddl in needed.items():
                 if not self._column_exists("trades", col):
@@ -572,6 +584,10 @@ class TradeJournal:
         tp_prices: Optional[List[float]] = None,
         telegram_chat_id_open: Optional[int] = None,
         telegram_message_id_open: Optional[int] = None,
+        idea_id: Optional[str] = None,
+        idea_entries: Optional[int] = None,
+        idea_volume: Optional[float] = None,
+        idea_risk_pct: Optional[float] = None,
     ) -> None:
         with self._lock:
             trade_id = self._find_last_open_trade_id(symbol)
@@ -580,6 +596,25 @@ class TradeJournal:
 
             cols = []
             vals = []
+
+            # A position-adding idea keeps ONE row: later entries grow the row's
+            # volume and entry count instead of opening a second open trade,
+            # which would leave the first row unclosed forever.
+            if idea_id is not None:
+                cols.append("idea_id = ?")
+                vals.append(str(idea_id))
+
+            if idea_entries is not None:
+                cols.append("idea_entries = ?")
+                vals.append(int(idea_entries))
+
+            if idea_volume is not None:
+                cols.append("idea_volume = ?")
+                vals.append(float(idea_volume))
+
+            if idea_risk_pct is not None:
+                cols.append("idea_risk_pct = ?")
+                vals.append(float(idea_risk_pct))
 
             if stop_current is not None:
                 cols.append("stop_current = ?")

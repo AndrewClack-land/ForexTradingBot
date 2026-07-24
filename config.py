@@ -151,6 +151,25 @@ EM_TP_MAX_RATIO = _env_float("EM_TP_MAX_RATIO", 1.0)
 # Recompute the vol context at most this often per symbol (RV moves slowly).
 VOL_REGIME_REFRESH_MIN = _env_int("VOL_REGIME_REFRESH_MIN") or 15
 
+# ================== POSITION ADDING (PYRAMIDING) ==================
+# Stage extra entries into a working idea instead of one all-in setup: entry 1
+# risks 1%, each later confirmation adds another 1%, and older entries are moved
+# to break-even so the whole idea never risks more than IDEA_MAX_RISK_PCT.
+# Opt-in: an upgraded bot must not start pyramiding on a VPS by itself.
+POSITION_ADDING_ENABLED = os.getenv("POSITION_ADDING_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+# Hard ceiling on entries per idea (methodology allows 2-3).
+IDEA_MAX_ENTRIES = max(1, min(5, _env_int("IDEA_MAX_ENTRIES") or 3))
+# Aggregate risk of all open entries of one idea, as a fraction of risk capital.
+IDEA_MAX_RISK_PCT = min(max(_env_float("IDEA_MAX_RISK_PCT", 0.02), 0.0), 0.02)
+# An add-on needs the idea to have proven itself: price must be at least this
+# many R (of the previous entry) in profit before another entry is allowed.
+ADDON_MIN_PROGRESS_R = max(0.0, _env_float("ADDON_MIN_PROGRESS_R", 0.5))
+# Kolachi pyramiding rule: past this share of the way from entry 1 to the final
+# TP the remaining reward no longer justifies a new entry's risk.
+ADDON_MAX_PROGRESS_PCT = min(max(_env_float("ADDON_MAX_PROGRESS_PCT", 0.5), 0.0), 1.0)
+
 # ================== EXECUTION SIZING GUARDS ==================
 # Cap on total volume (lots) per setup, applied on top of the broker maximum.
 MT5_MAX_VOLUME = _env_float("MT5_MAX_VOLUME", 10.0)
