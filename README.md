@@ -7,7 +7,7 @@
 ## На чём основан
 
 - **Python 3.11** + официальный пакет **MetaTrader5** — котировки и исполнение напрямую через терминал;
-- **Smart Money Concepts / ICT**: premium/discount, дилинг-ренджи, ордерблоки, rejection-блоки,
+- **Smart Money Concepts / ICT**: premium/discount, ордерблоки, rejection-блоки,
   FVG, liquidity sweep (turtle soup), фракталы Вильямса;
 - **python-telegram-bot** — сигналы и команды (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — журнал сделок и статистика для AI-фильтра;
@@ -15,22 +15,25 @@
 
 ## Как бот принимает направление (HTF bias)
 
-Направление определяется ансамблем независимых моделей (ensemble learning) по старшим
+Направление определяется ансамблем независимых моделей (ensemble learning) по нескольким
 таймфреймам (`core/strategy_narrative.py: calc_narrative`):
 
 | Модель | Вклад |
 | --- | --- |
-| **Daily Premium/Discount** — текущая цена относительно PDH/PDL вчерашнего дня | +2 |
-| **5-дневный дилинг-рендж** — доминирующая сторона строки и её вероятность (≥55%) | +1 |
-| **Ложный пробой фрактала D1** — свеча проколола уровень, но закрылась внутри (разворот) | +2 |
-| **Истинный пробой фрактала D1** — закрытие за уровнем (продолжение) | +1 |
-| **Ордерблок (OB)** на 4H — сторона ближайшего валидного блока | +1 |
-| **Rejection Block (RB)** на 4H — валидный неповреждённый блок | +1 |
+| **Premium/Discount 1H** — последний закрытый 15M close внутри диапазона последней закрытой H1-свечи | +2 |
+| **Ложный пробой фрактала 4H** — свеча проколола уровень, но закрылась внутри (разворот) | +2 |
+| **Истинный пробой фрактала 15M** — закрытие за уровнем (продолжение) | +1 |
+| **Ордерблок (OB)** на 1H — сторона последнего активного блока | +1 |
+| **Rejection Block (RB)** на 1H — последний валидный неповреждённый блок | +1 |
 
 Bias принимается при перевесе голосов ≥ `HTF_SCORE_MARGIN` (по умолчанию 2).
 Строгость регулирует **FVG-режим 1H** (LuxAlgo Instantaneous Mitigation): против
 направления режима порог ужесточается на +1. SMA/EMA в принятии решения не участвуют;
 при смешанном счёте bias = NEUTRAL (входа нет).
+
+Прежний 5-дневный dealing range удалён полностью. Его заменяет недирекционная
+**оценка волатильности**: `R(t)` не добавляет баллы LONG/SHORT, но режим PANIC
+блокирует вход, а Expected Move проверяет достижимость TP1.
 
 ## Фильтры перед входом
 
@@ -40,7 +43,9 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
    максимум 3 сетапа на символ в день (`MAX_SETUPS_PER_SYMBOL_PER_DAY`),
    одна и та же зона/уровень триггера не торгуется повторно в течение дня;
 4. **Дневной стоп бота** — при просадке −3% от баланса на начало дня (`DAILY_MAX_LOSS_PCT`)
-   новые входы блокируются до следующего дня.
+   новые входы блокируются до следующего дня;
+5. **Режим волатильности** — вход блокируется при `R(t) >= VOL_REGIME_MAX_R`;
+   TP1 должен быть не дальше `EM_TP_MAX_RATIO × EM1D`.
 
 ## Триггеры входа
 
@@ -109,7 +114,7 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 ### Built on
 
 - **Python 3.11** + the official **MetaTrader5** package — quotes and execution directly through the terminal;
-- **Smart Money Concepts / ICT**: premium/discount, dealing ranges, order blocks, rejection blocks,
+- **Smart Money Concepts / ICT**: premium/discount, order blocks, rejection blocks,
   FVG, liquidity sweeps (turtle soup), Williams fractals;
 - **python-telegram-bot** — signals and commands (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — trade journal and statistics for the AI filter;
@@ -117,22 +122,25 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 ### How the bot picks direction (HTF bias)
 
-Direction comes from an ensemble of independent models on the higher
+Direction comes from an ensemble of independent models on selected
 timeframes (`core/strategy_narrative.py: calc_narrative`):
 
 | Model | Weight |
 | --- | --- |
-| **Daily Premium/Discount** — current price vs yesterday's PDH/PDL | +2 |
-| **D1 fractal false breakout** — wick pierced the level, close back inside (reversal) | +2 |
-| **D1 fractal true breakout** — close beyond the level (continuation) | +1 |
-| **5-day dealing range** — dominant side of the current row and its probability (≥55%) | +1 |
-| **Order Block (OB)** on 4H — side of the nearest valid block | +1 |
-| **Rejection Block (RB)** on 4H — valid, unbroken block | +1 |
+| **1H Premium/Discount** — latest closed 15M close inside the latest closed H1 candle range | +2 |
+| **4H fractal false breakout** — wick pierced the level, close back inside (reversal) | +2 |
+| **15M fractal true breakout** — close beyond the level (continuation) | +1 |
+| **Order Block (OB)** on 1H — side of the most recent active block | +1 |
+| **Rejection Block (RB)** on 1H — most recent valid, unbroken block | +1 |
 
 Bias is accepted once the vote margin reaches `HTF_SCORE_MARGIN` (default 2).
 Strictness is regulated by the **1H FVG regime** (LuxAlgo Instantaneous Mitigation):
 against the regime direction the required margin tightens by +1. SMA/EMA take no part
 in the decision; on a mixed score the bias is NEUTRAL (no entry).
+
+The former 5-day dealing range has been removed completely. It is replaced by
+the non-directional **volatility assessment**: `R(t)` does not add LONG/SHORT
+votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 
 ### Entry filters
 
@@ -142,7 +150,9 @@ in the decision; on a mixed score the bias is NEUTRAL (no entry).
    max 3 setups per symbol per day (`MAX_SETUPS_PER_SYMBOL_PER_DAY`),
    the same trigger zone/level is never re-traded within the day;
 4. **Bot-wide daily stop** — at −3% from the day's starting balance (`DAILY_MAX_LOSS_PCT`)
-   new entries are blocked until the next day.
+   new entries are blocked until the next day;
+5. **Volatility regime** — entry is blocked at `R(t) >= VOL_REGIME_MAX_R`;
+   TP1 must be within `EM_TP_MAX_RATIO × EM1D`.
 
 ### Entry triggers
 

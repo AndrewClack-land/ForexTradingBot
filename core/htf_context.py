@@ -45,73 +45,13 @@ class FractalPower:
 
 
 @dataclass
-class DealingRangeRow:
-    idx: int
-    high: float
-    low: float
-    top_hits: int
-    bottom_hits: int
-    dominant: Literal["BULL", "BEAR", "NONE"]
-    probability: float
+class HourlyRange:
+    """Current price location inside the latest completed H1 candle range."""
 
-    def contains(self, price: float) -> bool:
-        return self.low <= price <= self.high
-
-    def to_dict(self) -> dict:
-        return {
-            "idx": int(self.idx),
-            "high": float(self.high),
-            "low": float(self.low),
-            "top_hits": int(self.top_hits),
-            "bottom_hits": int(self.bottom_hits),
-            "dominant": self.dominant,
-            "probability": float(self.probability),
-        }
-
-
-@dataclass
-class DealingRange:
-    high: float
-    low: float
-    rows: List[DealingRangeRow]
-    current_row: Optional[DealingRangeRow]
-    position: Literal["PREMIUM", "DISCOUNT", "EQ"]
-
-    @property
-    def mid(self) -> float:
-        return (self.high + self.low) / 2.0 if self.high > self.low else self.high
-
-    @property
-    def bias(self) -> Side:
-        if self.current_row and self.current_row.probability >= 55:
-            if self.current_row.dominant == "BULL":
-                return "LONG"
-            if self.current_row.dominant == "BEAR":
-                return "SHORT"
-        if self.position == "DISCOUNT":
-            return "LONG"
-        if self.position == "PREMIUM":
-            return "SHORT"
-        return "NEUTRAL"
-
-    def to_dict(self) -> dict:
-        return {
-            "high": float(self.high),
-            "low": float(self.low),
-            "position": self.position,
-            "current_row": self.current_row.to_dict() if self.current_row else None,
-            "rows": [row.to_dict() for row in self.rows],
-        }
-
-
-@dataclass
-class DailyRange:
     high: float
     low: float
     close: float
     position: Literal["PREMIUM", "DISCOUNT", "EQ"]
-    pdh: float
-    pdl: float
 
     @property
     def mid(self) -> float:
@@ -127,8 +67,6 @@ class DailyRange:
 
     def to_dict(self) -> dict:
         return {
-            "pdh": float(self.pdh),
-            "pdl": float(self.pdl),
             "high": float(self.high),
             "low": float(self.low),
             "close": float(self.close),
@@ -138,8 +76,8 @@ class DailyRange:
 
 
 @dataclass
-class DailyBreakout:
-    """Latest interaction of a D1 bar with a confirmed D1 Williams fractal level.
+class FractalBreakout:
+    """Latest interaction with a confirmed Williams fractal level.
 
     FALSE_BREAK — wick pierced the level but the bar closed back inside → reversal vote.
     TRUE_BREAK  — the bar closed beyond the level → continuation vote.
@@ -150,6 +88,7 @@ class DailyBreakout:
     level_kind: Literal["HIGH", "LOW"]
     bar_index: int
     bars_ago: int
+    timeframe: str
 
     def to_dict(self) -> dict:
         return {
@@ -158,6 +97,7 @@ class DailyBreakout:
             "level": float(self.level),
             "level_kind": self.level_kind,
             "bars_ago": int(self.bars_ago),
+            "timeframe": self.timeframe,
         }
 
 
@@ -395,9 +335,18 @@ class RejectionBlockTracker:
         for rb in rbs:
             if last_idx - rb.created_idx > self.box_length:
                 rb.valid = False
-            if rb.side == "LONG" and float(df["close"].iloc[-1]) < rb.zone_low:
+            subsequent_closes = close[rb.created_idx + 1 :]
+            if (
+                rb.side == "LONG"
+                and len(subsequent_closes)
+                and bool(np.any(subsequent_closes < rb.zone_low))
+            ):
                 rb.broken = True
-            if rb.side == "SHORT" and float(df["close"].iloc[-1]) > rb.zone_high:
+            if (
+                rb.side == "SHORT"
+                and len(subsequent_closes)
+                and bool(np.any(subsequent_closes > rb.zone_high))
+            ):
                 rb.broken = True
         return rbs[-4:]
 
@@ -420,13 +369,10 @@ class HtfContext:
         self,
         df_1h: Optional[pd.DataFrame],
         df_4h: Optional[pd.DataFrame],
-        df_daily: Optional[pd.DataFrame] = None,
+        df_15m: Optional[pd.DataFrame],
         *,
         fractal_limit: int = 20,
         pivot_lookback: int = 2,
-        dealing_range_window: int = 120,
-        dealing_rows: int = 10,
-        dealing_pivot: int = 3,
         ob_lookback: int = 10,
         ob_show_last: int = 3,
         rb_box_length: int = 6,
@@ -437,13 +383,10 @@ class HtfContext:
     ) -> None:
         self.df_1h = df_1h
         self.df_4h = df_4h
-        self.df_daily = df_daily
+        self.df_15m = df_15m
 
         self.fractal_limit = max(5, int(fractal_limit))
         self.pivot_lookback = max(1, int(pivot_lookback))
-        self.dealing_range_window = max(20, int(dealing_range_window))
-        self.dealing_rows = max(4, int(dealing_rows))
-        self.dealing_pivot = max(1, int(dealing_pivot))
 
         self.ob_tracker = OrderBlockTracker(swing_lookback=ob_lookback, show_last=ob_show_last)
         self.rb_tracker = RejectionBlockTracker(
@@ -456,26 +399,37 @@ class HtfContext:
         )
 
         self.fractals: Optional[FractalPower] = None
-        self.dealing_range: Optional[DealingRange] = None
-        self.daily_range: Optional[DailyRange] = None
+        self.hourly_range: Optional[HourlyRange] = None
         self.order_blocks: List[OrderBlock] = []
         self.rejection_blocks: List[RejectionBlock] = []
-        # 4H zones vote in the HTF bias; 1H zones stay for entry triggers.
-        self.order_blocks_4h: List[OrderBlock] = []
-        self.rejection_blocks_4h: List[RejectionBlock] = []
-        self.daily_breakout: Optional[DailyBreakout] = None
+        self.false_breakout_4h: Optional[FractalBreakout] = None
+        self.true_breakout_15m: Optional[FractalBreakout] = None
 
         if self.df_1h is not None and not self.df_1h.empty:
             self.fractals = self._calc_fractals()
-            self.dealing_range = self._calc_dealing_range()
-            self.daily_range = self._calc_daily_range()
+            self.hourly_range = self._calc_hourly_range()
             self.order_blocks = self.ob_tracker.build(self.df_1h)
             self.rejection_blocks = self.rb_tracker.build(self.df_1h)
         if self.df_4h is not None and not self.df_4h.empty:
-            self.order_blocks_4h = self.ob_tracker.build(self.df_4h)
-            self.rejection_blocks_4h = self.rb_tracker.build(self.df_4h)
-        if self.df_daily is not None and not self.df_daily.empty:
-            self.daily_breakout = self._calc_daily_breakout()
+            latest_4h_breakout = self._calc_latest_fractal_breakout(
+                self.df_4h,
+                timeframe="4H",
+            )
+            if (
+                latest_4h_breakout is not None
+                and latest_4h_breakout.kind == "FALSE_BREAK"
+            ):
+                self.false_breakout_4h = latest_4h_breakout
+        if self.df_15m is not None and not self.df_15m.empty:
+            latest_15m_breakout = self._calc_latest_fractal_breakout(
+                self.df_15m,
+                timeframe="15M",
+            )
+            if (
+                latest_15m_breakout is not None
+                and latest_15m_breakout.kind == "TRUE_BREAK"
+            ):
+                self.true_breakout_15m = latest_15m_breakout
 
     # ---------------------- FRACTALS ----------------------
 
@@ -560,149 +514,23 @@ class HtfContext:
             strength=strength,
         )
 
-    # ---------------------- DEALING RANGE ----------------------
+    # ---------------------- TIMEFRAME FRACTAL BREAKOUTS ----------------------
 
-    def _calc_dealing_range(self) -> Optional[DealingRange]:
-        df = self.df_1h
-        if df is None or df.empty:
-            return None
-        window_df = df.tail(self.dealing_range_window).copy()
-        if len(window_df) < max(self.dealing_rows * 2, 40):
-            return None
-
-        highs = window_df["high"].astype(float).to_numpy()
-        lows = window_df["low"].astype(float).to_numpy()
-        closes = window_df["close"].astype(float).to_numpy()
-
-        hi = float(np.max(highs))
-        lo = float(np.min(lows))
-        if hi <= lo:
-            return None
-
-        row_height = (hi - lo) / float(self.dealing_rows)
-        rows: List[DealingRangeRow] = []
-        top_counts = np.zeros(self.dealing_rows)
-        bottom_counts = np.zeros(self.dealing_rows)
-
-        top_idx = self._pivot_indices(highs, kind="HIGH", left=self.dealing_pivot, right=self.dealing_pivot)
-        bot_idx = self._pivot_indices(lows, kind="LOW", left=self.dealing_pivot, right=self.dealing_pivot)
-
-        for idx in top_idx:
-            price = highs[idx]
-            row = self._row_for_price(price, lo, row_height, self.dealing_rows)
-            if row is not None:
-                top_counts[row] += 1
-        for idx in bot_idx:
-            price = lows[idx]
-            row = self._row_for_price(price, lo, row_height, self.dealing_rows)
-            if row is not None:
-                bottom_counts[row] += 1
-
-        total_tops = float(np.sum(top_counts))
-        total_bottoms = float(np.sum(bottom_counts))
-        max_tops = float(np.max(top_counts)) if total_tops > 0 else 1.0
-        max_bottoms = float(np.max(bottom_counts)) if total_bottoms > 0 else 1.0
-
-        current_price = float(closes[-1])
-        current_row_idx = self._row_for_price(current_price, lo, row_height, self.dealing_rows)
-        current_row: Optional[DealingRangeRow] = None
-
-        for i in range(self.dealing_rows):
-            r_lo = lo + i * row_height
-            r_hi = r_lo + row_height
-            t_count = float(top_counts[i])
-            b_count = float(bottom_counts[i])
-
-            bull_prob = (b_count / total_bottoms * 100.0) if total_bottoms > 0 else 0.0
-            bear_prob = (t_count / total_tops * 100.0) if total_tops > 0 else 0.0
-
-            if current_price < r_lo:
-                dominant = "BEAR"
-                prob = bear_prob
-                rel = (t_count / max_tops * 50.0) if max_tops > 0 else 0.0
-            elif current_price > r_hi:
-                dominant = "BULL"
-                prob = bull_prob
-                rel = (b_count / max_bottoms * 50.0) if max_bottoms > 0 else 0.0
-            else:
-                if bear_prob >= bull_prob:
-                    dominant = "BEAR"
-                    prob = bear_prob
-                    rel = (t_count / max_tops * 50.0) if max_tops > 0 else 0.0
-                else:
-                    dominant = "BULL"
-                    prob = bull_prob
-                    rel = (b_count / max_bottoms * 50.0) if max_bottoms > 0 else 0.0
-
-            row_obj = DealingRangeRow(
-                idx=i,
-                high=float(r_hi),
-                low=float(r_lo),
-                top_hits=int(t_count),
-                bottom_hits=int(b_count),
-                dominant=dominant if prob > 0 else "NONE",
-                probability=float(min(100.0, prob + rel)),
-            )
-            rows.append(row_obj)
-            if i == current_row_idx:
-                current_row = row_obj
-
-        position = "EQ"
-        mid = (hi + lo) / 2.0
-        if current_price > mid:
-            position = "PREMIUM"
-        elif current_price < mid:
-            position = "DISCOUNT"
-
-        return DealingRange(
-            high=hi,
-            low=lo,
-            rows=rows,
-            current_row=current_row,
-            position=position,
-        )
-
-    @staticmethod
-    def _row_for_price(price: float, low: float, row_height: float, rows: Optional[int] = None) -> Optional[int]:
-        if row_height <= 0:
-            return None
-        rel = price - low
-        idx = int(rel // row_height)
-        if rel < 0:
-            idx = -1
-        if rows is not None:
-            if idx < 0:
-                return 0
-            return min(idx, rows - 1)
-        return max(idx, 0)
-
-    @staticmethod
-    def _pivot_indices(values: np.ndarray, *, kind: str, left: int, right: int) -> List[int]:
-        idxs: List[int] = []
-        n = len(values)
-        for i in range(left, n - right):
-            window = values[i - left : i + right + 1]
-            if len(window) < left + right + 1:
-                continue
-            if kind == "HIGH":
-                if values[i] == np.max(window):
-                    idxs.append(i)
-            else:
-                if values[i] == np.min(window):
-                    idxs.append(i)
-        return idxs
-
-    # ---------------------- D1 FRACTAL BREAKOUTS ----------------------
-
-    def _calc_daily_breakout(self, scan_bars: int = 10) -> Optional[DailyBreakout]:
-        """Most recent false/true breakout of a confirmed D1 Williams fractal.
+    def _calc_latest_fractal_breakout(
+        self,
+        df: pd.DataFrame,
+        *,
+        timeframe: str,
+        scan_bars: int = 10,
+    ) -> Optional[FractalBreakout]:
+        """Most recent interaction with a confirmed Williams fractal.
 
         A fractal at index i (pivot_lookback bars each side) is confirmed only at
         i + pivot_lookback, so a bar j may interact solely with levels where
         i + pivot_lookback < j — no lookahead. Scanning newest-first, the first
-        event found wins.
+        event of either kind wins. TRUE_BREAK requires a close crossing the level,
+        rather than merely remaining beyond an already-broken level.
         """
-        df = self.df_daily
         lb = self.pivot_lookback
         if df is None or df.empty or len(df) < lb * 2 + 3:
             return None
@@ -731,54 +559,75 @@ class HtfContext:
             confirmed_lows = [i for i in frac_low_idx if i + lb < j]
             lvl_high = highs[confirmed_highs[-1]] if confirmed_highs else None
             lvl_low = lows[confirmed_lows[-1]] if confirmed_lows else None
+            previous_close = closes[j - 1]
 
-            # Primary basis: false breakout of a D1 fractal → reversal vote.
             if lvl_high is not None and highs[j] > lvl_high and closes[j] < lvl_high:
-                return DailyBreakout(kind="FALSE_BREAK", side="SHORT", level=float(lvl_high),
-                                     level_kind="HIGH", bar_index=j, bars_ago=n - 1 - j)
+                return FractalBreakout(
+                    kind="FALSE_BREAK",
+                    side="SHORT",
+                    level=float(lvl_high),
+                    level_kind="HIGH",
+                    bar_index=j,
+                    bars_ago=n - 1 - j,
+                    timeframe=timeframe,
+                )
             if lvl_low is not None and lows[j] < lvl_low and closes[j] > lvl_low:
-                return DailyBreakout(kind="FALSE_BREAK", side="LONG", level=float(lvl_low),
-                                     level_kind="LOW", bar_index=j, bars_ago=n - 1 - j)
-            # Secondary: true breakout (close beyond the level) → continuation vote.
-            if lvl_high is not None and closes[j] > lvl_high:
-                return DailyBreakout(kind="TRUE_BREAK", side="LONG", level=float(lvl_high),
-                                     level_kind="HIGH", bar_index=j, bars_ago=n - 1 - j)
-            if lvl_low is not None and closes[j] < lvl_low:
-                return DailyBreakout(kind="TRUE_BREAK", side="SHORT", level=float(lvl_low),
-                                     level_kind="LOW", bar_index=j, bars_ago=n - 1 - j)
+                return FractalBreakout(
+                    kind="FALSE_BREAK",
+                    side="LONG",
+                    level=float(lvl_low),
+                    level_kind="LOW",
+                    bar_index=j,
+                    bars_ago=n - 1 - j,
+                    timeframe=timeframe,
+                )
+            if (
+                lvl_high is not None
+                and previous_close <= lvl_high
+                and closes[j] > lvl_high
+            ):
+                return FractalBreakout(
+                    kind="TRUE_BREAK",
+                    side="LONG",
+                    level=float(lvl_high),
+                    level_kind="HIGH",
+                    bar_index=j,
+                    bars_ago=n - 1 - j,
+                    timeframe=timeframe,
+                )
+            if (
+                lvl_low is not None
+                and previous_close >= lvl_low
+                and closes[j] < lvl_low
+            ):
+                return FractalBreakout(
+                    kind="TRUE_BREAK",
+                    side="SHORT",
+                    level=float(lvl_low),
+                    level_kind="LOW",
+                    bar_index=j,
+                    bars_ago=n - 1 - j,
+                    timeframe=timeframe,
+                )
         return None
 
-    # ---------------------- DAILY PD ----------------------
+    # ---------------------- H1 PREMIUM / DISCOUNT ----------------------
 
-    def _calc_daily_range(self) -> Optional[DailyRange]:
-        df_daily = self.df_daily
-        if df_daily is not None and not df_daily.empty and len(df_daily) >= 2:
-            last = df_daily.iloc[-1]
-            high = float(last["high"])
-            low = float(last["low"])
-            close = float(last["close"])
-        else:
-            df = self.df_1h
-            if df is None or df.empty:
-                return None
-            if not isinstance(df.index, pd.DatetimeIndex):
-                df = df.copy()
-                df.index = pd.to_datetime(df.index)
-            last_day = df.index[-1].date()
-            same_day = df[df.index.date == last_day]
-            if same_day.empty:
-                return None
-            high = float(same_day["high"].max())
-            low = float(same_day["low"].min())
-            close = float(same_day["close"].iloc[-1])
+    def _calc_hourly_range(self) -> Optional[HourlyRange]:
+        df = self.df_1h
+        if df is None or df.empty:
+            return None
+        last = df.iloc[-1]
+        high = float(last["high"])
+        low = float(last["low"])
+        close = float(last["close"])
 
         if high <= low:
             return None
-        # Premium/discount must track the CURRENT price against yesterday's
-        # range. Using the daily bar's own close froze the position for the
-        # whole session (2026-07-10: bias stayed LONG through a full-day dump).
-        if self.df_1h is not None and not self.df_1h.empty:
-            close = float(self.df_1h["close"].iloc[-1])
+        # Localize the current price with M15 while retaining the latest
+        # completed H1 candle as the premium/discount reference range.
+        if self.df_15m is not None and not self.df_15m.empty:
+            close = float(self.df_15m["close"].iloc[-1])
         mid = (high + low) / 2.0
         if close > mid:
             position = "PREMIUM"
@@ -787,27 +636,34 @@ class HtfContext:
         else:
             position = "EQ"
 
-        return DailyRange(
+        return HourlyRange(
             high=high,
             low=low,
             close=close,
             position=position,
-            pdh=high,
-            pdl=low,
         )
 
     def to_payload(self) -> dict:
         return {
-            "daily_range": self.daily_range.to_dict() if self.daily_range else None,
-            "dealing_range": self.dealing_range.to_dict() if self.dealing_range else None,
+            "hourly_range": self.hourly_range.to_dict() if self.hourly_range else None,
             "fractals": self.fractals.to_dict() if self.fractals else None,
             "order_blocks": [ob.to_dict() for ob in self.order_blocks],
             "rejection_blocks": [rb.to_dict() for rb in self.rejection_blocks],
-            "order_blocks_4h": [ob.to_dict() for ob in self.order_blocks_4h],
-            "rejection_blocks_4h": [rb.to_dict() for rb in self.rejection_blocks_4h],
-            "daily_breakout": self.daily_breakout.to_dict() if self.daily_breakout else None,
+            "false_breakout_4h": (
+                self.false_breakout_4h.to_dict() if self.false_breakout_4h else None
+            ),
+            "true_breakout_15m": (
+                self.true_breakout_15m.to_dict() if self.true_breakout_15m else None
+            ),
         }
 
     @property
     def ready(self) -> bool:
-        return self.df_1h is not None and not self.df_1h.empty and self.df_4h is not None and not self.df_4h.empty
+        return (
+            self.df_1h is not None
+            and not self.df_1h.empty
+            and self.df_4h is not None
+            and not self.df_4h.empty
+            and self.df_15m is not None
+            and not self.df_15m.empty
+        )

@@ -132,8 +132,9 @@ class ActiveTrade:
 class NarrativeStrategy:
     """
     Top-Down:
-      1) Narrative / BIAS: 4H + 1H
-      2) VC (optional): 1H (SNR/FVG)
+      1) Narrative / BIAS: H1 Premium/Discount, 4H/15M fractal
+         breakouts, 1H Order/Rejection Blocks
+      2) Bias strictness: 1H FVG regime
       3) SETUP: 15M Rejection Block
       4) FALLBACK: 15M Turtle Soup
       5) FALLBACK2: H1 Pivots levels + 15M reclaim
@@ -176,9 +177,6 @@ class NarrativeStrategy:
         # HTF context config
         self.htf_fractal_limit = 20
         self.htf_pivot_lookback = 2
-        self.htf_dealing_window = 120  # ≈5 дней H1
-        self.htf_dealing_rows = 10
-        self.htf_dealing_pivot = 3
         self.htf_ob_lookback = 10
         self.htf_ob_show_last = 3
         self.htf_rb_box_length = 12
@@ -304,19 +302,24 @@ class NarrativeStrategy:
         side: Side = "LONG" if os_state == 1 else "SHORT"
         return side, f"FVG-режим {side} (IMFVG 1H, сигнал {last_sig_ago} барами ранее)"
 
-    def _build_htf_context(self, df_D: pd.DataFrame, df_4H: pd.DataFrame, df_1H: pd.DataFrame) -> Optional[HtfContext]:
-        if df_4H is None or df_1H is None or df_4H.empty or df_1H.empty:
+    def _build_htf_context(
+        self,
+        df_4H: pd.DataFrame,
+        df_1H: pd.DataFrame,
+        df_15M: pd.DataFrame,
+    ) -> Optional[HtfContext]:
+        if any(
+            df is None or df.empty
+            for df in (df_4H, df_1H, df_15M)
+        ):
             self._last_htf_context = None
             return None
         ctx = HtfContext(
             df_1h=df_1H,
             df_4h=df_4H,
-            df_daily=df_D,
+            df_15m=df_15M,
             fractal_limit=self.htf_fractal_limit,
             pivot_lookback=self.htf_pivot_lookback,
-            dealing_range_window=self.htf_dealing_window,
-            dealing_rows=self.htf_dealing_rows,
-            dealing_pivot=self.htf_dealing_pivot,
             ob_lookback=self.htf_ob_lookback,
             ob_show_last=self.htf_ob_show_last,
             rb_box_length=self.htf_rb_box_length,
@@ -328,74 +331,75 @@ class NarrativeStrategy:
         self._last_htf_context = ctx
         return ctx
 
-    def calc_narrative(self, df_D: pd.DataFrame, df_4H: pd.DataFrame, df_1H: pd.DataFrame) -> Tuple[Side, str]:
-        """Ensemble-скоринг HTF bias. Голосуют независимые модели:
+    def calc_narrative(
+        self,
+        df_4H: pd.DataFrame,
+        df_1H: pd.DataFrame,
+        df_15M: pd.DataFrame,
+    ) -> Tuple[Side, str]:
+        """Ensemble-скоринг bias. Голосуют независимые модели:
 
-          DailyPD (текущая цена vs вчерашний рендж)  +2
-          5-дневный дилинг-рендж                      +1
-          D1 фрактал: ложный пробой (разворот)        +2
-          D1 фрактал: истинный пробой (продолжение)   +1
-          OB 4H                                       +1
-          RB 4H (валидный)                            +1
+          H1 Premium/Discount                         +2
+          4H фрактал: ложный пробой (разворот)        +2
+          15M фрактал: истинный пробой (продолжение)  +1
+          OB 1H                                       +1
+          RB 1H (валидный)                            +1
 
         FVG-режим 1H регулирует строгость: против лидера голосов порог
         htf_score_margin ужесточается на +1. SMA/EMA в решении не участвуют;
         при смешанном счёте bias = NEUTRAL (без фолбэка).
+
+        Волатильность заменяет прежний 5-дневный dealing range как отдельный
+        недирекционный entry gate в Core._apply_vol_regime_filter: PANIC и
+        недостижимый относительно EM1D TP блокируют вход, но не дают L/S-балл.
         """
-        ctx = self._build_htf_context(df_D, df_4H, df_1H)
+        ctx = self._build_htf_context(df_4H, df_1H, df_15M)
         if ctx is None:
-            return "NEUTRAL", "Нет данных HTF (4H/1H) для Narrative"
+            return "NEUTRAL", "Нет данных 4H/1H/15M для Narrative"
 
         parts: List[str] = []
         score_long = 0
         score_short = 0
 
-        # Daily premium/discount
-        if ctx.daily_range is not None:
-            dr = ctx.daily_range
+        # Current M15 close inside the latest completed H1 range.
+        if ctx.hourly_range is not None:
+            hourly = ctx.hourly_range
             parts.append(
-                f"DailyPD pos={dr.position} (PDH={dr.pdh:.5f}/PDL={dr.pdl:.5f})"
+                f"H1PD pos={hourly.position} "
+                f"(H1H={hourly.high:.5f}/H1L={hourly.low:.5f})"
             )
-            if dr.bias == "LONG":
+            if hourly.bias == "LONG":
                 score_long += 2
-            elif dr.bias == "SHORT":
+            elif hourly.bias == "SHORT":
                 score_short += 2
 
-        # 5-day dealing range rows
-        if ctx.dealing_range is not None:
-            drange = ctx.dealing_range
-            current_row = drange.current_row
-            if current_row is not None:
-                parts.append(
-                    f"DR row={current_row.idx} dom={current_row.dominant} prob={current_row.probability:.1f}% pos={drange.position}"
-                )
-                if current_row.dominant == "BULL" and current_row.probability >= 55:
-                    score_long += 1
-                elif current_row.dominant == "BEAR" and current_row.probability >= 55:
-                    score_short += 1
-            else:
-                parts.append(f"DR pos={drange.position}")
-                if drange.bias == "LONG":
-                    score_long += 1
-                elif drange.bias == "SHORT":
-                    score_short += 1
-
-        # D1 fractal breakout: false break = primary reversal vote (+2),
-        # true break = continuation vote (+1)
-        if ctx.daily_breakout is not None:
-            db = ctx.daily_breakout
+        # 4H false fractal breakout: primary reversal vote (+2).
+        if ctx.false_breakout_4h is not None:
+            breakout = ctx.false_breakout_4h
             parts.append(
-                f"D1 {db.kind} {db.level_kind}@{db.level:.5f} -> {db.side} ({db.bars_ago}d ago)"
+                f"4H {breakout.kind} {breakout.level_kind}@{breakout.level:.5f} "
+                f"-> {breakout.side} ({breakout.bars_ago} bars ago)"
             )
-            weight = 2 if db.kind == "FALSE_BREAK" else 1
-            if db.side == "LONG":
-                score_long += weight
-            elif db.side == "SHORT":
-                score_short += weight
+            if breakout.side == "LONG":
+                score_long += 2
+            elif breakout.side == "SHORT":
+                score_short += 2
+
+        # 15M true fractal breakout: continuation confirmation (+1).
+        if ctx.true_breakout_15m is not None:
+            breakout = ctx.true_breakout_15m
+            parts.append(
+                f"15M {breakout.kind} {breakout.level_kind}@{breakout.level:.5f} "
+                f"-> {breakout.side} ({breakout.bars_ago} bars ago)"
+            )
+            if breakout.side == "LONG":
+                score_long += 1
+            elif breakout.side == "SHORT":
+                score_short += 1
 
         zone_snippets: List[str] = []
         active_order_blocks = [
-            ob for ob in (ctx.order_blocks_4h or [])
+            ob for ob in (ctx.order_blocks or [])
             if not getattr(ob, "breaker", False)
         ]
         if active_order_blocks:
@@ -403,23 +407,31 @@ class NarrativeStrategy:
             # hydrated/tests/custom contexts and removes the old LONG-first bias.
             ob = max(active_order_blocks, key=lambda item: int(item.created_idx))
             zone_snippets.append(
-                f"OB4H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}"
+                f"OB1H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}"
             )
             if ob.side == "LONG":
                 score_long += 1
             elif ob.side == "SHORT":
                 score_short += 1
-        if ctx.rejection_blocks_4h:
-            rb = ctx.rejection_blocks_4h[-1]
-            state = "valid" if rb.valid and not rb.broken else "invalid"
-            zone_snippets.append(
-                f"RB4H {rb.side} @{min(rb.zone_low, rb.zone_high):.5f}-{max(rb.zone_low, rb.zone_high):.5f} {state}"
+
+        active_rejection_blocks = [
+            rb for rb in (ctx.rejection_blocks or [])
+            if rb.valid and not rb.broken
+        ]
+        if active_rejection_blocks:
+            rb = max(
+                active_rejection_blocks,
+                key=lambda item: int(item.created_idx),
             )
-            if rb.valid and not rb.broken:
-                if rb.side == "LONG":
-                    score_long += 1
-                elif rb.side == "SHORT":
-                    score_short += 1
+            zone_snippets.append(
+                f"RB1H {rb.side} "
+                f"@{min(rb.zone_low, rb.zone_high):.5f}-"
+                f"{max(rb.zone_low, rb.zone_high):.5f} valid"
+            )
+            if rb.side == "LONG":
+                score_long += 1
+            elif rb.side == "SHORT":
+                score_short += 1
         if zone_snippets:
             parts.append("; ".join(zone_snippets))
 
@@ -992,7 +1004,7 @@ class NarrativeStrategy:
         if any(d is None or d.empty for d in (df_4H, df_1H, df_15M)):
             return {"signal": "NO_DATA"}
 
-        side_bias, narrative_text = self.calc_narrative(data.get("D"), df_4H, df_1H)
+        side_bias, narrative_text = self.calc_narrative(df_4H, df_1H, df_15M)
         ctx = self._last_htf_context
         if side_bias == "NEUTRAL":
             return {"signal": "NO_TREND", "narrative": narrative_text}
