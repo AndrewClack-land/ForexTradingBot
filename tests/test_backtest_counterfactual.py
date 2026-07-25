@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -11,7 +12,10 @@ from backtest.counterfactual import (
     run_counterfactual_backtest,
 )
 from backtest.data import HistoricalDataset
-from backtest.strategy_runner import NarrativeBacktestConfig
+from backtest.strategy_runner import (
+    NarrativeBacktestConfig,
+    StrategyBacktestError,
+)
 from core.narrative_scoring import build_factor_vector
 from core.strategy_narrative import CandidateEntry
 
@@ -156,6 +160,7 @@ def _config(
     *,
     rejection_block_entry_enabled=True,
     orderblock_entry_enabled=True,
+    entry_ttl="15min",
 ):
     return NarrativeBacktestConfig.build(
         symbols=["EURUSD"],
@@ -166,7 +171,7 @@ def _config(
         history_limit=1,
         min_context_bars=1,
         min_daily_bars=1,
-        entry_ttl="15min",
+        entry_ttl=entry_ttl,
         max_holding="15min",
         intrabar_policy="stop-first",
         profile="signal-quality",
@@ -176,6 +181,165 @@ def _config(
         rejection_block_entry_enabled=rejection_block_entry_enabled,
         orderblock_entry_enabled=orderblock_entry_enabled,
     )
+
+
+def test_optimize_v2_rejects_cross_decision_pending_overlap():
+    with pytest.raises(
+        StrategyBacktestError,
+        match=r"entry_ttl <= 15 minutes",
+    ):
+        run_counterfactual_backtest(
+            _dataset("counterfactual-overlap"),
+            _config(entry_ttl="30min"),
+            strategy_factory=_AllSideAllTriggerStrategy,
+            min_train_opportunities=1,
+        )
+
+
+def test_private_replay_rejects_overlapping_pending_decisions():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "entry_min": 99.9,
+        "entry_max": 100.1,
+        "stop_price": 99.0,
+        "tp_prices": [101.0, 102.0, 103.0],
+        "trigger_kind": "h1_pivot_reclaim_15m",
+        "optimizer_rank": 1,
+    }
+    selected = [
+        counterfactual_module._Candidate(
+            candidate_id="overlap-a",
+            fold_index=0,
+            symbol="EURUSD",
+            decision_time=decision_time,
+            gate="ENTER",
+            gate_reason="eligible",
+            signal=signal,
+        ),
+        counterfactual_module._Candidate(
+            candidate_id="overlap-b",
+            fold_index=0,
+            symbol="EURUSD",
+            decision_time=decision_time + pd.Timedelta(minutes=5),
+            gate="ENTER",
+            gate_reason="eligible",
+            signal=signal,
+        ),
+    ]
+    period = counterfactual_module._Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=decision_time,
+        test_end=decision_time + pd.Timedelta(minutes=30),
+    )
+
+    with pytest.raises(
+        StrategyBacktestError,
+        match=r"overlapping pending entry windows",
+    ):
+        counterfactual_module._run_selected_replay(
+            selected=selected,
+            prepared_by_symbol={"EURUSD": {}},
+            periods=[period],
+            config=_config(),
+            progress=None,
+        )
+
+
+def test_adjacent_decisions_at_ttl_boundary_do_not_overlap():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "entry_min": 99.9,
+        "entry_max": 100.1,
+        "stop_price": 99.0,
+        "tp_prices": [101.0, 102.0, 103.0],
+        "trigger_kind": "h1_pivot_reclaim_15m",
+        "optimizer_rank": 1,
+    }
+    selected = [
+        counterfactual_module._Candidate(
+            candidate_id=f"boundary-{index}",
+            fold_index=0,
+            symbol="EURUSD",
+            decision_time=decision_time + pd.Timedelta(minutes=15 * index),
+            gate="ENTER",
+            gate_reason="eligible",
+            signal=signal,
+        )
+        for index in range(2)
+    ]
+    m1_index = pd.date_range(
+        "2026-01-01T00:16:00Z",
+        periods=30,
+        freq="1min",
+    )
+    m1 = _frame(
+        m1_index,
+        [(101.5, 101.5, 101.5, 101.5)] * len(m1_index),
+    )
+
+    ordered = counterfactual_module._causal_ranked_replay_order(
+        candidates=selected,
+        prepared={"1m": SimpleNamespace(frame=m1)},
+        config=_config(),
+    )
+
+    assert [row.candidate_id for row in ordered] == [
+        "boundary-0",
+        "boundary-1",
+    ]
+
+
+def test_entry_ttl_deadline_is_exclusive():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    index = pd.DatetimeIndex(
+        [
+            "2026-01-01T00:16:00Z",
+            "2026-01-01T00:29:00Z",
+            "2026-01-01T00:30:00Z",
+        ]
+    )
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "entry_min": 100.0,
+        "entry_max": 100.0,
+        "stop_price": 99.0,
+        "tp_prices": [101.0, 102.0, 103.0],
+    }
+    deadline_only = _frame(
+        index,
+        [
+            (101.5, 101.5, 101.5, 101.5),
+            (101.5, 101.5, 101.5, 101.5),
+            (100.0, 100.0, 100.0, 100.0),
+        ],
+    )
+    before_deadline = deadline_only.copy()
+    before_deadline.loc[index[1], ["open", "high", "low", "close"]] = 100.0
+
+    _, deadline_fill, _, _ = counterfactual_module._find_fill(
+        m1=deadline_only,
+        decision_time=decision_time,
+        period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+        signal=signal,
+        config=_config(),
+    )
+    _, causal_fill, _, _ = counterfactual_module._find_fill(
+        m1=before_deadline,
+        decision_time=decision_time,
+        period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+        signal=signal,
+        config=_config(),
+    )
+
+    assert deadline_fill is None
+    assert causal_fill == pd.Timestamp("2026-01-01T00:29:00Z")
 
 
 def test_universe_regenerates_both_sides_and_every_trigger_inside_train():
@@ -394,7 +558,7 @@ def test_summary_metrics_sort_cross_market_exits_chronologically(
     assert metrics["longest_loss_streak"] == 1
 
 
-def test_ranked_replay_falls_through_no_fill_then_stops_after_first_fill():
+def test_ranked_replay_never_fills_retroactively_after_a_full_ttl_no_fill():
     class _FallbackStrategy(_AllSideAllTriggerStrategy):
         def trigger_15m_rejection_block(self, _, side):
             return self._entry(side, "rejection_block_15m", 0.10)
@@ -410,20 +574,120 @@ def test_ranked_replay_falls_through_no_fill_then_stops_after_first_fill():
     for row in result.executions:
         by_decision.setdefault(row["decision_time"], []).append(row)
     assert any(
-        "EXPIRED_ENTRY_RANGE" in {
-            row["disposition"] for row in rows
-        }
-        and "FILLED" in {row["disposition"] for row in rows}
-        and "BLOCK_ALTERNATIVE" in {
-            row["disposition"] for row in rows
-        }
+        {"FILLED", "BLOCK_ALTERNATIVE"} <= {row["disposition"] for row in rows}
+        for rows in by_decision.values()
+    )
+    assert not any(
+        {"EXPIRED_ENTRY_RANGE", "FILLED"}
+        <= {row["disposition"] for row in rows}
         for rows in by_decision.values()
     )
     assert all(
         sum(row["disposition"] == "FILLED" for row in rows) <= 1
         for rows in by_decision.values()
     )
-    assert not {
-        setup.get("forced_exit_reason")
-        for setup in result.setups
-    } & {"FOLD_END"}
+    assert not {setup.get("forced_exit_reason") for setup in result.setups} & {
+        "FOLD_END"
+    }
+
+
+def test_ranked_replay_uses_earliest_fill_then_rank_for_timestamp_tie():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    index = pd.date_range(
+        "2026-01-01T00:16:00Z",
+        periods=31,
+        freq="1min",
+    )
+    opens = [100.1, 100.0, *([100.2] * (len(index) - 2))]
+    m1 = _frame(
+        index,
+        [(price, price, price, price) for price in opens],
+    )
+
+    def candidate(
+        candidate_id,
+        *,
+        rank,
+        entry,
+        trigger_kind,
+    ):
+        return counterfactual_module._Candidate(
+            candidate_id=candidate_id,
+            fold_index=0,
+            symbol="EURUSD",
+            decision_time=decision_time,
+            gate="ENTER",
+            gate_reason="eligible",
+            signal={
+                "side": "LONG",
+                "entry_price": entry,
+                "entry_min": entry,
+                "entry_max": entry,
+                "stop_price": entry - 1.0,
+                "tp_prices": [entry + 1.0, entry + 2.0, entry + 3.0],
+                "trigger_kind": trigger_kind,
+                "trigger_reason": trigger_kind,
+                "optimizer_rank": rank,
+            },
+        )
+
+    selected = [
+        candidate(
+            "rank-1-no-fill",
+            rank=1,
+            entry=101.0,
+            trigger_kind="rejection_block_15m",
+        ),
+        candidate(
+            "rank-2-later-fill",
+            rank=2,
+            entry=100.0,
+            trigger_kind="absorption_15m",
+        ),
+        candidate(
+            "a-rank-4-earliest-fill",
+            rank=4,
+            entry=100.1,
+            trigger_kind="order_block_1h",
+        ),
+        candidate(
+            "z-rank-3-earliest-fill",
+            rank=3,
+            entry=100.1,
+            trigger_kind="h1_pivot_reclaim_15m",
+        ),
+    ]
+    period = counterfactual_module._Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=decision_time,
+        test_end=pd.Timestamp("2026-01-01T00:45:00Z"),
+    )
+
+    setups, _, executions, _ = counterfactual_module._run_selected_replay(
+        selected=selected,
+        prepared_by_symbol={"EURUSD": {"1m": SimpleNamespace(frame=m1)}},
+        periods=[period],
+        config=_config(),
+        progress=None,
+    )
+
+    filled = [row for row in executions if row["disposition"] == "FILLED"]
+    assert [row["candidate_id"] for row in filled] == [
+        "z-rank-3-earliest-fill"
+    ]
+    assert filled[0]["fill_time"] == "2026-01-01T00:16:00+00:00"
+    assert setups[0]["candidate_id"] == "z-rank-3-earliest-fill"
+    assert {
+        row["candidate_id"]
+        for row in executions
+        if row["disposition"] == "BLOCK_ALTERNATIVE"
+    } == {
+        "rank-1-no-fill",
+        "rank-2-later-fill",
+        "a-rank-4-earliest-fill",
+    }
+    assert "EXPIRED_ENTRY_RANGE" not in {
+        row["disposition"] for row in executions
+    }

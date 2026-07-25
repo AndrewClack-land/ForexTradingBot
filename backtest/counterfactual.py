@@ -74,6 +74,7 @@ _TRIGGER_PRIORITY = {
     trigger: index for index, trigger in enumerate(TRIGGER_MANIFEST)
 }
 _PRIMARY_POLICY = "stop-first"
+_DECISION_CADENCE = pd.Timedelta(minutes=15)
 _METRIC_FIELDS = (
     "setups_total",
     "setups_closed",
@@ -1044,6 +1045,75 @@ def _select_oos_candidates(
     return selected, audit
 
 
+def _causal_ranked_replay_order(
+    *,
+    candidates: Sequence[_Candidate],
+    prepared: Mapping[str, Any],
+    config: NarrativeBacktestConfig,
+) -> list[_Candidate]:
+    """Order simultaneous alternatives by first executable fill, then rank.
+
+    Every pre-gate eligible alternative from one M15 decision is considered
+    live at the same decision timestamp.  Looking through one candidate's full
+    TTL before trying the next one would allow a later-ranked candidate to fill
+    retroactively.  Stable chronological execution avoids that look-ahead:
+    the earliest executable M1 open wins, while the frozen optimizer rank only
+    breaks ties at the same fill timestamp.
+
+    The current executor is intentionally restricted to non-overlapping pending
+    windows: optimize-v2 decisions come from closed M15 bars and entry TTL cannot
+    exceed that 15-minute cadence.  Enforce the invariant here as well as at the
+    public entry point so synthetic/private callers cannot reintroduce
+    cross-decision time travel.
+    """
+
+    decision_times = sorted({item.decision_time for item in candidates})
+    for previous, current in zip(decision_times, decision_times[1:]):
+        if current - previous < config.entry_ttl:
+            raise StrategyBacktestError(
+                "Counterfactual replay received overlapping pending entry "
+                "windows; event-driven cross-decision replay is required"
+            )
+
+    m1 = prepared["1m"].frame.drop(
+        columns=[_BAR_CLOSE_COLUMN],
+        errors="ignore",
+    )
+    fill_times: dict[str, Optional[pd.Timestamp]] = {}
+    for candidate in candidates:
+        fill_end = config.end
+        if config.profile == "production-deterministic":
+            fill_end = min(
+                fill_end,
+                _next_friday_close(candidate.decision_time, config),
+            )
+        _, fill_time, _, _ = _find_fill(
+            m1=m1,
+            decision_time=candidate.decision_time,
+            period_end=fill_end,
+            signal=candidate.signal,
+            config=config,
+        )
+        fill_times[candidate.candidate_id] = fill_time
+
+    def replay_key(
+        candidate: _Candidate,
+    ) -> tuple[int, int, bool, int, int, str]:
+        fill_time = fill_times[candidate.candidate_id]
+        raw_rank = candidate.signal.get("optimizer_rank")
+        rank = int(raw_rank) if raw_rank is not None else 2**31 - 1
+        return (
+            candidate.fold_index,
+            int(candidate.decision_time.value),
+            fill_time is None,
+            int(fill_time.value) if fill_time is not None else 0,
+            rank,
+            candidate.candidate_id,
+        )
+
+    return sorted(candidates, key=replay_key)
+
+
 def _run_selected_replay(
     *,
     selected: Sequence[_Candidate],
@@ -1065,7 +1135,11 @@ def _run_selected_replay(
         by_symbol[candidate.symbol].append(candidate)
 
     for symbol in config.symbols:
-        candidates = by_symbol.get(symbol, [])
+        candidates = _causal_ranked_replay_order(
+            candidates=by_symbol.get(symbol, []),
+            prepared=prepared_by_symbol[symbol],
+            config=config,
+        )
         for policy in config.intrabar_policies:
             setups, legs, executions, _ = _execute_candidates(
                 candidates=candidates,
@@ -1119,6 +1193,12 @@ def run_counterfactual_backtest(
     if config.train is None or config.test is None:
         raise StrategyBacktestError(
             "Counterfactual optimizer requires --train and --test"
+        )
+    if config.entry_ttl > _DECISION_CADENCE:
+        raise StrategyBacktestError(
+            "Counterfactual optimize-v2 currently requires entry_ttl <= "
+            "15 minutes so pending windows from consecutive closed M15 "
+            "decisions cannot overlap"
         )
     unknown = sorted(set(config.symbols) - set(dataset.symbols))
     if unknown:
@@ -1353,9 +1433,12 @@ def run_counterfactual_backtest(
             ),
             "selection": (
                 "continuous frozen OOS score; no score threshold; all "
-                "pre-gate-eligible alternatives are replayed in rank order "
-                "until one fills; fixed trigger priority breaks score ties; "
-                "NOT_FIT folds do not trade"
+                "pre-gate-eligible alternatives from one M15 decision are "
+                "considered simultaneously; earliest executable M1 fill wins "
+                "and frozen score/rank breaks only same-timestamp fill ties; "
+                "entry_ttl is capped at the closed-M15 cadence so adjacent "
+                "pending windows cannot overlap; fixed trigger priority breaks "
+                "score ties; NOT_FIT folds do not trade"
             ),
             "trigger_optimization": (
                 "factor weights optimize direction alignment only; trigger "

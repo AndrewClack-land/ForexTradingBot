@@ -89,16 +89,17 @@ volume-at-price и однозначным mapping рынка.
   оставшийся суммарный риск;
 - **Безубыток** — после TP1 стопы всех оставшихся ног переносятся на цену входа;
 - **Position Adding** (`core/position_adding.py`, по умолчанию выключено,
-  `POSITION_ADDING_ENABLED=1`) — поэтапный набор объёма в одну идею: вход 1 с
-  риском 1%, каждое новое подтверждение того же направления добавляет ещё 1%, а
-  совокупный риск идеи никогда не превышает `IDEA_MAX_RISK_PCT` (2%). Перед
-  входом, который не помещается в лимит, самые ранние входы переводятся в
-  безубыток (методика: перед третьим входом первый уходит в БУ, второй остаётся
-  со своим стопом). Добавка требует подтверждения ценой (`ADDON_MIN_PROGRESS_R`,
-  0.5R от последнего входа) и запрещена после `ADDON_MAX_PROGRESS_PCT` (50%)
-  пути до финального TP — правило пирамидинга Kolachi. Максимум
-  `IDEA_MAX_ENTRIES` входов (3), каждый со своими split-ногами, БУ и TP;
-  неудачная идея стоит ≈2%, а не сумму входов;
+  `POSITION_ADDING_ENABLED=1`) — поэтапный набор объёма в одну идею. Все
+  split-ноги и все одновременно рискующие входы одной идеи делят единый бюджет
+  `IDEA_MAX_RISK_PCT`, не более 1% зафиксированного стартового капитала.
+  Значение переменной окружения выше `0.01` жёстко ограничивается до `0.01`.
+  Перед полноразмерной добавкой предыдущие рискующие входы переводятся в
+  безубыток, освобождая тот же бюджет; поэтому добавление позиции остаётся
+  доступным, но риски входов не суммируются. Добавка требует подтверждения ценой
+  (`ADDON_MIN_PROGRESS_R`, 0.5R от последнего входа) и запрещена после
+  `ADDON_MAX_PROGRESS_PCT` (50%) пути до финального TP — правило пирамидинга
+  Kolachi. Максимум `IDEA_MAX_ENTRIES` входов (3), каждый со своими split-ногами,
+  БУ и TP; номинальный SL-риск неудачной идеи остаётся не выше 1%;
 - **AI-фильтр** (`core/m1/`) — статистическая оценка p(TP) по истории символа, может отклонить вход.
 
 ## Структура
@@ -225,16 +226,17 @@ the M15 decision.
   checked before every order submission;
 - **Break-even** — after TP1 the stops of all remaining legs move to the entry price;
 - **Position Adding** (`core/position_adding.py`, off by default, enable with
-  `POSITION_ADDING_ENABLED=1`) — staged entries into one idea: entry 1 risks 1%,
-  every later confirmation of the same direction adds another 1%, and the idea's
-  aggregate risk never exceeds `IDEA_MAX_RISK_PCT` (2%). Before an entry that
-  would not fit, the oldest entries are moved to break-even (per the
-  methodology: the third entry puts entry 1 at BE while entry 2 keeps its stop).
-  An add-on needs price confirmation (`ADDON_MIN_PROGRESS_R`, 0.5R from the last
-  entry) and is refused past `ADDON_MAX_PROGRESS_PCT` (50%) of the way to the
-  final TP — the Kolachi pyramiding rule. At most `IDEA_MAX_ENTRIES` entries (3),
-  each with its own split legs, break-even and TPs; a failed idea costs ≈2%
-  rather than the sum of its entries;
+  `POSITION_ADDING_ENABLED=1`) — staged entries into one idea. All split legs and
+  all simultaneously risking entries of that idea share one
+  `IDEA_MAX_RISK_PCT` budget, capped at 1% of fixed starting capital. An
+  environment value above `0.01` is hard-clamped to `0.01`. Before a full-risk
+  add-on, previous risking entries are moved to break-even to release that same
+  budget, so adding remains available without summing entry risks. An add-on
+  needs price confirmation (`ADDON_MIN_PROGRESS_R`, 0.5R from the last entry)
+  and is refused past `ADDON_MAX_PROGRESS_PCT` (50%) of the way to the final TP
+  — the Kolachi pyramiding rule. At most `IDEA_MAX_ENTRIES` entries (3), each
+  with its own split legs, break-even and TPs; a failed idea's nominal SL risk
+  remains at or below 1%;
 - **AI filter** (`core/m1/`) — statistical p(TP) estimate from the symbol's history; may reject an entry.
 
 ### Project layout
@@ -874,13 +876,18 @@ weight, and the minimum train sample is counted in these independent clusters
 rather than raw trigger rows. `NOT_FIT` folds are reported and skipped without
 falling back to the old weights. OOS label-quality metrics exclude exits after
 that fold's `test_end`; chronological execution replay is authoritative.
-Replay tries pre-gate-eligible alternatives in frozen-score order, falls
-through after a duplicate/invalid/no-fill trigger, and stops after the first
-fill for that M15 decision. Pending entries and positions carry across
-artificial fold boundaries; Friday close, max holding, stop/target or final
-dataset end still closes them. This v2 fits direction-factor weights only;
-trigger-family coefficients are not fitted, and fixed trigger priority resolves
-equal-score ties.
+Replay arms all pre-gate-eligible alternatives from one M15 decision
+simultaneously. The earliest executable M1 open wins; frozen score/rank only
+breaks a same-timestamp tie. It never waits through one trigger's complete TTL
+and then fills another trigger retroactively. Until cross-decision pending
+orders have a fully event-driven executor, `optimize-v2` fails closed for
+`entry_ttl > 15 minutes` or overlapping decision windows. With closed M15
+decisions and the supported deadline-exclusive TTL, adjacent pending windows
+cannot overlap. Pending entries and positions carry across artificial fold
+boundaries; Friday close, max holding, stop/target or final dataset end still
+closes them. This v2 fits direction-factor weights only; trigger-family
+coefficients are not fitted, and fixed trigger priority resolves equal-score
+ties.
 
 The report is a gross strategy diagnostic, not a broker-accurate PnL
 statement. LSE OHLCV does not contain historical Bid/Ask spread, FxPro

@@ -161,17 +161,22 @@ EM_TP_MAX_RATIO = _env_float("EM_TP_MAX_RATIO", 1.0)
 VOL_REGIME_REFRESH_MIN = _env_int("VOL_REGIME_REFRESH_MIN") or 15
 
 # ================== POSITION ADDING (PYRAMIDING) ==================
-# Stage extra entries into a working idea instead of one all-in setup: entry 1
-# risks 1%, each later confirmation adds another 1%, and older entries are moved
-# to break-even so the whole idea never risks more than IDEA_MAX_RISK_PCT.
+# Stage extra entries into a working idea instead of one all-in setup.  All
+# split legs and all simultaneously risking entries share one fixed-capital
+# 1% budget; older entries must be moved to break-even before an add-on can
+# reuse the released risk.
 # Opt-in: an upgraded bot must not start pyramiding on a VPS by itself.
 POSITION_ADDING_ENABLED = os.getenv("POSITION_ADDING_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on"
 }
 # Hard ceiling on entries per idea (methodology allows 2-3).
 IDEA_MAX_ENTRIES = max(1, min(5, _env_int("IDEA_MAX_ENTRIES") or 3))
-# Aggregate risk of all open entries of one idea, as a fraction of risk capital.
-IDEA_MAX_RISK_PCT = min(max(_env_float("IDEA_MAX_RISK_PCT", 0.02), 0.0), 0.02)
+# Aggregate risk of every simultaneously risking entry in one idea. Values
+# above 1% are unconditionally clamped to the same hard setup-level ceiling.
+IDEA_MAX_RISK_PCT = min(
+    max(_env_float("IDEA_MAX_RISK_PCT", 0.01), 0.0),
+    0.01,
+)
 # An add-on needs the idea to have proven itself: price must be at least this
 # many R (of the previous entry) in profit before another entry is allowed.
 ADDON_MIN_PROGRESS_R = max(0.0, _env_float("ADDON_MIN_PROGRESS_R", 0.5))

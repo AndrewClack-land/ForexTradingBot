@@ -1950,8 +1950,8 @@ def _execute_candidates(
                         policy=policy,
                         disposition="BLOCK_ALTERNATIVE",
                         reason=(
-                            "a higher-ranked opportunity from this M15 "
-                            "decision already filled"
+                            "another opportunity from this M15 decision "
+                            "filled first"
                         ),
                     )
                 )

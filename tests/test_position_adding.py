@@ -1,13 +1,15 @@
 from __future__ import annotations
 
+import importlib
 import json
+import os
 import threading
 from pathlib import Path
 
 import pytest
 
 import main
-from core.position_adding import PyramidManager, PyramidSettings
+from core.position_adding import PyramidManager, PyramidSettings, build_manager
 from core.state_store import load_active_trades, save_active_trades
 from core.strategy_narrative import ActiveTrade
 
@@ -92,7 +94,7 @@ def _manager(**overrides) -> PyramidManager:
     settings = dict(
         enabled=True,
         max_entries=3,
-        max_idea_risk_pct=0.02,
+        max_idea_risk_pct=0.01,
         min_progress_r=0.5,
         max_progress_pct=0.5,
     )
@@ -183,21 +185,24 @@ def test_kolachi_rule_blocks_adding_past_half_way_to_target():
 # ---------------- risk invariant ----------------
 
 
-def test_second_entry_fits_without_break_even():
-    idea = _idea(_entry(1, entry=1.0000, stop=0.9950, tickets=[101]))
+def test_second_entry_reuses_budget_after_first_moves_to_break_even():
+    first = _entry(1, entry=1.0000, stop=0.9950, tickets=[101])
+    idea = _idea(first)
     decision = _manager().evaluate(
         idea, _sig(), executor=FakeRiskExecutor(), last_price=1.0060,
         trigger_signature="LONG|new|z2",
     )
     assert decision.allowed is True
     assert decision.entry_index == 2
-    assert decision.entries_to_breakeven == []
+    assert decision.entries_to_breakeven == [first]
     assert decision.idea_risk_pct == 0.01
-    assert decision.projected_risk_pct == 0.02
+    assert decision.projected_risk_pct == 0.01
 
 
-def test_third_entry_moves_only_the_oldest_entry_to_break_even():
-    first = _entry(1, entry=1.0000, stop=0.9950, tickets=[101])
+def test_third_entry_moves_current_risking_entry_to_break_even():
+    first = _entry(1, entry=1.0000, stop=1.0000, tickets=[101])
+    first.moved_to_be = True
+    first.be_for_idea_risk = True
     second = _entry(2, entry=1.0030, stop=0.9980, tickets=[102])
     idea = _idea(first, second)
     decision = _manager().evaluate(
@@ -206,35 +211,65 @@ def test_third_entry_moves_only_the_oldest_entry_to_break_even():
     )
     assert decision.allowed is True
     assert decision.entry_index == 3
-    # Entry 2 keeps its stop — only entry 1 frees the room the third entry needs.
-    assert decision.entries_to_breakeven == [first]
-    assert decision.idea_risk_pct == 0.02
-    assert decision.projected_risk_pct == 0.02
+    assert decision.entries_to_breakeven == [second]
+    assert decision.idea_risk_pct == 0.01
+    assert decision.projected_risk_pct == 0.01
 
 
 def test_failed_idea_costs_the_cap_not_the_sum_of_entries():
-    """Scenario 2: entry 1 at BE, entries 2 and 3 still at their stops."""
+    """Only the newest entry risks capital; prior entries have released it."""
     first = _entry(1, entry=1.0000, stop=1.0000, tickets=[101])  # moved to BE
     first.moved_to_be = True
+    second = _entry(2, entry=1.0030, stop=1.0030, tickets=[102])
+    second.moved_to_be = True
     idea = _idea(
         first,
-        _entry(2, entry=1.0030, stop=0.9980, tickets=[102]),
+        second,
         _entry(3, entry=1.0060, stop=1.0010, tickets=[103]),
     )
     manager = _manager()
-    assert manager.idea_risk_pct(FakeRiskExecutor(), idea) == 0.02
+    assert manager.idea_risk_pct(FakeRiskExecutor(), idea) == 0.01
 
 
-def test_addon_blocked_when_break_even_cannot_free_enough_room():
-    # Cap 1% with 1% already at risk: the newest entry may not be moved to BE,
-    # so there is no room left for another entry.
+def test_single_addon_above_one_percent_is_blocked_even_if_requested_cap_is_higher():
     idea = _idea(_entry(1, entry=1.0000, stop=0.9950, tickets=[101]))
-    decision = _manager(max_idea_risk_pct=0.01).evaluate(
-        idea, _sig(), executor=FakeRiskExecutor(), last_price=1.0060,
+    manager = _manager(max_idea_risk_pct=0.02)
+    decision = manager.evaluate(
+        idea, _sig(), executor=FakeRiskExecutor(risk_fraction=0.011),
+        last_price=1.0060,
         trigger_signature="LONG|new|z2",
     )
+    assert manager.settings.max_idea_risk_pct == 0.01
     assert decision.allowed is False
-    assert "не помещается в лимит" in decision.reason
+    assert "Риск одного входа превышает лимит идеи" in decision.reason
+
+
+def test_pyramid_settings_default_and_hard_cap_are_one_percent():
+    assert PyramidSettings().max_idea_risk_pct == 0.01
+    assert PyramidSettings(max_idea_risk_pct=0.02).max_idea_risk_pct == 0.01
+    assert PyramidSettings(max_idea_risk_pct=0.005).max_idea_risk_pct == 0.005
+
+
+def test_build_manager_clamps_config_above_one_percent(monkeypatch):
+    import config as project_config
+
+    monkeypatch.setattr(project_config, "IDEA_MAX_RISK_PCT", 0.02)
+    assert build_manager().settings.max_idea_risk_pct == 0.01
+
+
+def test_config_env_above_one_percent_is_clamped(monkeypatch):
+    import config as project_config
+
+    original = os.environ.get("IDEA_MAX_RISK_PCT")
+    monkeypatch.setenv("IDEA_MAX_RISK_PCT", "0.02")
+    try:
+        assert importlib.reload(project_config).IDEA_MAX_RISK_PCT == 0.01
+    finally:
+        if original is None:
+            monkeypatch.delenv("IDEA_MAX_RISK_PCT", raising=False)
+        else:
+            monkeypatch.setenv("IDEA_MAX_RISK_PCT", original)
+        importlib.reload(project_config)
 
 
 def test_partially_closed_entry_releases_risk():
@@ -394,8 +429,10 @@ def _executed_addon(index: int, entry: float) -> ActiveTrade:
     return _entry(index, entry=entry, stop=entry - 0.0050, tickets=[100 + index])
 
 
-def test_third_entry_moves_first_to_break_even_before_opening(monkeypatch):
-    first = _entry(1, entry=1.0000, stop=0.9950, tickets=[101])
+def test_third_entry_moves_second_to_break_even_before_opening(monkeypatch):
+    first = _entry(1, entry=1.0000, stop=1.0000, tickets=[101])
+    first.moved_to_be = True
+    first.be_for_idea_risk = True
     second = _entry(2, entry=1.0030, stop=0.9980, tickets=[102])
     idea = _idea(first, second)
     executor = FakeRiskExecutor()
@@ -412,16 +449,18 @@ def test_third_entry_moves_first_to_break_even_before_opening(monkeypatch):
     assert result is not None
     assert result["entry_index"] == 3
     # The break-even that frees the risk budget happens BEFORE the new order.
-    assert calls[0][1] == [("EURUSD", [101], 1.0000)]
+    assert calls[0][1] == [("EURUSD", [102], 1.0030)]
     assert first.moved_to_be is True and first.be_for_idea_risk is True
-    assert second.moved_to_be is False
+    assert second.moved_to_be is True and second.be_for_idea_risk is True
     assert [e.entry_index for e in idea.entries()] == [1, 2, 3]
     assert core._entries_today["EURUSD"] == 1
     assert len(idea.idea_trigger_signatures) == 3
 
 
 def test_addon_is_cancelled_when_break_even_fails(monkeypatch):
-    first = _entry(1, entry=1.0000, stop=0.9950, tickets=[101])
+    first = _entry(1, entry=1.0000, stop=1.0000, tickets=[101])
+    first.moved_to_be = True
+    first.be_for_idea_risk = True
     second = _entry(2, entry=1.0030, stop=0.9980, tickets=[102])
     idea = _idea(first, second)
     executor = FakeRiskExecutor()
@@ -434,7 +473,8 @@ def test_addon_is_cancelled_when_break_even_fails(monkeypatch):
 
     assert core._try_position_add("EURUSD", idea, {}, 1.0060) is None
     assert idea.addons == [second]
-    assert first.moved_to_be is False
+    assert executor.move_calls == [("EURUSD", [102], 1.0030)]
+    assert second.moved_to_be is False
 
 
 def test_single_tp_signal_is_not_added_to_a_split_idea(monkeypatch):

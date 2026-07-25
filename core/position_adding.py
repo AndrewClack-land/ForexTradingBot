@@ -1,11 +1,12 @@
 # core/position_adding.py
 """Position Adding — staged entries into one trading idea.
 
-The methodology: entry 1 opens on the idea with 1% risk. Each later confirmation
-of the same direction adds another 1% entry, and before the aggregate risk of the
-idea would exceed its cap (2%), the oldest still-risking entries are moved to
-break-even. A failed idea therefore costs the cap, not the sum of its entries,
-while a working idea carries several times the base volume into the targets.
+All split legs and all simultaneously risking entries of one idea share a single
+budget of at most 1% of fixed starting capital. Before a later confirmation opens
+another full-risk entry, older still-risking entries are moved to break-even to
+free that same budget. A failed idea therefore costs at most 1% of starting
+capital, not the sum of its entries, while a working idea can still carry several
+entries into the targets.
 
 This module owns the decision only. Execution, break-even orders and lifecycle
 management stay in the caller (main.Core) and the MT5 executor, so the rules here
@@ -13,17 +14,32 @@ stay testable without a broker connection.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
+
+
+MAX_AGGREGATE_IDEA_RISK_PCT = 0.01
 
 
 @dataclass(frozen=True)
 class PyramidSettings:
     enabled: bool = False
     max_entries: int = 3
-    max_idea_risk_pct: float = 0.02
+    max_idea_risk_pct: float = MAX_AGGREGATE_IDEA_RISK_PCT
     min_progress_r: float = 0.5
     max_progress_pct: float = 0.5
+
+    def __post_init__(self) -> None:
+        """Enforce the absolute fixed-capital risk ceiling at every entry point."""
+        risk_pct = float(self.max_idea_risk_pct)
+        if not math.isfinite(risk_pct):
+            raise ValueError("max_idea_risk_pct must be finite")
+        object.__setattr__(
+            self,
+            "max_idea_risk_pct",
+            min(max(risk_pct, 0.0), MAX_AGGREGATE_IDEA_RISK_PCT),
+        )
 
 
 @dataclass
@@ -138,9 +154,9 @@ class PyramidManager:
         if progress_reason:
             return block(progress_reason)
 
-        # Risk: the add-on is sized to the standard per-trade fraction, so the
-        # idea must have room for it — freeing room by moving the oldest still
-        # risking entries to break-even, exactly as the methodology prescribes.
+        # Risk: all split legs and every simultaneously risking entry share one
+        # fixed-capital budget. Free room for the add-on by moving existing
+        # entries to break-even, oldest first.
         capital = self._capital_base(executor)
         risks = [self.entry_risk_amount(executor, entry) for entry in entries]
         try:
@@ -159,8 +175,10 @@ class PyramidManager:
 
         to_breakeven: List[Any] = []
         projected = idea_risk + planned
-        # The newest entry keeps its stop — it is the one still proving the idea.
-        for entry, risk in list(zip(entries, risks))[:-1]:
+        # The planned add-on becomes the new proving entry. Therefore every
+        # existing entry, including the current newest, may have to release its
+        # risk before the order is allowed.
+        for entry, risk in zip(entries, risks):
             if projected <= budget:
                 break
             if risk <= 0:
@@ -253,7 +271,7 @@ def build_manager() -> PyramidManager:
         PyramidSettings(
             enabled=bool(getattr(_cfg, "POSITION_ADDING_ENABLED", False)),
             max_entries=int(getattr(_cfg, "IDEA_MAX_ENTRIES", 3)),
-            max_idea_risk_pct=float(getattr(_cfg, "IDEA_MAX_RISK_PCT", 0.02)),
+            max_idea_risk_pct=float(getattr(_cfg, "IDEA_MAX_RISK_PCT", 0.01)),
             min_progress_r=float(getattr(_cfg, "ADDON_MIN_PROGRESS_R", 0.5)),
             max_progress_pct=float(getattr(_cfg, "ADDON_MAX_PROGRESS_PCT", 0.5)),
         )

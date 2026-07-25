@@ -142,11 +142,15 @@ margin. It is not a causal estimate and not a Shapley value.
   each leg.
 - A model, factor weight, or execution path must not bypass the per-entry cap.
 - Position Adding is a separate, optional live feature and is OFF by default.
-  When explicitly enabled, distinct entries in one idea can retain up to the
-  existing `IDEA_MAX_RISK_PCT=2%` aggregate idea risk while earlier entries
-  may be moved to break-even. The historical strategy runner excludes
-  pyramiding. Do not enable, redesign, or claim to backtest Position Adding
-  without separate explicit user approval.
+  When explicitly enabled, every split leg and every simultaneously risking
+  entry in one idea shares one aggregate budget of at most `1%` of fixed
+  starting capital. `IDEA_MAX_RISK_PCT` defaults to `0.01`, and any environment
+  or direct settings value above `0.01` must be hard-clamped to `0.01`.
+  Add-ons remain possible by moving prior still-risking entries to break-even
+  before opening the next entry, thereby reusing rather than increasing the
+  budget. The historical strategy runner excludes pyramiding. Do not enable,
+  redesign, or claim to backtest Position Adding without separate explicit user
+  approval.
 - The current backtest uses fixed, non-compounding risk. Variable risk sizing
   requires explicit user approval and must still remain at or below the same
   fixed per-entry `1%` cap.
@@ -327,10 +331,15 @@ A valid replacement-weight optimizer requires a new v2 research population:
 - one immutable model is frozen per outer fold; OOS scoring uses no hard score
   threshold, with fixed trigger priority for deterministic ties; a `NOT_FIT`
   fold is audited but never falls back to the old weights for trading;
-- every pre-gate-eligible opportunity at one M15 decision is passed to replay
-  in frozen-score order; if a higher-ranked trigger is duplicate, invalid or
-  does not fill, replay may fall through to the next one, but stops after the
-  first filled alternative;
+- every pre-gate-eligible opportunity at one M15 decision is armed
+  simultaneously. The earliest executable M1 open wins; frozen score/rank is
+  only a tie-break when alternatives fill at the same timestamp. Never scan a
+  higher rank through its full TTL and then fill a lower rank retroactively;
+- until replay is fully event-driven across overlapping decisions,
+  `optimize-v2` must fail closed when `entry_ttl > 15 minutes` or candidate
+  decision windows overlap. Closed M15 decisions with the supported
+  `entry_ttl <= 15 minutes` have non-overlapping, deadline-exclusive pending
+  windows;
 - optimizer label metrics include an OOS result only when its exit was known
   before that fold's `test_end`; chronological replay metrics are
   authoritative;
