@@ -5,6 +5,7 @@ import json
 import pandas as pd
 import pytest
 
+import backtest.data as data_module
 from backtest.__main__ import main as cli_main
 from backtest.data import DataValidationError, HistoricalDataset
 
@@ -53,6 +54,79 @@ def test_json_loader_sorts_dedupes_and_frames_asof_are_causal(tmp_path):
     again = HistoricalDataset.load(tmp_path)
     assert dataset.manifest_sha256 == again.manifest_sha256
     assert len(dataset.manifest["files"][0]["sha256"]) == 64
+
+
+def test_single_shard_loader_does_not_concat(monkeypatch, tmp_path):
+    _write_json(
+        tmp_path / "EURUSD_1h.json",
+        [
+            _record("2026-01-01T09:00:00Z", 1.09),
+            _record("2026-01-01T10:00:00Z", 1.10),
+        ],
+    )
+
+    def reject_concat(*args, **kwargs):
+        raise AssertionError("single-shard series must not call pandas.concat")
+
+    monkeypatch.setattr(data_module.pd, "concat", reject_concat)
+
+    dataset = HistoricalDataset.load(tmp_path)
+    assert len(dataset.get_frame("EURUSD", "1h")) == 2
+
+
+def test_load_transfers_normalized_frame_ownership(monkeypatch, tmp_path):
+    _write_json(
+        tmp_path / "EURUSD_1h.json",
+        [_record("2026-01-01T09:00:00Z", 1.09)],
+    )
+    normalized = pd.DataFrame(
+        {
+            "open": [1.09],
+            "high": [1.092],
+            "low": [1.088],
+            "close": [1.091],
+            "volume": [10],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-01T09:00:00Z"],
+            name="timestamp",
+        ),
+    )
+
+    def return_owned_frame(frame, *, source, timeframe):
+        return normalized
+
+    monkeypatch.setattr(data_module, "_normalize_frame", return_owned_frame)
+
+    dataset = HistoricalDataset.load(tmp_path)
+    assert dataset._frames[("EURUSD", "1h")] is normalized
+
+
+def test_public_constructor_keeps_defensive_frame_copy(tmp_path):
+    source = pd.DataFrame(
+        {
+            "open": [1.09],
+            "high": [1.092],
+            "low": [1.088],
+            "close": [1.091],
+        },
+        index=pd.DatetimeIndex(
+            ["2026-01-01T09:00:00Z"],
+            name="timestamp",
+        ),
+    )
+    dataset = HistoricalDataset(
+        tmp_path,
+        {("eurusd", "H1"): source},
+        source_files=[],
+        raw_counts={("EURUSD", "1h"): 1},
+    )
+
+    assert dataset._frames[("EURUSD", "1h")] is not source
+    source.loc[source.index[0], "open"] = 9.99
+    assert dataset.get_frame("EURUSD", "1h").iloc[0]["open"] == pytest.approx(
+        1.09
+    )
 
 
 def test_future_mutation_cannot_change_asof_view(tmp_path):

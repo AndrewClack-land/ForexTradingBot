@@ -3,11 +3,14 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import weakref
 from pathlib import Path
 
 import pandas as pd
 import pytest
 
+import backtest.__main__ as backtest_cli
+import backtest.lse_ingest as lse_ingest_module
 from backtest.data import HistoricalDataset
 from backtest.lse_ingest import (
     DEFAULT_TARGET_TIMEFRAMES,
@@ -240,6 +243,7 @@ def test_rest_import_builds_immutable_snapshot_and_pages(tmp_path, monkeypatch):
     rows = _minute_rows("2026-07-01T00:00:00Z", 3 * 24 * 60)
     client = FakeRestClient(rows)
     target = tmp_path / "snapshot"
+    progress_events = []
     monkeypatch.setenv("LSE_API_KEY", "test-secret-must-not-be-written")
 
     result = import_lse_snapshot(
@@ -251,9 +255,33 @@ def test_rest_import_builds_immutable_snapshot_and_pages(tmp_path, monkeypatch):
         page_limit=5000,
         rest_min_interval=0,
         client=client,
+        progress=lambda event: progress_events.append(dict(event)),
     )
 
     assert result.output == target.resolve()
+    assert progress_events[0] == {
+        "phase": "download",
+        "state": "start",
+        "symbol": "EURUSD",
+        "provider_symbol": "EUR/USD",
+        "window": 0,
+        "total_windows": 1,
+        "request_count": 0,
+        "rows": 0,
+    }
+    assert {
+        (event["phase"], event["state"])
+        for event in progress_events
+    }.issuperset(
+        {
+            ("download", "complete"),
+            ("resample", "complete"),
+            ("finalize", "start"),
+            ("finalize", "complete"),
+            ("publish", "start"),
+            ("publish", "complete"),
+        }
+    )
     assert len(client.calls) == 2
     assert all(call["dataset"] == "fx" for call in client.calls)
     assert {path.name for path in target.glob("*.parquet")} == {
@@ -352,6 +380,66 @@ def test_direct_import_defaults_to_quota_safe_rest_transport():
     )
 
 
+def test_lse_cli_passes_progress_callback_to_unbuffered_journal_output(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    class FakeResult:
+        output = tmp_path / "snapshot"
+        manifest_sha256 = "abc123"
+        readiness = {"wfo_ready": True}
+        symbols = ()
+
+        def to_dict(self):
+            return {
+                "output": str(self.output),
+                "manifest_sha256": self.manifest_sha256,
+                "readiness": self.readiness,
+                "symbols": [],
+            }
+
+    def fake_import(**kwargs):
+        kwargs["progress"](
+            {
+                "phase": "download",
+                "state": "progress",
+                "symbol": "EURUSD",
+                "provider_symbol": "EUR/USD",
+                "window": 40,
+                "total_windows": 799,
+                "request_count": 80,
+                "rows": 172800,
+            }
+        )
+        return FakeResult()
+
+    monkeypatch.setattr(backtest_cli, "import_lse_snapshot", fake_import)
+
+    assert (
+        backtest_cli.main(
+            [
+                "lse-import",
+                "--output",
+                str(tmp_path / "snapshot"),
+                "--symbols",
+                "EURUSD",
+                "--start",
+                "2020-01-01",
+                "--end",
+                "2026-07-24",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert (
+        "LSE progress: phase=download state=progress symbol=EURUSD "
+        "provider=EUR/USD window=40/799 requests=80 rows=172800"
+        in captured.out
+    )
+
+
 @pytest.mark.parametrize(
     ("column", "bad_value", "message"),
     [
@@ -403,6 +491,47 @@ def test_rest_uses_date_windows_and_filters_partial_days_later():
     assert report["pagination_overlap_rows"] == 0
 
 
+def test_rest_progress_reports_deterministic_windows_without_flooding():
+    rows = []
+    for timestamp in pd.date_range(
+        "2026-01-01T00:00:00Z",
+        periods=60,
+        freq="1D",
+    ):
+        row = _minute_rows(timestamp.isoformat(), 1)[0]
+        rows.append(row)
+    client = FakeRestClient(rows)
+    events = []
+
+    _, report = fetch_lse_rest(
+        client,
+        provider_symbol="EUR/USD",
+        dataset="fx",
+        start="2026-01-01",
+        end="2026-03-02",
+        page_limit=1441,
+        rest_min_interval=0,
+        progress=lambda event: events.append(dict(event)),
+    )
+
+    assert events[0] == {
+        "phase": "download",
+        "state": "start",
+        "symbol": "EUR/USD",
+        "window": 0,
+        "total_windows": 60,
+        "request_count": 0,
+        "rows": 0,
+    }
+    assert events[-1]["state"] == "complete"
+    assert events[-1]["window"] == 60
+    assert events[-1]["total_windows"] == 60
+    assert events[-1]["request_count"] == 120
+    assert events[-1]["rows"] == 60
+    assert len(events) == 22
+    assert report["total_utc_date_windows"] == 60
+
+
 def test_rest_skips_empty_weekend_date_windows_and_continues():
     rows = _minute_rows("2026-01-02T00:00:00Z", 2)
     rows += _minute_rows("2026-01-05T00:00:00Z", 2)
@@ -423,6 +552,88 @@ def test_rest_skips_empty_weekend_date_windows_and_continues():
     assert report["pages"] == 2
     assert report["requests"] == 8
     assert all(len(call["start"]) == 10 for call in client.calls)
+
+
+def test_import_releases_symbol_frames_before_next_fetch_and_final_load(
+    tmp_path,
+    monkeypatch,
+):
+    catalog_rows = _minute_rows("2026-01-01T00:00:00Z", 1)
+    catalog_rows += _minute_rows(
+        "2026-01-01T00:00:00Z",
+        1,
+        symbol="GBP/USD",
+    )
+    client = FakeRestClient(catalog_rows)
+    raw_refs = []
+    minute_refs = []
+    derived_refs = []
+    snapshot_refs = []
+    final_load_checked = []
+    real_resample = lse_ingest_module.resample_lse_candles
+    real_snapshot_frame = lse_ingest_module._snapshot_file_frame
+    real_load = HistoricalDataset.load
+
+    def assert_released():
+        assert all(reference() is None for reference in raw_refs)
+        assert all(reference() is None for reference in minute_refs)
+        assert all(reference() is None for reference in derived_refs)
+        assert all(reference() is None for reference in snapshot_refs)
+
+    def fake_fetch(*args, provider_symbol, **kwargs):
+        if raw_refs:
+            assert_released()
+        frame = pd.DataFrame(
+            _minute_rows(
+                "2026-01-01T00:00:00Z",
+                24 * 60,
+                symbol=provider_symbol,
+            )
+        )
+        raw_refs.append(weakref.ref(frame))
+        return frame, {"transport": "rest", "requests": 2}
+
+    def tracked_resample(minute_frame, **kwargs):
+        minute_refs.append(weakref.ref(minute_frame))
+        frame = real_resample(minute_frame, **kwargs)
+        derived_refs.append(weakref.ref(frame))
+        return frame
+
+    def tracked_snapshot_frame(frame, **kwargs):
+        snapshot = real_snapshot_frame(frame, **kwargs)
+        snapshot_refs.append(weakref.ref(snapshot))
+        return snapshot
+
+    def checked_load(cls, root):
+        assert_released()
+        final_load_checked.append(True)
+        return real_load(root)
+
+    monkeypatch.setattr(lse_ingest_module, "fetch_lse_rest", fake_fetch)
+    monkeypatch.setattr(
+        lse_ingest_module,
+        "resample_lse_candles",
+        tracked_resample,
+    )
+    monkeypatch.setattr(
+        lse_ingest_module,
+        "_snapshot_file_frame",
+        tracked_snapshot_frame,
+    )
+    monkeypatch.setattr(HistoricalDataset, "load", classmethod(checked_load))
+
+    import_lse_snapshot(
+        output=tmp_path / "released-frames",
+        symbols=["EURUSD", "GBPUSD"],
+        start="2026-01-01",
+        end="2026-01-02",
+        timeframes=["1m"],
+        transport="rest",
+        rest_min_interval=0,
+        client=client,
+    )
+
+    assert final_load_checked == [True]
 
 
 def test_rest_tail_probe_rejects_hidden_plan_cap():

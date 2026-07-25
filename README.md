@@ -342,9 +342,10 @@ is checked with a descending one-row tail probe. If a plan cap silently
 truncates the ascending result, the timestamps disagree and the run fails
 closed with a recommendation to use bulk export. Empty weekend windows are
 skipped without ending the backfill. This means two paced HTTP requests per
-UTC date window (plus any retry attempts), which is designed to keep the normal
-long run inside the unit's three-hour timeout at the default interval; repeated
-rate-limit retries can still extend it. Leave
+UTC date window (plus any retry attempts). The production import can take
+several hours: network latency, provider throttling and local resampling all
+affect elapsed time. The unit therefore has a finite 12-hour start timeout and
+a five-minute stop grace period; these are safety limits, not an ETA. Leave
 `LSE_DATASET=` empty to resolve and validate every symbol through the provider
 catalog (for example, Forex is `fx`, while gold is `commodity`). The
 `LSE_OUTPUT_DIR` target must not exist before the run; use a new versioned path
@@ -391,11 +392,168 @@ the live Wine/MT5 process does not import the network-facing SDK.
 Start each import intentionally and inspect its result:
 
 ```bash
-sudo systemctl start forexbot-lse-import.service
+sudo systemctl start --no-block forexbot-lse-import.service
 sudo systemctl show forexbot-lse-import.service \
-  -p Result -p ExecMainStatus
+  -p ActiveState -p SubState -p MainPID -p Result -p ExecMainStatus
 sudo journalctl -u forexbot-lse-import.service --no-pager -n 200
 ```
+
+While `ActiveState=activating`, `Result` and `ExecMainStatus` describe the last
+completed invocation and are not the current run's final result. The normal
+successful terminal state is `ActiveState=inactive`, `Result=success`,
+`ExecMainStatus=0` and `MainPID=0`. The importer publishes atomically, so the
+configured final incoming path
+`/var/lib/forexbot-backtest/incoming/fx-2020-2026-v1` appears only after all
+validation succeeds.
+
+Current releases write bounded progress messages to the journal, including the
+phase, symbol, completed/total UTC windows, request count, resampling timeframe,
+and finalization/publish phases:
+
+```bash
+sudo journalctl -fu forexbot-lse-import.service
+```
+
+For REST, download progress is emitted at roughly five-percent intervals rather
+than for every request, so the journal remains useful without being flooded.
+
+For the default three symbols and six timeframes, progress is visible as up to
+18 Parquet files in the hidden staging directory. Six files mean one symbol
+has been resampled, 12 mean two symbols, and 18 mean all three have been
+resampled; manifest generation and final validation still remain after file
+18. This is a progress indicator, not proof of a valid snapshot:
+
+```bash
+watch -n 30 "sudo find /var/lib/forexbot-backtest/incoming \
+  -maxdepth 2 -type f -name '*.parquet' -printf '%p\n' | sort"
+```
+
+Do not add `Restart=` to this oneshot unit. An automatic retry can consume
+provider quota, create another partial staging directory, and obscure the
+original failure. Start every retry manually after diagnosis.
+
+If systemd reports `Result=timeout` and `ExecMainStatus=15`, the start timeout
+sent `SIGTERM`; inspect the timestamps, unit limits, journal and retained
+staging files before retrying:
+
+```bash
+sudo systemctl show forexbot-lse-import.service \
+  -p Result -p ExecMainStatus -p ActiveEnterTimestamp \
+  -p InactiveEnterTimestamp -p TimeoutStartUSec -p TimeoutStopUSec
+sudo journalctl -u forexbot-lse-import.service \
+  --since "12 hours ago" --no-pager
+sudo find /var/lib/forexbot-backtest/incoming -maxdepth 2 \
+  -type f -printf '%p\n' | sort
+```
+
+Install the current unit before the next attempt so the 12-hour timeout,
+five-minute stop grace period and updated memory limits are active:
+
+```bash
+sudo install -o root -g root -m 0644 \
+  deploy/forexbot-lse-import.service \
+  /etc/systemd/system/forexbot-lse-import.service
+sudo systemctl daemon-reload
+sudo systemd-analyze verify /etc/systemd/system/forexbot-lse-import.service
+sudo systemctl reset-failed forexbot-lse-import.service
+```
+
+There is one narrow manual recovery path for the current interrupted run. Use
+it only while the unit is inactive, the final target does not exist, exactly
+the expected 18 Parquet files are present in one partial directory, and
+`source_manifest.json` exists and validates every declared file size and
+SHA-256. The following guard performs those checks, builds the final manifest,
+and exits without moving anything if any condition fails:
+
+```bash
+sudo systemctl is-active --quiet forexbot-lse-import.service && {
+  echo "ERROR: importer is still active"
+  exit 1
+}
+target=/var/lib/forexbot-backtest/incoming/fx-2020-2026-v1
+sudo test ! -e "$target" || {
+  echo "ERROR: final target already exists"
+  exit 1
+}
+mapfile -t partials < <(sudo find /var/lib/forexbot-backtest/incoming \
+  -mindepth 1 -maxdepth 1 -type d \
+  -name '.fx-2020-2026-v1.partial-*' -print)
+test "${#partials[@]}" -eq 1 || {
+  echo "ERROR: expected exactly one partial directory"
+  exit 1
+}
+partial="${partials[0]}"
+sudo -u forexbot-backtest env \
+  PYTHONPATH=/opt/forexbot-backtest/app PARTIAL="$partial" \
+  /opt/forexbot-backtest/venv/bin/python - <<'PY'
+import hashlib
+import json
+import os
+from pathlib import Path
+
+from backtest.data import HistoricalDataset
+
+root = Path(os.environ["PARTIAL"])
+symbols = ("EURUSD", "GBPUSD", "USDCAD")
+timeframes = ("1m", "5m", "15m", "1h", "4h", "1d")
+expected = {
+    f"{symbol}_{timeframe}.parquet"
+    for symbol in symbols
+    for timeframe in timeframes
+}
+actual = {path.name for path in root.glob("*.parquet") if path.is_file()}
+if actual != expected:
+    raise SystemExit(
+        f"expected exact 18 Parquet files; mismatch={expected ^ actual}"
+    )
+source_path = root / "source_manifest.json"
+source = json.loads(source_path.read_text(encoding="utf-8"))
+if source.get("provider") != "london_strategic_edge":
+    raise SystemExit("unexpected source_manifest provider")
+entries = source.get("files")
+if (
+    not isinstance(entries, list)
+    or len(entries) != 18
+    or {item.get("path") for item in entries} != expected
+):
+    raise SystemExit("source_manifest does not declare the exact 18 files")
+declared_symbols = {
+    item.get("bot_symbol")
+    for item in source.get("symbols", [])
+    if isinstance(item, dict)
+}
+if declared_symbols != set(symbols):
+    raise SystemExit(
+        f"source_manifest symbol mismatch: {declared_symbols ^ set(symbols)}"
+    )
+for item in entries:
+    path = root / item["path"]
+    if path.is_symlink() or not path.is_file():
+        raise SystemExit(f"invalid snapshot file: {path.name}")
+    if path.stat().st_size != int(item["bytes"]):
+        raise SystemExit(f"size mismatch: {path.name}")
+    with path.open("rb") as stream:
+        digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    if digest != item["sha256"]:
+        raise SystemExit(f"SHA-256 mismatch: {path.name}")
+dataset = HistoricalDataset.load(root)
+readiness = dataset.audit_readiness(symbols=symbols)
+if not readiness["wfo_ready"]:
+    raise SystemExit(f"WFO BLOCKED: {readiness['reasons']}")
+dataset.write_manifest(root / "manifest.json")
+print(f"WFO READY; validated manifest {dataset.manifest_sha256}")
+PY
+sudo test ! -e "$target"
+sudo mv -T -- "$partial" "$target"
+sudo -u forexbot-backtest env PYTHONPATH=/opt/forexbot-backtest/app \
+  /opt/forexbot-backtest/venv/bin/python \
+  -m backtest verify --data "$target"
+```
+
+If there are fewer than 18 exact files, no `source_manifest.json`, a hash
+mismatch, or more than one ambiguous partial directory, do not publish it.
+Keep it for diagnosis, choose a fresh versioned `LSE_OUTPUT_DIR`, and manually
+start a new import with the updated unit.
 
 The importer downloads M1, validates UTC/OHLC/duplicates, and rebuilds
 5M/M15/H1/H4/D1. It rejects truncated range edges and internal source gaps

@@ -269,6 +269,8 @@ class SeriesCoverage:
 class HistoricalDataset:
     """Immutable in-memory view of a broker-native multi-timeframe snapshot."""
 
+    _OWNED_FRAMES_TOKEN = object()
+
     def __init__(
         self,
         root: Path,
@@ -276,10 +278,14 @@ class HistoricalDataset:
         *,
         source_files: Iterable[Mapping[str, Any]],
         raw_counts: Mapping[Tuple[str, str], int],
+        _owned_frames_token: object | None = None,
     ) -> None:
         self.root = Path(root)
+        take_ownership = _owned_frames_token is self._OWNED_FRAMES_TOKEN
         self._frames = {
-            (symbol.upper(), normalize_timeframe(tf)): frame.copy()
+            (symbol.upper(), normalize_timeframe(tf)): (
+                frame if take_ownership else frame.copy()
+            )
             for (symbol, tf), frame in frames.items()
         }
         self._raw_counts = dict(raw_counts)
@@ -366,28 +372,34 @@ class HistoricalDataset:
             )
 
         frames: Dict[Tuple[str, str], pd.DataFrame] = {}
-        for key, parts in grouped.items():
-            combined = pd.concat(parts, axis=0)
-            combined = combined.sort_index(kind="stable")
+        for key in list(grouped):
+            parts = grouped.pop(key)
+            combined = parts[0] if len(parts) == 1 else pd.concat(parts, axis=0)
+            del parts
+            if not combined.index.is_monotonic_increasing:
+                combined = combined.sort_index(kind="stable")
             explicit_by_timestamp: Dict[pd.Timestamp, pd.Timestamp] = {}
-            if (
-                _BAR_CLOSE_COLUMN in combined.columns
-                and combined.index.duplicated(keep=False).any()
-            ):
-                duplicate_closes = combined.loc[
-                    combined.index.duplicated(keep=False),
-                    _BAR_CLOSE_COLUMN,
-                ]
-                for timestamp, values in duplicate_closes.groupby(level=0, sort=False):
-                    explicit = pd.DatetimeIndex(values.dropna().unique())
-                    if len(explicit) > 1:
-                        raise DataValidationError(
-                            f"Conflicting explicit bar close times for {key} "
-                            f"at {pd.Timestamp(timestamp).isoformat()}"
-                        )
-                    if len(explicit) == 1:
-                        explicit_by_timestamp[pd.Timestamp(timestamp)] = explicit[0]
-            combined = combined[~combined.index.duplicated(keep="last")]
+            if not combined.index.is_unique:
+                duplicate_timestamps = combined.index.duplicated(keep=False)
+                if _BAR_CLOSE_COLUMN in combined.columns:
+                    duplicate_closes = combined.loc[
+                        duplicate_timestamps,
+                        _BAR_CLOSE_COLUMN,
+                    ]
+                    for timestamp, values in duplicate_closes.groupby(
+                        level=0,
+                        sort=False,
+                    ):
+                        explicit = pd.DatetimeIndex(values.dropna().unique())
+                        if len(explicit) > 1:
+                            raise DataValidationError(
+                                f"Conflicting explicit bar close times for {key} "
+                                f"at {pd.Timestamp(timestamp).isoformat()}"
+                            )
+                        if len(explicit) == 1:
+                            explicit_by_timestamp[pd.Timestamp(timestamp)] = explicit[0]
+                duplicate_rows = combined.index.duplicated(keep="last")
+                combined = combined.loc[~duplicate_rows]
             if (
                 _BAR_CLOSE_COLUMN in combined.columns
                 and explicit_by_timestamp
@@ -431,6 +443,7 @@ class HistoricalDataset:
             frames,
             source_files=source_files,
             raw_counts=raw_counts,
+            _owned_frames_token=cls._OWNED_FRAMES_TOKEN,
         )
         stored_manifest_path = base / "manifest.json"
         if stored_manifest_path.is_file():

@@ -7,6 +7,7 @@ for live orders and for exact Bid/Ask execution modelling.
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import math
@@ -74,6 +75,8 @@ _EXPORT_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _RELEASE_COMMIT_RE = re.compile(r"^(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})$")
 _ENVIRONMENT_LOCK_SNAPSHOT = "environment.freeze.txt"
 
+ProgressCallback = Callable[[Mapping[str, Any]], None]
+
 
 class LSEIngestError(DataValidationError):
     """Raised when an LSE request cannot produce a safe candle snapshot."""
@@ -105,6 +108,14 @@ class LSEImportResult:
             "readiness": dict(self.readiness),
             "symbols": [dict(item) for item in self.symbols],
         }
+
+
+def _emit_progress(
+    callback: Optional[ProgressCallback],
+    **event: Any,
+) -> None:
+    if callback is not None:
+        callback(event)
 
 
 def parse_symbol_spec(value: str) -> LSESymbolSpec:
@@ -682,6 +693,7 @@ def fetch_lse_rest(
     retry_after_seconds: float = DEFAULT_RETRY_AFTER_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
     now: Any = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Fetch M1 candles through the provider's UTC date-window contract.
 
@@ -733,11 +745,44 @@ def fetch_lse_rest(
     end_day = end_utc.normalize()
     if end_utc != end_day:
         end_day += pd.Timedelta(days=1)
+    total_days = int((end_day - first_day) / pd.Timedelta(days=1))
+    total_windows = max(1, math.ceil(total_days / window_days))
+    progress_interval = max(1, math.ceil(total_windows / 20))
 
     pages: list[pd.DataFrame] = []
     requested_windows = 0
     empty_windows = 0
     api_requests = 0
+    downloaded_rows = 0
+
+    _emit_progress(
+        progress,
+        phase="download",
+        state="start",
+        symbol=provider_symbol,
+        window=0,
+        total_windows=total_windows,
+        request_count=0,
+        rows=0,
+    )
+
+    def emit_window_progress() -> None:
+        if (
+            requested_windows % progress_interval != 0
+            and requested_windows != total_windows
+        ):
+            return
+        _emit_progress(
+            progress,
+            phase="download",
+            state="progress",
+            symbol=provider_symbol,
+            window=requested_windows,
+            total_windows=total_windows,
+            request_count=api_requests,
+            rows=downloaded_rows,
+        )
+
     window_start = first_day
     while window_start < end_day:
         requested_windows += 1
@@ -851,6 +896,7 @@ def fetch_lse_rest(
         if page.empty:
             empty_windows += 1
             window_start = window_end
+            emit_window_progress()
             continue
         if parsed.max() != tail_parsed.max():
             raise LSEIngestError(
@@ -875,16 +921,32 @@ def fetch_lse_rest(
                 f"{request_start}; use bulk export"
             )
         pages.append(page)
+        downloaded_rows += len(page)
         window_start = window_end
+        emit_window_progress()
 
     if not pages:
         raise LSEIngestError("LSE REST returned no candles in the UTC-day windows")
+    page_count = len(pages)
     merged = pd.concat(pages, ignore_index=True, sort=False)
+    pages.clear()
+    gc.collect()
+    _emit_progress(
+        progress,
+        phase="download",
+        state="complete",
+        symbol=provider_symbol,
+        window=requested_windows,
+        total_windows=total_windows,
+        request_count=api_requests,
+        rows=len(merged),
+    )
     return merged, {
         "transport": "rest",
         "requests": api_requests,
-        "pages": len(pages),
+        "pages": page_count,
         "utc_date_windows": requested_windows,
+        "total_utc_date_windows": total_windows,
         "window_days": window_days,
         "empty_utc_date_windows": empty_windows,
         "tail_probes": requested_windows,
@@ -1399,6 +1461,7 @@ def import_lse_snapshot(
     release_commit_file: str | Path | None = None,
     environment_lock_file: str | Path | None = None,
     client: Any = None,
+    progress: Optional[ProgressCallback] = None,
 ) -> LSEImportResult:
     """Create a new immutable snapshot directory from LSE M1 candles."""
 
@@ -1504,89 +1567,186 @@ def import_lse_snapshot(
                     "Environment lock changed while the snapshot was being created"
                 )
 
+        raw: Optional[pd.DataFrame] = None
+        minute_frame: Optional[pd.DataFrame] = None
+        derived: Optional[pd.DataFrame] = None
+        snapshot_frame: Optional[pd.DataFrame] = None
+
         for spec in specs:
             resolved_dataset = resolved_datasets[spec.bot_symbol]
             raw_dir = raw_root / spec.bot_symbol
-            if transport == "export":
-                raw, request_report = fetch_lse_export(
-                    lse_client,
-                    provider_symbol=spec.provider_symbol,
-                    start=start,
-                    end=end,
-                    destination=raw_dir,
-                    dataset=resolved_dataset,
-                    export_chunk_days=export_chunk_days,
-                )
-            else:
-                raw, request_report = fetch_lse_rest(
-                    lse_client,
-                    provider_symbol=spec.provider_symbol,
-                    start=start_utc,
-                    end=end_utc,
-                    dataset=resolved_dataset,
-                    page_limit=page_limit,
-                    retries=int(retries),
-                    rest_min_interval=rest_min_interval,
-                    retry_after_seconds=retry_after_seconds,
-                )
+            try:
+                if transport == "export":
+                    _emit_progress(
+                        progress,
+                        phase="download",
+                        state="start",
+                        symbol=spec.bot_symbol,
+                        provider_symbol=spec.provider_symbol,
+                        window=0,
+                        total_windows=len(export_chunks),
+                        request_count=0,
+                    )
+                    raw, request_report = fetch_lse_export(
+                        lse_client,
+                        provider_symbol=spec.provider_symbol,
+                        start=start,
+                        end=end,
+                        destination=raw_dir,
+                        dataset=resolved_dataset,
+                        export_chunk_days=export_chunk_days,
+                    )
+                    _emit_progress(
+                        progress,
+                        phase="download",
+                        state="complete",
+                        symbol=spec.bot_symbol,
+                        provider_symbol=spec.provider_symbol,
+                        window=len(export_chunks),
+                        total_windows=len(export_chunks),
+                        request_count=int(request_report["jobs_started"]),
+                        rows=len(raw),
+                    )
+                else:
 
-            minute_frame, quality = normalize_lse_candles(
-                raw,
-                expected_provider_symbol=spec.provider_symbol,
-                start=start_utc,
-                end=end_utc,
-                max_duplicate_ratio=max_duplicate_ratio,
-                max_edge_gap_days=max_edge_gap_days,
-                max_internal_gap_days=max_internal_gap_days,
-            )
-            derived_rows: dict[str, int] = {}
-            derived_quality: dict[str, Mapping[str, Any]] = {}
-            for timeframe in normalized_timeframes:
-                derived = resample_lse_candles(
-                    minute_frame,
-                    timeframe=timeframe,
+                    def relay_download(event: Mapping[str, Any]) -> None:
+                        payload = dict(event)
+                        payload.update(
+                            {
+                                "symbol": spec.bot_symbol,
+                                "provider_symbol": spec.provider_symbol,
+                            }
+                        )
+                        _emit_progress(progress, **payload)
+
+                    raw, request_report = fetch_lse_rest(
+                        lse_client,
+                        provider_symbol=spec.provider_symbol,
+                        start=start_utc,
+                        end=end_utc,
+                        dataset=resolved_dataset,
+                        page_limit=page_limit,
+                        retries=int(retries),
+                        rest_min_interval=rest_min_interval,
+                        retry_after_seconds=retry_after_seconds,
+                        progress=relay_download if progress is not None else None,
+                    )
+
+                minute_frame, quality = normalize_lse_candles(
+                    raw,
+                    expected_provider_symbol=spec.provider_symbol,
                     start=start_utc,
                     end=end_utc,
-                    bar_timezone=bar_timezone,
-                    min_bucket_coverage=min_bucket_coverage,
+                    max_duplicate_ratio=max_duplicate_ratio,
+                    max_edge_gap_days=max_edge_gap_days,
+                    max_internal_gap_days=max_internal_gap_days,
                 )
-                bucket_quality = dict(derived.attrs.get("bucket_quality", {}))
-                destination = staging / f"{spec.bot_symbol}_{timeframe}.parquet"
-                _snapshot_file_frame(
-                    derived,
+                # The provider frame is no longer needed once the canonical M1
+                # frame exists. Releasing it here prevents raw + M1 + derived
+                # data from remaining resident throughout all resamples.
+                raw = None
+                gc.collect()
+
+                derived_rows: dict[str, int] = {}
+                derived_quality: dict[str, Mapping[str, Any]] = {}
+                _emit_progress(
+                    progress,
+                    phase="resample",
+                    state="start",
                     symbol=spec.bot_symbol,
-                    timeframe=timeframe,
-                ).to_parquet(destination, index=False)
-                derived_rows[timeframe] = len(derived)
-                derived_quality[timeframe] = bucket_quality
-                file_reports.append(
+                    provider_symbol=spec.provider_symbol,
+                    step=0,
+                    total_timeframes=len(normalized_timeframes),
+                )
+                for step, timeframe in enumerate(normalized_timeframes, start=1):
+                    try:
+                        derived = resample_lse_candles(
+                            minute_frame,
+                            timeframe=timeframe,
+                            start=start_utc,
+                            end=end_utc,
+                            bar_timezone=bar_timezone,
+                            min_bucket_coverage=min_bucket_coverage,
+                        )
+                        bucket_quality = dict(
+                            derived.attrs.get("bucket_quality", {})
+                        )
+                        destination = (
+                            staging / f"{spec.bot_symbol}_{timeframe}.parquet"
+                        )
+                        snapshot_frame = _snapshot_file_frame(
+                            derived,
+                            symbol=spec.bot_symbol,
+                            timeframe=timeframe,
+                        )
+                        snapshot_frame.to_parquet(destination, index=False)
+                        row_count = len(derived)
+                        derived_rows[timeframe] = row_count
+                        derived_quality[timeframe] = bucket_quality
+                        file_reports.append(
+                            {
+                                "path": destination.name,
+                                "symbol": spec.bot_symbol,
+                                "timeframe": timeframe,
+                                "rows": row_count,
+                                "bytes": int(destination.stat().st_size),
+                                "sha256": _sha256_file(destination),
+                                "start": derived.index[0].isoformat(),
+                                "end_open": derived.index[-1].isoformat(),
+                                "end_close": pd.Timestamp(
+                                    derived["bar_close_time"].iloc[-1]
+                                ).isoformat(),
+                                "bucket_quality": bucket_quality,
+                            }
+                        )
+                    finally:
+                        # Do not retain a large derived frame on the RHS while
+                        # the next timeframe is being materialized.
+                        snapshot_frame = None
+                        derived = None
+                    _emit_progress(
+                        progress,
+                        phase="resample",
+                        state=(
+                            "complete"
+                            if step == len(normalized_timeframes)
+                            else "progress"
+                        ),
+                        symbol=spec.bot_symbol,
+                        provider_symbol=spec.provider_symbol,
+                        timeframe=timeframe,
+                        step=step,
+                        total_timeframes=len(normalized_timeframes),
+                        rows=derived_rows[timeframe],
+                    )
+
+                symbol_reports.append(
                     {
-                        "path": destination.name,
-                        "symbol": spec.bot_symbol,
-                        "timeframe": timeframe,
-                        "rows": len(derived),
-                        "bytes": int(destination.stat().st_size),
-                        "sha256": _sha256_file(destination),
-                        "start": derived.index[0].isoformat(),
-                        "end_open": derived.index[-1].isoformat(),
-                        "end_close": pd.Timestamp(
-                            derived["bar_close_time"].iloc[-1]
-                        ).isoformat(),
-                        "bucket_quality": bucket_quality,
+                        **spec.to_dict(),
+                        "dataset": resolved_dataset,
+                        **request_report,
+                        "quality": quality,
+                        "derived_rows": derived_rows,
+                        "derived_quality": derived_quality,
                     }
                 )
+            finally:
+                # Python evaluates an assignment's RHS before rebinding its
+                # targets. Clear every large frame before the next fetch so the
+                # previous symbol cannot overlap the next symbol's download.
+                snapshot_frame = None
+                derived = None
+                minute_frame = None
+                raw = None
+                gc.collect()
 
-            symbol_reports.append(
-                {
-                    **spec.to_dict(),
-                    "dataset": resolved_dataset,
-                    **request_report,
-                    "quality": quality,
-                    "derived_rows": derived_rows,
-                    "derived_quality": derived_quality,
-                }
-            )
-
+        _emit_progress(
+            progress,
+            phase="finalize",
+            state="start",
+            symbols=len(symbol_reports),
+            files=len(file_reports),
+        )
         source_manifest = {
             "schema_version": 1,
             "provider": "london_strategic_edge",
@@ -1610,15 +1770,41 @@ def import_lse_snapshot(
             json.dumps(source_manifest, ensure_ascii=False, indent=2, sort_keys=True),
             encoding="utf-8",
         )
+        # HistoricalDataset.load intentionally materializes the finished
+        # snapshot. Ensure no ingestion frame competes with that final load.
+        snapshot_frame = None
+        derived = None
+        minute_frame = None
+        raw = None
+        gc.collect()
         dataset_snapshot = HistoricalDataset.load(staging)
         readiness = dataset_snapshot.audit_readiness()
         dataset_snapshot.write_manifest(staging / "manifest.json")
+        _emit_progress(
+            progress,
+            phase="finalize",
+            state="complete",
+            symbols=len(symbol_reports),
+            files=len(file_reports),
+        )
         if target.exists() or target.is_symlink():
             raise LSEIngestError(
                 f"Snapshot target appeared during import; refusing to replace it: {target}"
             )
+        _emit_progress(
+            progress,
+            phase="publish",
+            state="start",
+            output=str(target),
+        )
         staging.replace(target)
         completed = True
+        _emit_progress(
+            progress,
+            phase="publish",
+            state="complete",
+            output=str(target),
+        )
         if transport == "export":
             shutil.rmtree(raw_root, ignore_errors=True)
         return LSEImportResult(

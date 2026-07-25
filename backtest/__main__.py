@@ -6,7 +6,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 from .data import DataValidationError, HistoricalDataset
 from .lse_ingest import (
@@ -240,6 +240,39 @@ def _verify(args: argparse.Namespace) -> int:
 
 
 def _lse_import(args: argparse.Namespace) -> int:
+    progress_stream = sys.stderr if args.json else sys.stdout
+
+    def print_progress(event: Mapping[str, Any]) -> None:
+        fields = [
+            f"phase={event['phase']}",
+            f"state={event['state']}",
+        ]
+        if "symbol" in event:
+            fields.append(f"symbol={event['symbol']}")
+        if "provider_symbol" in event:
+            fields.append(f"provider={event['provider_symbol']}")
+        if "total_windows" in event:
+            fields.append(
+                f"window={event.get('window', 0)}/{event['total_windows']}"
+            )
+        if "request_count" in event:
+            fields.append(f"requests={event['request_count']}")
+        if "total_timeframes" in event:
+            fields.append(
+                f"step={event.get('step', 0)}/{event['total_timeframes']}"
+            )
+        if "timeframe" in event:
+            fields.append(f"timeframe={event['timeframe']}")
+        if "rows" in event:
+            fields.append(f"rows={event['rows']}")
+        if "symbols" in event:
+            fields.append(f"symbols={event['symbols']}")
+        if "files" in event:
+            fields.append(f"files={event['files']}")
+        if "output" in event:
+            fields.append(f"output={event['output']}")
+        print("LSE progress: " + " ".join(fields), file=progress_stream, flush=True)
+
     result = import_lse_snapshot(
         output=args.output,
         symbols=args.symbols,
@@ -261,6 +294,7 @@ def _lse_import(args: argparse.Namespace) -> int:
         release_commit_file=args.release_commit_file,
         environment_lock_file=args.environment_lock_file,
         timeout=args.timeout,
+        progress=print_progress,
     )
     payload = result.to_dict()
     if args.json:
