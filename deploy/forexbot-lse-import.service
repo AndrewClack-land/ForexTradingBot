@@ -4,21 +4,21 @@ After=network-online.target
 Wants=network-online.target
 AssertPathExists=/etc/forexbot/lse.env
 AssertPathExists=/etc/forexbot/lse-import.env
-AssertPathExists=/opt/forexbot-backtest/app/backtest
-AssertPathExists=/opt/forexbot-backtest/RELEASE_COMMIT
-AssertPathExists=/opt/forexbot-backtest/installed.freeze.txt
-AssertFileIsExecutable=/opt/forexbot-backtest/venv/bin/python
+AssertPathExists=/opt/forexbot-backtest/current/app/backtest
+AssertPathExists=/opt/forexbot-backtest/current/RELEASE_COMMIT
+AssertPathExists=/opt/forexbot-backtest/current/installed.freeze.txt
+AssertFileIsExecutable=/opt/forexbot-backtest/current/venv/bin/python
 
 [Service]
 Type=oneshot
 User=forexbot-backtest
 Group=forexbot-backtest
-WorkingDirectory=/opt/forexbot-backtest/app
+WorkingDirectory=/opt/forexbot-backtest/current/app
 Environment=PYTHONDONTWRITEBYTECODE=1
 Environment=PYTHONUNBUFFERED=1
 EnvironmentFile=/etc/forexbot/lse.env
 EnvironmentFile=/etc/forexbot/lse-import.env
-ExecStart=/opt/forexbot-backtest/venv/bin/python -m backtest lse-import --output ${LSE_OUTPUT_DIR} --symbols $LSE_SYMBOLS --start ${LSE_START} --end ${LSE_END} --transport ${LSE_TRANSPORT} --dataset=${LSE_DATASET} --bar-timezone ${LSE_BAR_TIMEZONE} --timeframes $LSE_TIMEFRAMES --rest-min-interval ${LSE_REST_MIN_INTERVAL} --min-bucket-coverage ${LSE_MIN_BUCKET_COVERAGE} --max-edge-gap-days ${LSE_MAX_EDGE_GAP_DAYS} --max-internal-gap-days ${LSE_MAX_INTERNAL_GAP_DAYS} --release-commit-file /opt/forexbot-backtest/RELEASE_COMMIT --environment-lock-file /opt/forexbot-backtest/installed.freeze.txt
+ExecStart=/opt/forexbot-backtest/current/venv/bin/python -m backtest lse-import --output ${LSE_OUTPUT_DIR} --symbols $LSE_SYMBOLS --start ${LSE_START} --end ${LSE_END} --transport ${LSE_TRANSPORT} --dataset=${LSE_DATASET} --bar-timezone ${LSE_BAR_TIMEZONE} --timeframes $LSE_TIMEFRAMES --rest-min-interval ${LSE_REST_MIN_INTERVAL} --min-bucket-coverage ${LSE_MIN_BUCKET_COVERAGE} --max-edge-gap-days ${LSE_MAX_EDGE_GAP_DAYS} --max-internal-gap-days ${LSE_MAX_INTERNAL_GAP_DAYS} --release-commit-file /opt/forexbot-backtest/current/RELEASE_COMMIT --environment-lock-file /opt/forexbot-backtest/current/installed.freeze.txt
 StateDirectory=forexbot-backtest
 StateDirectoryMode=0700
 TimeoutStartSec=12h

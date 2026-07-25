@@ -262,48 +262,77 @@ Create the unprivileged account and root-owned application directories:
 
 ```bash
 getent passwd forexbot-backtest >/dev/null || \
-  sudo useradd --system --user-group \
+sudo useradd --system --user-group \
     --home-dir /var/lib/forexbot-backtest --no-create-home \
     --shell /usr/sbin/nologin forexbot-backtest
-sudo install -d -o root -g root -m 0755 /opt/forexbot-backtest/app
+sudo install -d -o root -g root -m 0755 \
+  /opt/forexbot-backtest/releases
 sudo install -d -o forexbot-backtest -g forexbot-backtest -m 0700 \
   /var/lib/forexbot-backtest
 sudo install -d -o root -g forexbot-backtest -m 0550 \
   /srv/forexbot-backtest/snapshots
 ```
 
-From the repository checkout, install only files tracked by the selected Git
-commit. This deliberately excludes ignored or untracked `.env` files:
+From the repository checkout, build a fresh versioned release using only files
+tracked by the selected Git commit. The release is never extracted over a
+running tree. Its manifest hashes every shipped file, and the `current`
+symlink is changed only after the venv and lock file are complete. Ignored or
+untracked `.env` files cannot enter this archive:
 
 ```bash
 release_commit="$(git rev-parse --verify HEAD)"
+release_root="/opt/forexbot-backtest/releases/$release_commit"
+release_stage="/opt/forexbot-backtest/releases/.stage-$release_commit-$$"
+sudo test ! -e "$release_root" || {
+  echo "ERROR: release already exists: $release_root"
+  exit 1
+}
+sudo install -d -o root -g root -m 0755 "$release_stage/app"
 git archive --format=tar "$release_commit" \
-  backtest requirements-backtest.txt | \
-  sudo tar --extract --file=- --directory=/opt/forexbot-backtest/app
+  backtest \
+  core/__init__.py \
+  core/strategy_narrative.py core/htf_context.py \
+  core/pivot_trigger.py core/vol_regime.py \
+  deploy/build_backtest_release_manifest.py \
+  requirements-backtest.txt | \
+  sudo tar --extract --file=- --directory="$release_stage/app"
+sudo python3 \
+  "$release_stage/app/deploy/build_backtest_release_manifest.py" \
+  --root "$release_stage/app" \
+  --commit "$release_commit" \
+  --output "$release_stage/RELEASE_MANIFEST.json"
 printf '%s\n' "$release_commit" | \
-  sudo tee /opt/forexbot-backtest/RELEASE_COMMIT >/dev/null
-sudo chown -R root:root /opt/forexbot-backtest/app
-sudo chmod -R go-w /opt/forexbot-backtest/app
-if sudo find /opt/forexbot-backtest/app -name '.env*' -print -quit | grep -q .; then
+  sudo tee "$release_stage/RELEASE_COMMIT" >/dev/null
+sudo chmod 0444 \
+  "$release_stage/RELEASE_COMMIT" \
+  "$release_stage/RELEASE_MANIFEST.json"
+sudo chown -R root:root "$release_stage"
+sudo chmod -R go-w "$release_stage"
+if sudo find "$release_stage/app" -name '.env*' -print -quit | grep -q .; then
   echo "ERROR: an environment file reached the isolated app tree"
   exit 1
 fi
+sudo mv "$release_stage" "$release_root"
 ```
 
 Build an isolated Python 3.13 environment. Direct dependencies are version
 pinned; `installed.freeze.txt` records the complete resolved environment for
-the deployment, but is not a cryptographic hash lock:
+the deployment and its SHA-256 is embedded in every strategy report:
 
 ```bash
-sudo python3.13 -m venv /opt/forexbot-backtest/venv
-sudo /opt/forexbot-backtest/venv/bin/python -m pip install \
+sudo python3.13 -m venv "$release_root/venv"
+sudo "$release_root/venv/bin/python" -m pip install \
   --only-binary=:all: \
-  -r /opt/forexbot-backtest/app/requirements-backtest.txt
-sudo /opt/forexbot-backtest/venv/bin/python -m pip check
-sudo sh -c '/opt/forexbot-backtest/venv/bin/python -m pip freeze --all \
-  > /opt/forexbot-backtest/installed.freeze.txt'
-sudo chown -R root:root /opt/forexbot-backtest
-sudo chmod -R go-w /opt/forexbot-backtest
+  -r "$release_root/app/requirements-backtest.txt"
+sudo "$release_root/venv/bin/python" -m pip check
+sudo sh -c "\"$release_root/venv/bin/python\" -m pip freeze --all \
+  > \"$release_root/installed.freeze.txt\""
+sudo chmod 0444 "$release_root/installed.freeze.txt"
+sudo chown -R root:root "$release_root"
+sudo chmod -R go-w "$release_root"
+sudo ln -s "$release_root" /opt/forexbot-backtest/current.next
+sudo mv -Tf /opt/forexbot-backtest/current.next \
+  /opt/forexbot-backtest/current
 ```
 
 Keep the API key only in the existing root-only secret file. `sudoedit` should
@@ -484,8 +513,8 @@ test "${#partials[@]}" -eq 1 || {
 }
 partial="${partials[0]}"
 sudo -u forexbot-backtest env \
-  PYTHONPATH=/opt/forexbot-backtest/app PARTIAL="$partial" \
-  /opt/forexbot-backtest/venv/bin/python - <<'PY'
+  PYTHONPATH=/opt/forexbot-backtest/current/app PARTIAL="$partial" \
+  /opt/forexbot-backtest/current/venv/bin/python - <<'PY'
 import hashlib
 import json
 import os
@@ -545,8 +574,9 @@ print(f"WFO READY; validated manifest {dataset.manifest_sha256}")
 PY
 sudo test ! -e "$target"
 sudo mv -T -- "$partial" "$target"
-sudo -u forexbot-backtest env PYTHONPATH=/opt/forexbot-backtest/app \
-  /opt/forexbot-backtest/venv/bin/python \
+sudo -u forexbot-backtest env \
+  PYTHONPATH=/opt/forexbot-backtest/current/app \
+  /opt/forexbot-backtest/current/venv/bin/python \
   -m backtest verify --data "$target"
 ```
 
@@ -585,8 +615,9 @@ sudo chown -R root:forexbot-backtest "$incoming"
 sudo find "$incoming" -type d -exec chmod 0550 {} +
 sudo find "$incoming" -type f -exec chmod 0440 {} +
 sudo mv -- "$incoming" "$snapshot"
-sudo -u forexbot-backtest env PYTHONPATH=/opt/forexbot-backtest/app \
-  /opt/forexbot-backtest/venv/bin/python \
+sudo -u forexbot-backtest env \
+  PYTHONPATH=/opt/forexbot-backtest/current/app \
+  /opt/forexbot-backtest/current/venv/bin/python \
   -m backtest verify --data "$snapshot"
 sudo -u forexbot-backtest test ! -w "$snapshot"
 sudo -u forexbot-backtest test ! -w /srv/forexbot-backtest/snapshots
@@ -603,6 +634,155 @@ subsequent loads fail if the stored manifest no longer matches the snapshot.
 
 No timer is installed or recommended: each run consumes provider quota and
 must be started deliberately.
+
+#### Run the narrative strategy offline
+
+`python -m backtest run` connects the immutable snapshot to the exact
+`NarrativeStrategy`, the volatility gate and the three-leg outcome simulator.
+It evaluates the strategy once per completed M15 candle and supplies at most
+299 already-closed D/4H/1H/15M candles. It must not call
+`Core._closed_bars_view`: the snapshot loader has already excluded forming
+candles.
+
+The default execution model is deliberately conservative and reproducible:
+
+- the signal becomes known at the M15 close;
+- it can fill only at a later M1 open inside the strategy entry range;
+- the range expires after 15 minutes;
+- TP weights are 50/30/20 percent and TP1 moves the remaining legs to
+  break-even;
+- an M1 candle touching both an adverse and favorable level uses
+  `stop-first`;
+- remaining exposure gets a causal time exit at Friday close, the configured
+  maximum holding period, or an OOS fold boundary;
+- each setup risks a fixed one percent of the explicitly supplied starting
+  capital, never a compounded balance.
+
+Use the same no-network systemd sandbox for both smoke and full runs. Paste the
+following function once in the current shell. It resolves `current` to an exact
+versioned, root-owned release and removes all live/LSE credentials from the
+job:
+
+```bash
+release_root="$(readlink -f /opt/forexbot-backtest/current)"
+snapshot=/srv/forexbot-backtest/snapshots/fx-2020-2026-v1
+runs=/var/lib/forexbot-backtest/runs
+sudo install -d -o forexbot-backtest -g forexbot-backtest -m 0700 "$runs"
+
+backtest_sandbox() {
+  unit="$1"
+  shift
+  sudo systemd-run --unit="$unit" --collect \
+    --property=Type=oneshot \
+    --property=User=forexbot-backtest \
+    --property=Group=forexbot-backtest \
+    --property="WorkingDirectory=$release_root/app" \
+    --property=Environment=PYTHONDONTWRITEBYTECODE=1 \
+    --property=Environment=PYTHONUNBUFFERED=1 \
+    --property=Environment=PYTHONNOUSERSITE=1 \
+    --property=Environment=PYTHONSAFEPATH=1 \
+    --property="Environment=PYTHONPATH=$release_root/app" \
+    --property=Environment=MT5_EXECUTION=0 \
+    --property='UnsetEnvironment=LSE_API_KEY MT5_LOGIN MT5_PASSWORD MT5_SERVER TELEGRAM_TOKEN TELEGRAM_CHANNEL_ID' \
+    --property=UMask=0077 \
+    --property=PrivateNetwork=yes \
+    --property=RestrictAddressFamilies=AF_UNIX \
+    --property=NoNewPrivileges=yes \
+    --property=RestrictSUIDSGID=yes \
+    --property=CapabilityBoundingSet= \
+    --property=AmbientCapabilities= \
+    --property=PrivateDevices=yes \
+    --property=PrivateTmp=yes \
+    --property=ProtectSystem=strict \
+    --property=ProtectHome=yes \
+    --property=InaccessiblePaths=/etc/forexbot \
+    --property="ReadOnlyPaths=$release_root" \
+    --property="ReadOnlyPaths=$snapshot" \
+    --property="ReadWritePaths=$runs" \
+    --property=ProtectProc=invisible \
+    --property=ProcSubset=pid \
+    --property=ProtectKernelTunables=yes \
+    --property=ProtectKernelModules=yes \
+    --property=ProtectControlGroups=yes \
+    --property=ProtectClock=yes \
+    --property=ProtectHostname=yes \
+    --property=LockPersonality=yes \
+    --property=RestrictRealtime=yes \
+    --property=RestrictNamespaces=yes \
+    --property=KeyringMode=private \
+    --property=LimitCORE=0 \
+    --property=TasksMax=128 \
+    --property=MemoryHigh=4G \
+    --property=MemoryMax=6G \
+    --property=Nice=10 \
+    --property=CPUWeight=20 \
+    --property=IOWeight=20 \
+    --property=TimeoutStartSec=24h \
+    --property=TimeoutStopSec=5min \
+    "$@"
+}
+```
+
+Run a short one-symbol diagnostic before the full walk-forward job. The output
+directory must not already exist:
+
+```bash
+backtest_sandbox forexbot-backtest-smoke-eurusd \
+  "$release_root/venv/bin/python" \
+  -m backtest run \
+  --data "$snapshot" \
+  --symbols EURUSD \
+  --start 2025-01-01 --end 2025-04-01 \
+  --initial-capital REPLACE_WITH_STARTING_CAPITAL \
+  --risk-fraction 0.01 \
+  --profile production-deterministic \
+  --intrabar-policy stop-first \
+  --release-commit-file "$release_root/RELEASE_COMMIT" \
+  --release-manifest-file "$release_root/RELEASE_MANIFEST.json" \
+  --environment-lock-file "$release_root/installed.freeze.txt" \
+  --output "$runs/eurusd-smoke-2025q1"
+sudo journalctl -fu forexbot-backtest-smoke-eurusd.service
+```
+
+For a disconnect-safe full run, start a transient systemd service with no
+network and no LSE/live-bot environment. The fixed current strategy has no
+parameter optimizer yet: the two-year train interval supplies the rolling
+walk-forward boundary and historical context; metrics are reported only for
+the following non-overlapping six-month OOS intervals.
+
+```bash
+backtest_sandbox forexbot-backtest-run-fx-v1 \
+  "$release_root/venv/bin/python" -m backtest run \
+  --data "$snapshot" \
+  --symbols EURUSD GBPUSD USDCAD \
+  --initial-capital REPLACE_WITH_STARTING_CAPITAL \
+  --risk-fraction 0.01 \
+  --profile production-deterministic \
+  --train 730D --test 180D --step 180D \
+  --intrabar-policy stop-first \
+  --release-commit-file "$release_root/RELEASE_COMMIT" \
+  --release-manifest-file "$release_root/RELEASE_MANIFEST.json" \
+  --environment-lock-file "$release_root/installed.freeze.txt" \
+  --output "$runs/fx-wfo-v1"
+sudo journalctl -fu forexbot-backtest-run-fx-v1.service
+```
+
+The report is atomically published and contains `summary.json`,
+`candidates.csv`, one auditable candidate/policy decision in `executions.csv`,
+`setups.csv`, `legs.csv`, `folds.csv`, `config.json` and a SHA-256
+`manifest.json`. Empty CSV reports still contain stable headers. A second run
+with `--intrabar-policy tp-first` (or `both`) measures sensitivity to
+unknowable M1 intrabar ordering.
+
+The report is a gross strategy diagnostic, not a broker-accurate PnL
+statement. LSE OHLCV does not contain historical Bid/Ask spread, FxPro
+commission, swap, slippage or tick ordering. The deterministic profile
+includes sessions, Friday close, the volatility/expected-move gate, daily
+setup cap, duplicate-trigger guard and post-loss cooldown. It intentionally
+does not reuse today's AI SQLite state in the past (that would leak future
+outcomes). It also excludes pyramiding, the bot-wide daily equity-loss brake,
+anti-hedge/portfolio-correlation rules and broker lot constraints; those
+require a later portfolio-level simulator.
 
 ### Disclaimer
 

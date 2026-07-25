@@ -18,7 +18,7 @@ DEFAULT_WEIGHTS: Tuple[float, float, float] = (0.50, 0.30, 0.20)
 class LegOutcome:
     tp_index: int
     weight: float
-    exit_reason: Literal["TP", "STOP", "BE", "OPEN"]
+    exit_reason: Literal["TP", "STOP", "BE", "TIME", "OPEN"]
     exit_price: Optional[float]
     r_multiple: float
     exit_time: Optional[pd.Timestamp]

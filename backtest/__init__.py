@@ -17,6 +17,14 @@ from .lse_ingest import (
     import_lse_snapshot,
 )
 from .simulator import SetupOutcome, simulate_split_outcome
+from .strategy_runner import (
+    NarrativeBacktestConfig,
+    StrategyBacktestError,
+    StrategyBacktestResult,
+    infer_common_strategy_range,
+    run_narrative_backtest,
+    verify_release_manifest,
+)
 from .walkforward import WalkForwardFold, split_walk_forward
 
 __all__ = [
@@ -26,10 +34,16 @@ __all__ = [
     "LSEIngestError",
     "LSESymbolSpec",
     "LIVE_CLOSED_BAR_LIMIT",
+    "NarrativeBacktestConfig",
     "SetupOutcome",
+    "StrategyBacktestError",
+    "StrategyBacktestResult",
     "WalkForwardFold",
     "aggregate_setup_metrics",
+    "infer_common_strategy_range",
     "import_lse_snapshot",
+    "run_narrative_backtest",
     "simulate_split_outcome",
     "split_walk_forward",
+    "verify_release_manifest",
 ]
