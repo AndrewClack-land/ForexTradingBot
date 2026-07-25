@@ -672,7 +672,7 @@ sudo install -d -o forexbot-backtest -g forexbot-backtest -m 0700 "$runs"
 backtest_sandbox() {
   unit="$1"
   shift
-  sudo systemd-run --unit="$unit" --collect \
+  sudo systemd-run --unit="$unit" --collect --no-block \
     --property=Type=oneshot \
     --property=User=forexbot-backtest \
     --property=Group=forexbot-backtest \
