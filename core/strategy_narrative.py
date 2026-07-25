@@ -1165,7 +1165,7 @@ class NarrativeStrategy:
 
             # compat
             "tp_price": round(float(tp_prices[-1]), 6),
-            "tp_prices": [round(float(x), 6) for x in tp_prices],  # 4 TPs
+            "tp_prices": [round(float(x), 6) for x in tp_prices],  # 3 TPs
 
             "rr": rr_text,
             "weighted_rr_numeric": float(weighted_rr),

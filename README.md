@@ -1,5 +1,9 @@
 # ForexTradingBot
 
+AI-assisted maintenance must follow the persistent engineering contract in
+[`CLAUDE.md`](CLAUDE.md), especially for factor weights, fixed-capital risk,
+causal backtesting, attribution semantics, and VPS release discipline.
+
 Автономный торговый бот для MetaTrader 5 (FxPro): сам находит сетапы по SMC/ICT-логике,
 исполняет сделки с разбивкой на частичные тейки и публикует сигналы в Telegram-канал.
 Работает 24/5 на Linux VPS (терминал MT5 под Wine), торгует GOLD, EURUSD, GBPUSD, USDCAD.
@@ -72,7 +76,7 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
   сохраняет технический SL, рассчитывает риск-совместимую цену и ждёт её вместо
   открытия завышенного риска;
 - потолок объёма `MT5_MAX_VOLUME` — по умолчанию 10 лотов на сетап;
-- **4 тейк-профита** по уровням RR (1.0 / rr_min / 2.0 / 3.0);
+- **3 тейк-профита** по уровням RR (1.0 / 2.0 / 3.0);
 - **Split-TP** — каждая цель открывается отдельной позицией со своим брокерским TP,
   но все ноги делят единый 1%-й риск-бюджет; перед каждой отправкой проверяется
   оставшийся суммарный риск;
@@ -199,7 +203,7 @@ Checked in order; the first one that fires produces an ENTER signal:
   to `volume_step`; when `volume_min` temporarily exceeds budget, the bot keeps
   the technical SL, calculates a risk-compatible entry, and waits for that price;
 - volume is additionally capped by `MT5_MAX_VOLUME` (default 10 lots per setup);
-- **4 take-profits** at RR levels (1.0 / rr_min / 2.0 / 3.0);
+- **3 take-profits** at RR levels (1.0 / 2.0 / 3.0);
 - **Split-TP** — each target is opened as a separate position with its own broker-side TP,
   but all legs share one 1% risk budget and the remaining aggregate risk is
   checked before every order submission;
@@ -280,6 +284,7 @@ symlink is changed only after the venv and lock file are complete. Ignored or
 untracked `.env` files cannot enter this archive:
 
 ```bash
+set -euo pipefail
 release_commit="$(git rev-parse --verify HEAD)"
 release_root="/opt/forexbot-backtest/releases/$release_commit"
 release_stage="/opt/forexbot-backtest/releases/.stage-$release_commit-$$"
@@ -320,6 +325,7 @@ pinned; `installed.freeze.txt` records the complete resolved environment for
 the deployment and its SHA-256 is embedded in every strategy report:
 
 ```bash
+set -euo pipefail
 sudo python3.13 -m venv "$release_root/venv"
 sudo "$release_root/venv/bin/python" -m pip install \
   --only-binary=:all: \
@@ -330,6 +336,17 @@ sudo sh -c "\"$release_root/venv/bin/python\" -m pip freeze --all \
 sudo chmod 0444 "$release_root/installed.freeze.txt"
 sudo chown -R root:root "$release_root"
 sudo chmod -R go-w "$release_root"
+```
+
+Before publishing this candidate as `current`, run the short
+production-deterministic smoke described below with `release_root` set to this
+exact versioned candidate path. Do not let the helper resolve the old
+`current` symlink for this pre-switch smoke. Verify its release attestation,
+factor coverage, report manifest, and all expected report files. Only then
+switch the symlink atomically:
+
+```bash
+set -euo pipefail
 sudo ln -s "$release_root" /opt/forexbot-backtest/current.next
 sudo mv -Tf /opt/forexbot-backtest/current.next \
   /opt/forexbot-backtest/current
