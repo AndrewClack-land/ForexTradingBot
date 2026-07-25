@@ -18,12 +18,21 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `backtest/walkforward.py`, `backtest/simulator.py`
 - Conditional factor attribution: `backtest/attribution.py`
 - Leakage-aware shadow scoring: `backtest/optimizer.py`
+- Counterfactual all-M15 universe/OOS replay:
+  `backtest/counterfactual.py`
+- Train-only constrained replacement weights:
+  `backtest/weight_optimizer.py`
+- Sealed footprint sidecar validation: `backtest/orderflow_data.py`
+- Pure fail-closed Absorption detector: `core/absorption.py`
 - Historical snapshot ingest/audit: `backtest/lse_ingest.py`,
   `backtest/data.py`
 - Release manifest builder: `deploy/build_backtest_release_manifest.py`
 - Tests are part of the contract, especially:
   `tests/test_narrative_scoring.py`,
   `tests/test_backtest_optimizer.py`,
+  `tests/test_backtest_weight_optimizer.py`,
+  `tests/test_backtest_counterfactual.py`,
+  `tests/test_backtest_orderflow_data.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
@@ -65,6 +74,46 @@ Important distinctions:
   disabled by default in the backtest. The permissive fallback currently
   present in `config.py`/`core/strategy_narrative.py` is not authorization to
   enable it. Do not confuse the trigger with the active RB1H score factor.
+
+## Current entry-trigger contract
+
+Production trigger priority is:
+
+1. quarantined 15M Rejection Block, only if separately enabled;
+2. 15M footprint Absorption;
+3. H1 Pivot Reclaim on 15M;
+4. 1H Order Block touch.
+
+Turtle Soup is retired from the production call path. Do not add a re-enable
+flag, fallback call, or implicit compatibility path. The legacy pure detector
+may remain only for reproducing historical reports.
+
+Absorption defaults OFF and is fail-closed. The audited definition is:
+
+- LONG: `low_sell_volume >= 80`,
+  `low_sell_volume >= 2 * low_buy_volume`, and close strictly above the M15
+  midpoint;
+- SHORT: `high_buy_volume >= 80`,
+  `high_buy_volume >= 2 * high_sell_volume`, and close strictly below the M15
+  midpoint.
+
+The input must be a finalized, provenance-pinned 15M footprint with executed
+aggressor Buy/Sell volume at price. `backtest/orderflow_data.py` is the sealed
+sidecar contract. Schema v1 requires `revision=0`, a causal `available_at`,
+source, venue, polarity and a lowercase SHA-256 event checksum. Symbol mapping
+is one-to-one identity-only; cross-market proxy mappings are rejected. Never
+infer Buy/Sell delta, aggressor, or volume-at-price from LSE OHLCV, tick
+volume, or quote-only Bid/Ask changes. Missing, delayed, revised, unmapped,
+mixed-feed, or checksum-invalid order flow means `DATA_UNAVAILABLE`, not a
+bearish/bullish false result and never a proxy.
+
+The locally audited Quantower FxPro VolumeAnalysis database currently contains
+no rows. Its FxPro History database has quote ticks but no executed LAST tape,
+sizes, aggressor, or price-level volume. The available Bybit footprint cache is
+for different markets and cannot be mapped to EURUSD/GBPUSD/USDCAD. Therefore
+Absorption must remain OFF on the live VPS until a validated adapter exists.
+Do not copy the downloaded Quantower C# sources or XML layouts into Git: they
+have no repository license, and the XML files contain connection/user state.
 
 `build_factor_vector()` is the canonical arithmetic. A refactor must preserve
 the resulting bias, scores, margins, factor rows, and live narrative text.
@@ -232,7 +281,8 @@ Recommended sequence:
    targets while preserving aggregate fixed-capital risk.
 5. Use hierarchical/shrunk symbol, side, session, and volatility adjustments
    instead of independent small-sample models.
-6. Only then build a true counterfactual weight optimizer.
+6. Use the implemented counterfactual optimizer only as a frozen offline
+   challenger; do not copy its weights into live configuration.
 
 A valid replacement-weight optimizer requires a new v2 research population:
 
@@ -245,6 +295,64 @@ A valid replacement-weight optimizer requires a new v2 research population:
 - regularize toward the current `[2, 2, 1, 1, 1]` contract;
 - freeze the fitted model before replaying the next OOS interval;
 - compare against the untouched baseline with the same execution simulator.
+
+`python -m backtest optimize-v2` implements this v2 population in
+`backtest/counterfactual.py` and the constrained fit in
+`backtest/weight_optimizer.py`:
+
+- every completed M15 decision in the union of outer train/test windows gets a
+  stable decision event and frozen raw factor vector, including production
+  `NEUTRAL`;
+- each technically available detector is called separately for LONG and
+  SHORT, independently of production trigger switches; Turtle is absent from
+  the versioned trigger manifest;
+- every trigger family remains a separate opportunity even when two triggers
+  produce identical entry/stop/target geometry;
+- labels are generated independently of active-setup, cooldown, daily-limit,
+  duplicate-trigger, session, Friday and volatility gate state; operational
+  gate results are retained for audit and OOS replay but do not invalidate a
+  technically valid training label;
+- an operationally disabled trigger may contribute training labels but remains
+  `BLOCK_TRIGGER_DISABLED` in OOS replay unless explicitly enabled;
+- `FILLED` uses primary `stop-first` net R, `NO_FILL` is explicit 0R, and
+  `CENSORED`/`INVALID` never enter fitting;
+- train rows require both
+  `decision_time < train_end - (entry_ttl + max_holding)` and
+  `exit_time < train_end`;
+- fitted weights are deterministic, finite, constrained to `0 <= wi <= 3`,
+  sum to `7`, and are regularized toward `[2, 2, 1, 1, 1]`;
+- fit readiness is measured by unique `decision_event_id x side` clusters,
+  not raw correlated trigger rows; rows inside one cluster share one unit of
+  train weight and each model reports raw rows, cluster count and Kish ESS;
+- one immutable model is frozen per outer fold; OOS scoring uses no hard score
+  threshold, with fixed trigger priority for deterministic ties; a `NOT_FIT`
+  fold is audited but never falls back to the old weights for trading;
+- every pre-gate-eligible opportunity at one M15 decision is passed to replay
+  in frozen-score order; if a higher-ranked trigger is duplicate, invalid or
+  does not fill, replay may fall through to the next one, but stops after the
+  first filled alternative;
+- optimizer label metrics include an OOS result only when its exit was known
+  before that fold's `test_end`; chronological replay metrics are
+  authoritative;
+- replay carries pending entries and open positions across artificial fold
+  boundaries so its holding target matches training; Friday close, max
+  holding, stop/target or the final dataset boundary still closes exposure;
+- the replay uses the existing simulator and operational gates, and every
+  setup keeps fixed non-compounding risk
+  `initial_capital * risk_fraction <= 1%`.
+
+The v2 model optimizes the five direction-factor weights only. Trigger rows are
+preserved for attribution. Trigger-family coefficients are not fitted in this
+version; score orders alternatives and the fixed priority resolves equal-score
+ties.
+
+The v2 command produces `decision_events.csv`,
+`technical_opportunities.csv`, `opportunity_labels.csv`,
+`frozen_weight_models.json`, optimizer predictions/coefficients/metrics, OOS
+selections, and the chronological replay tables. All files must be covered by
+the report manifest. A run without a sealed order-flow sidecar must state
+Absorption `DATA_UNAVAILABLE`; it is a no-Turtle/remaining-trigger challenger,
+not evidence about Absorption.
 
 The existing `--train` interval does not fit replacement factor weights. It
 defines rolling history/OOS boundaries for the fixed baseline. The current
@@ -276,7 +384,9 @@ After code changes:
 
 ```bash
 python -m ruff check core/narrative_scoring.py \
-  backtest/attribution.py backtest/optimizer.py \
+  core/absorption.py backtest/attribution.py backtest/optimizer.py \
+  backtest/orderflow_data.py backtest/weight_optimizer.py \
+  backtest/counterfactual.py \
   backtest/strategy_runner.py
 python -m pytest -q -p no:cacheprovider --basetemp <fresh-temp-dir>
 git diff --check
@@ -289,6 +399,10 @@ Also verify:
 - future-outcome mutation cannot alter earlier models/scores;
 - input row permutation cannot alter model IDs or report hashes;
 - shadow scoring does not mutate executions or risk;
+- counterfactual generation calls both sides and every enabled trigger without
+  consulting the production bias;
+- OOS outcome mutation cannot alter frozen v2 weights;
+- no counterfactual setup exceeds 1% of fixed starting capital;
 - empty and non-empty CSV headers are identical.
 
 ## Git and VPS release discipline

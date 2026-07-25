@@ -1652,9 +1652,20 @@ class Core:
         """Stable identity of a setup: side + trigger kind + its zone (or stop
         level for zoneless triggers). The same zone/stop is traded at most once
         per day — a still-valid M15 trigger cannot re-enter after a stop-out."""
-        trig_kind = str(sig.get("trigger_reason") or "").split("|")[0].strip().split(" ")[0]
+        trig_kind = str(sig.get("trigger_kind") or "").strip().lower()
+        if not trig_kind:
+            trig_kind = (
+                str(sig.get("trigger_reason") or "")
+                .split("|")[0]
+                .strip()
+                .split(" ")[0]
+                .lower()
+            )
+        event_id = str(sig.get("trigger_event_id") or "").strip()
         zl, zh = sig.get("zone_low"), sig.get("zone_high")
-        if zl is not None and zh is not None:
+        if event_id:
+            anchor = f"e{event_id}"
+        elif zl is not None and zh is not None:
             anchor = f"z{float(zl):.5f}-{float(zh):.5f}"
         else:
             anchor = f"s{float(sig.get('stop_price') or 0.0):.5f}"

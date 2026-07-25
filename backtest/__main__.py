@@ -228,6 +228,112 @@ def _build_parser() -> argparse.ArgumentParser:
         help="print the final summary as JSON; progress goes to stderr",
     )
 
+    optimize_v2 = subparsers.add_parser(
+        "optimize-v2",
+        help=(
+            "regenerate all M15 LONG/SHORT trigger opportunities, fit "
+            "train-only factor weights, and replay frozen OOS folds"
+        ),
+    )
+    optimize_v2.add_argument("--data", required=True)
+    optimize_v2.add_argument("--symbols", nargs="+", required=True)
+    optimize_v2.add_argument("--start")
+    optimize_v2.add_argument("--end")
+    optimize_v2.add_argument(
+        "--initial-capital",
+        type=float,
+        required=True,
+    )
+    optimize_v2.add_argument(
+        "--risk-fraction",
+        type=float,
+        default=0.01,
+    )
+    optimize_v2.add_argument("--output", required=True)
+    optimize_v2.add_argument(
+        "--profile",
+        choices=("signal-quality", "production-deterministic"),
+        default="production-deterministic",
+    )
+    optimize_v2.add_argument(
+        "--intrabar-policy",
+        choices=("stop-first", "both"),
+        default="stop-first",
+    )
+    optimize_v2.add_argument("--entry-ttl", default="15min")
+    optimize_v2.add_argument("--max-holding", default="30D")
+    optimize_v2.add_argument("--train", required=True)
+    optimize_v2.add_argument("--test", required=True)
+    optimize_v2.add_argument("--step")
+    optimize_v2.add_argument("--history-limit", type=int, default=299)
+    optimize_v2.add_argument(
+        "--min-context-bars",
+        type=int,
+        default=299,
+    )
+    optimize_v2.add_argument("--min-daily-bars", type=int, default=22)
+    optimize_v2.add_argument(
+        "--sessions",
+        nargs="*",
+        default=["LONDON", "NY"],
+    )
+    optimize_v2.add_argument("--session-timezone", default="UTC")
+    optimize_v2.add_argument(
+        "--disable-vol-filter",
+        action="store_true",
+    )
+    optimize_v2.add_argument("--vol-max-r", type=float, default=60.0)
+    optimize_v2.add_argument("--em-tp-ratio", type=float, default=1.0)
+    optimize_v2.add_argument(
+        "--max-setups-per-symbol-day",
+        type=int,
+        default=3,
+    )
+    optimize_v2.add_argument("--post-loss-cooldown", default="60min")
+    optimize_v2.add_argument(
+        "--enable-rejection-block-entry",
+        action="store_true",
+    )
+    optimize_v2.add_argument(
+        "--disable-orderblock-entry",
+        action="store_true",
+    )
+    optimize_v2.add_argument(
+        "--orderblock-max-age-bars",
+        type=int,
+        default=80,
+    )
+    optimize_v2.add_argument(
+        "--htf-score-margin",
+        type=int,
+        default=2,
+    )
+    optimize_v2.add_argument(
+        "--orderflow-data",
+        help=(
+            "optional sealed AbsorptionEventDataset directory; when omitted "
+            "Absorption remains DATA_UNAVAILABLE and no OHLCV proxy is used"
+        ),
+    )
+    optimize_v2.add_argument(
+        "--ridge-alpha",
+        type=float,
+        default=1.0,
+    )
+    optimize_v2.add_argument(
+        "--min-train-opportunities",
+        type=int,
+        default=400,
+        help=(
+            "minimum unique decision_event_id x side train clusters "
+            "required to fit a fold (default: 400)"
+        ),
+    )
+    optimize_v2.add_argument("--release-commit-file")
+    optimize_v2.add_argument("--release-manifest-file")
+    optimize_v2.add_argument("--environment-lock-file")
+    optimize_v2.add_argument("--json", action="store_true")
+
     lse_import = subparsers.add_parser(
         "lse-import",
         help="download LSE M1 candles into a new immutable Parquet snapshot",
@@ -595,6 +701,163 @@ def _strategy_run(args: argparse.Namespace) -> int:
     return 0
 
 
+def _counterfactual_run(args: argparse.Namespace) -> int:
+    """Run the all-M15 replacement-weight optimizer in an isolated release."""
+
+    from .counterfactual import run_counterfactual_backtest
+    from .orderflow_data import AbsorptionEventDataset
+
+    release_commit = _read_release_commit(args.release_commit_file)
+    attestation_fields = (
+        release_commit is not None,
+        bool(args.release_manifest_file),
+        bool(args.environment_lock_file),
+    )
+    if any(attestation_fields) and not all(attestation_fields):
+        raise StrategyBacktestError(
+            "release commit, release manifest, and environment lock "
+            "must be provided together"
+        )
+    if args.profile == "production-deterministic" and (
+        release_commit is None
+        or not args.release_manifest_file
+        or not args.environment_lock_file
+    ):
+        raise StrategyBacktestError(
+            "production-deterministic profile requires "
+            "--release-commit-file, --release-manifest-file, and "
+            "--environment-lock-file"
+        )
+    release_manifest_sha256 = None
+    if args.release_manifest_file:
+        if release_commit is None:
+            raise StrategyBacktestError(
+                "--release-manifest-file requires --release-commit-file"
+            )
+        release_manifest_sha256 = verify_release_manifest(
+            args.release_manifest_file,
+            expected_commit=release_commit,
+        )
+    environment_lock_sha256 = _hash_environment_lock(
+        args.environment_lock_file
+    )
+    dataset = HistoricalDataset.load(Path(args.data))
+    symbols = tuple(str(symbol).upper() for symbol in args.symbols)
+    common_start, common_end = infer_common_strategy_range(
+        dataset,
+        symbols,
+    )
+    config = NarrativeBacktestConfig.build(
+        symbols=symbols,
+        start=args.start or common_start,
+        end=args.end or common_end,
+        initial_capital=args.initial_capital,
+        risk_fraction=args.risk_fraction,
+        history_limit=args.history_limit,
+        min_context_bars=args.min_context_bars,
+        min_daily_bars=args.min_daily_bars,
+        entry_ttl=args.entry_ttl,
+        max_holding=args.max_holding,
+        intrabar_policy=args.intrabar_policy,
+        profile=args.profile,
+        train=args.train,
+        test=args.test,
+        step=args.step,
+        session_timezone=args.session_timezone,
+        allowed_sessions=args.sessions,
+        vol_filter_enabled=not args.disable_vol_filter,
+        vol_max_r=args.vol_max_r,
+        em_tp_ratio=args.em_tp_ratio,
+        max_setups_per_symbol_day=args.max_setups_per_symbol_day,
+        post_loss_cooldown=args.post_loss_cooldown,
+        rejection_block_entry_enabled=(
+            args.enable_rejection_block_entry
+        ),
+        orderblock_entry_enabled=not args.disable_orderblock_entry,
+        orderblock_max_age_bars=args.orderblock_max_age_bars,
+        htf_score_margin=args.htf_score_margin,
+        release_commit=release_commit,
+        release_manifest_sha256=release_manifest_sha256,
+        environment_lock_sha256=environment_lock_sha256,
+    )
+    orderflow = (
+        AbsorptionEventDataset.load(Path(args.orderflow_data))
+        if args.orderflow_data
+        else None
+    )
+    progress_stream = sys.stderr if args.json else sys.stdout
+
+    def print_progress(event: Mapping[str, Any]) -> None:
+        fields = [
+            f"phase={event['phase']}",
+            f"state={event['state']}",
+        ]
+        for name in (
+            "symbol",
+            "policy",
+            "completed",
+            "decisions",
+            "candidates",
+            "setups",
+            "percent",
+        ):
+            if name in event:
+                fields.append(f"{name}={event[name]}")
+        print(
+            "Optimizer v2 progress: " + " ".join(fields),
+            file=progress_stream,
+            flush=True,
+        )
+
+    result = run_counterfactual_backtest(
+        dataset,
+        config,
+        orderflow=orderflow,
+        ridge_alpha=args.ridge_alpha,
+        min_train_opportunities=args.min_train_opportunities,
+        progress=print_progress,
+    )
+    report = result.write(args.output)
+    payload = {
+        **dict(result.summary),
+        "report": str(report),
+    }
+    if args.json:
+        print(
+            json.dumps(
+                payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                indent=2,
+                allow_nan=False,
+            )
+        )
+        return 0
+
+    metrics = result.summary["oos_primary_metrics"]
+    profit_factor = metrics.get("profit_factor")
+    pf_text = (
+        "n/a" if profit_factor is None else f"{profit_factor:.3f}"
+    )
+    print(f"Optimizer v2 report: {report}")
+    print(
+        "  stop-first OOS: "
+        f"setups={metrics['setups_closed']}/{metrics['setups_total']} "
+        f"net={metrics['net_r']:.3f}R "
+        f"expectancy={metrics['expectancy_r']:.3f}R "
+        f"PF={pf_text} maxDD={metrics['max_drawdown_r']:.3f}R"
+    )
+    print(
+        "  Absorption sidecar: "
+        + (
+            "sealed and loaded"
+            if orderflow is not None
+            else "DATA_UNAVAILABLE (no OHLCV proxy)"
+        )
+    )
+    return 0
+
+
 def _lse_import(args: argparse.Namespace) -> int:
     progress_stream = sys.stderr if args.json else sys.stdout
 
@@ -683,6 +946,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             return _verify(args)
         if args.command == "run":
             return _strategy_run(args)
+        if args.command == "optimize-v2":
+            return _counterfactual_run(args)
         if args.command == "lse-import":
             return _lse_import(args)
     except (

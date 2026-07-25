@@ -25,6 +25,7 @@ DEFAULT_RIDGE_ALPHA = 25.0
 DEFAULT_MIN_TRAIN_SETUPS = 400
 _TRIGGERS = (
     "h1_pivot_reclaim_15m",
+    "absorption_15m",
     "order_block_1h",
     "rejection_block_15m",
     "turtle_soup_15m",

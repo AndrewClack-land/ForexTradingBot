@@ -78,14 +78,18 @@ _REQUIRED_RELEASE_FILES = {
     "backtest/__init__.py",
     "backtest/__main__.py",
     "backtest/attribution.py",
+    "backtest/counterfactual.py",
     "backtest/data.py",
     "backtest/lse_ingest.py",
     "backtest/metrics.py",
     "backtest/optimizer.py",
+    "backtest/orderflow_data.py",
     "backtest/simulator.py",
     "backtest/strategy_runner.py",
     "backtest/walkforward.py",
+    "backtest/weight_optimizer.py",
     "core/__init__.py",
+    "core/absorption.py",
     "core/htf_context.py",
     "core/narrative_scoring.py",
     "core/pivot_trigger.py",
@@ -1084,6 +1088,7 @@ def _default_strategy_factory() -> Any:
             shim = types.ModuleType("config")
             shim.ORDERBLOCK_ENTRY_ENABLED = True
             shim.REJECTION_BLOCK_ENTRY_ENABLED = False
+            shim.ABSORPTION_15M_ENTRY_ENABLED = False
             shim.ORDERBLOCK_TOUCH_ATR_K = 0.15
             shim.ORDERBLOCK_TOUCH_MIN_ABS = 0.0005
             shim.ORDERBLOCK_MAX_AGE_BARS = 80
@@ -1345,15 +1350,21 @@ def _apply_deterministic_gates(
 
 
 def _trigger_signature(signal: Mapping[str, Any]) -> str:
-    trigger = (
-        str(signal.get("trigger_reason") or "")
-        .split("|")[0]
-        .strip()
-        .split(" ")[0]
-    )
+    trigger = str(signal.get("trigger_kind") or "").strip().lower()
+    if not trigger:
+        trigger = (
+            str(signal.get("trigger_reason") or "")
+            .split("|")[0]
+            .strip()
+            .split(" ")[0]
+            .lower()
+        )
+    event_id = str(signal.get("trigger_event_id") or "").strip()
     zone_low = signal.get("zone_low")
     zone_high = signal.get("zone_high")
-    if zone_low is not None and zone_high is not None:
+    if event_id:
+        anchor = f"e{event_id}"
+    elif zone_low is not None and zone_high is not None:
         anchor = f"z{float(zone_low):.5f}-{float(zone_high):.5f}"
     else:
         anchor = f"s{float(signal.get('stop_price') or 0.0):.5f}"
@@ -1529,9 +1540,20 @@ def _validate_factor_vector(
 
 
 def _trigger_kind(signal: Mapping[str, Any]) -> str:
+    structured = str(signal.get("trigger_kind") or "").strip().lower()
+    if structured in {
+        "rejection_block_15m",
+        "absorption_15m",
+        "h1_pivot_reclaim_15m",
+        "order_block_1h",
+        "turtle_soup_15m",
+    }:
+        return structured
     reason = str(signal.get("trigger_reason") or "").strip().lower()
     if reason.startswith("rejectionblock 15m"):
         return "rejection_block_15m"
+    if reason.startswith("absorption 15m"):
+        return "absorption_15m"
     if reason.startswith("turtlesoup 15m"):
         return "turtle_soup_15m"
     if reason.startswith(("h1 pivothigh reclaim", "h1 pivotlow reclaim")):
@@ -1849,6 +1871,7 @@ def _execute_candidates(
     config: NarrativeBacktestConfig,
     policy: str,
     progress: Optional[ProgressCallback],
+    carry_positions_across_folds: bool = False,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1888,6 +1911,7 @@ def _execute_candidates(
     current_day: Any = None
     entries_today = 0
     trigger_signatures: set[str] = set()
+    filled_ranked_decisions: set[tuple[int, pd.Timestamp]] = set()
     production_gates = config.profile == "production-deterministic"
     for period in periods:
         for candidate in sorted(
@@ -1910,6 +1934,28 @@ def _execute_candidates(
                 )
                 next_progress = min(100, percent + 1)
             decision_time = candidate.decision_time
+            ranked_decision = (
+                (candidate.fold_index, decision_time)
+                if candidate.signal.get("optimizer_rank") is not None
+                else None
+            )
+            if (
+                ranked_decision is not None
+                and ranked_decision in filled_ranked_decisions
+            ):
+                counters["blocked_lower_ranked_alternative"] += 1
+                executions.append(
+                    _execution_row(
+                        candidate=candidate,
+                        policy=policy,
+                        disposition="BLOCK_ALTERNATIVE",
+                        reason=(
+                            "a higher-ranked opportunity from this M15 "
+                            "decision already filled"
+                        ),
+                    )
+                )
+                continue
             day = decision_time.date()
             if day != current_day:
                 current_day = day
@@ -1988,7 +2034,12 @@ def _execute_candidates(
                 )
                 continue
 
-            fill_end = period.test_end
+            replay_end = (
+                config.end
+                if carry_positions_across_folds
+                else period.test_end
+            )
+            fill_end = replay_end
             if production_gates:
                 fill_end = min(
                     fill_end,
@@ -2020,7 +2071,7 @@ def _execute_candidates(
                 continue
 
             horizon_end = min(
-                period.test_end,
+                replay_end,
                 entry_time + config.max_holding,
             )
             friday_cutoff: Optional[pd.Timestamp] = None
@@ -2069,9 +2120,13 @@ def _execute_candidates(
                 if friday_cutoff is not None:
                     force_cutoff = friday_cutoff
                     forced_exit_reason = "FRIDAY_CLOSE"
-                elif simulation_end == period.test_end:
-                    force_cutoff = period.test_end
-                    forced_exit_reason = "FOLD_END"
+                elif simulation_end == replay_end:
+                    force_cutoff = replay_end
+                    forced_exit_reason = (
+                        "DATASET_END"
+                        if carry_positions_across_folds
+                        else "FOLD_END"
+                    )
                 else:
                     force_cutoff = simulation_end
                     forced_exit_reason = "MAX_HOLDING"
@@ -2129,6 +2184,8 @@ def _execute_candidates(
             )
             counters["setups_filled"] += 1
             counters[f"setups_{outcome.status.lower()}"] += 1
+            if ranked_decision is not None:
+                filled_ranked_decisions.add(ranked_decision)
             if production_gates:
                 entries_today += 1
                 trigger_signatures.add(signature)
@@ -2136,10 +2193,10 @@ def _execute_candidates(
             if not production_gates:
                 continue
             if outcome.exit_time is None:
-                active_until = period.test_end
+                active_until = replay_end
             else:
                 exit_bar_close = outcome.exit_time + pd.Timedelta(minutes=1)
-                active_until = min(exit_bar_close, period.test_end)
+                active_until = min(exit_bar_close, replay_end)
                 active_setup_id = setup_id
                 if any(
                     leg.exit_reason == "STOP"

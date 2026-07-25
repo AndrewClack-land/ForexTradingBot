@@ -12,7 +12,7 @@ def _frames():
     return {"D": frame, "4H": frame, "1H": frame, "15M": frame}
 
 
-def test_rejection_block_quarantine_falls_through_to_next_trigger():
+def test_rejection_block_quarantine_falls_through_to_absorption():
     strategy = NarrativeStrategy()
     strategy._last_htf_context = None
     strategy.calc_narrative = lambda *args, **kwargs: ("LONG", "test bias")
@@ -20,13 +20,17 @@ def test_rejection_block_quarantine_falls_through_to_next_trigger():
     strategy.trigger_15m_rejection_block = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("quarantined trigger must not run")
     )
-    strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: CandidateEntry(
+    strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("retired Turtle Soup must not run")
+    )
+    strategy.trigger_15m_absorption = lambda *args, **kwargs: CandidateEntry(
         side="LONG",
         entry_price=1.0,
         entry_min=0.999,
         entry_max=1.001,
         tf="15M",
-        reason="TurtleSoup test",
+        reason="Absorption 15M test",
+        trigger_kind="absorption_15m",
         lock_entry_range=True,
     )
     strategy.calc_stop_and_tps = lambda *args, **kwargs: (0.99, [1.01, 1.02, 1.03])
@@ -35,7 +39,8 @@ def test_rejection_block_quarantine_falls_through_to_next_trigger():
     signal = strategy.generate_signal(_frames(), symbol="EURUSD")
 
     assert signal["signal"] == "ENTER"
-    assert signal["trigger_reason"] == "TurtleSoup test"
+    assert signal["trigger_reason"] == "Absorption 15M test"
+    assert signal["trigger_kind"] == "absorption_15m"
 
 
 def test_enabled_rejection_block_keeps_trigger_priority():
@@ -53,6 +58,9 @@ def test_enabled_rejection_block_keeps_trigger_priority():
         lock_entry_range=True,
     )
     strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("retired Turtle Soup must not run")
+    )
+    strategy.trigger_15m_absorption = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("RB must keep priority when enabled")
     )
     strategy.calc_stop_and_tps = lambda *args, **kwargs: (0.99, [1.01, 1.02, 1.03])
@@ -61,3 +69,35 @@ def test_enabled_rejection_block_keeps_trigger_priority():
     signal = strategy.generate_signal(_frames(), symbol="EURUSD")
 
     assert signal["trigger_reason"] == "RejectionBlock test"
+
+
+def test_absorption_miss_falls_through_to_pivot_without_turtle():
+    strategy = NarrativeStrategy()
+    strategy._last_htf_context = None
+    strategy.calc_narrative = lambda *args, **kwargs: ("LONG", "test bias")
+    strategy.calc_fvg_regime_1h = lambda *args, **kwargs: ("LONG", "fvg")
+    strategy.trigger_15m_rejection_block = lambda *args, **kwargs: None
+    strategy.trigger_15m_absorption = lambda *args, **kwargs: None
+    strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("retired Turtle Soup must not run")
+    )
+    strategy.trigger_h1_pivot_reclaim_on_15m = (
+        lambda *args, **kwargs: CandidateEntry(
+            side="LONG",
+            entry_price=1.0,
+            entry_min=0.999,
+            entry_max=1.001,
+            tf="15M",
+            reason="H1 PivotLow reclaim test",
+            lock_entry_range=True,
+        )
+    )
+    strategy.calc_stop_and_tps = lambda *args, **kwargs: (
+        0.99,
+        [1.01, 1.02, 1.03],
+    )
+
+    signal = strategy.generate_signal(_frames(), symbol="EURUSD")
+
+    assert signal["signal"] == "ENTER"
+    assert signal["trigger_reason"] == "H1 PivotLow reclaim test"

@@ -112,8 +112,17 @@ SYMBOL_DECIMALS = {
 # ================== ORDERBLOCK SETTINGS ==================
 ORDERBLOCK_ENTRY_ENABLED = os.getenv("ORDERBLOCK_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
 REJECTION_BLOCK_ENTRY_ENABLED = os.getenv(
-    "REJECTION_BLOCK_ENTRY_ENABLED", "1"
+    "REJECTION_BLOCK_ENTRY_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
+ABSORPTION_15M_ENTRY_ENABLED = os.getenv(
+    "ABSORPTION_15M_ENTRY_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+ABSORPTION_MIN_IMBALANCE_RATIO = _env_float(
+    "ABSORPTION_MIN_IMBALANCE_RATIO", 2.0
+)
+ABSORPTION_MIN_EDGE_VOLUME = _env_float(
+    "ABSORPTION_MIN_EDGE_VOLUME", 80.0
+)
 ORDERBLOCK_TOUCH_ATR_K = _env_float("ORDERBLOCK_TOUCH_ATR_K", 0.15)
 ORDERBLOCK_TOUCH_MIN_ABS = _env_float("ORDERBLOCK_TOUCH_MIN_ABS", 0.0005)
 ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80

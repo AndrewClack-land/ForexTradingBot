@@ -12,7 +12,7 @@ causal backtesting, attribution semantics, and VPS release discipline.
 
 - **Python 3.11** + официальный пакет **MetaTrader5** — котировки и исполнение напрямую через терминал;
 - **Smart Money Concepts / ICT**: premium/discount, ордерблоки, rejection-блоки,
-  FVG, liquidity sweep (turtle soup), фракталы Вильямса;
+  FVG, проверенный footprint absorption, фракталы Вильямса;
 - **python-telegram-bot** — сигналы и команды (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — журнал сделок и статистика для AI-фильтра;
 - сигналы считаются **только по закрытым свечам** (без перерисовки).
@@ -56,9 +56,16 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 Проверяются по очереди, первый сработавший даёт сигнал ENTER:
 
 1. **15M Rejection Block** — отклонение от блока с длинной тенью по направлению bias;
-2. **15M Turtle Soup** — ложный пробой локального экстремума (liquidity sweep) с возвратом;
+2. **15M Absorption** — поглощение агрессивного объёма на краю footprint закрытой
+   15M-свечи; работает только с проверенным Bid/Ask volume-at-price;
 3. **H1 Pivot Reclaim на 15M** — возврат цены за пивот-уровень 1H;
 4. **Касание ордерблока 1H** — вход от валидного OB (порог касания в долях ATR).
+
+Turtle Soup удалён из production-цепочки без флага обратного включения.
+Absorption по умолчанию выключен и fail-closed: LSE OHLCV или котировочные
+Bid/Ask ticks не преобразуются в псевдо-order-flow. Для включения нужен
+финализированный и запечатанный 15M footprint sidecar с executed Buy/Sell
+volume-at-price и однозначным mapping рынка.
 
 ## Риск и сопровождение
 
@@ -140,7 +147,7 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 - **Python 3.11** + the official **MetaTrader5** package — quotes and execution directly through the terminal;
 - **Smart Money Concepts / ICT**: premium/discount, order blocks, rejection blocks,
-  FVG, liquidity sweeps (turtle soup), Williams fractals;
+  FVG, verified footprint absorption, Williams fractals;
 - **python-telegram-bot** — signals and commands (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — trade journal and statistics for the AI filter;
 - signals are computed on **closed candles only** (no repainting).
@@ -184,9 +191,18 @@ votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 Checked in order; the first one that fires produces an ENTER signal:
 
 1. **15M Rejection Block** — rejection from a block with a long wick in the bias direction;
-2. **15M Turtle Soup** — false break of a local extreme (liquidity sweep) with reclaim;
+2. **15M Absorption** — aggressive flow absorbed at the edge of a closed M15
+   footprint; requires verified Bid/Ask volume-at-price;
 3. **H1 Pivot Reclaim on 15M** — price reclaiming an H1 pivot level;
 4. **1H Order Block touch** — entry off a valid OB (touch threshold in ATR fractions).
+
+Turtle Soup is retired from the production path with no re-enable switch.
+Absorption defaults OFF and fails closed: LSE OHLCV and quote-only Bid/Ask
+ticks are never converted into fake order flow. Activation requires a
+finalized, sealed M15 footprint sidecar with executed Buy/Sell volume-at-price
+and strict one-to-one identity mapping for the same market. Schema v1 accepts
+only unrevised `revision=0` events whose `available_at` timestamp was known at
+the M15 decision.
 
 ### Risk & trade management
 
@@ -296,7 +312,7 @@ sudo install -d -o root -g root -m 0755 "$release_stage/app"
 git archive --format=tar "$release_commit" \
   backtest \
   core/__init__.py \
-  core/strategy_narrative.py core/htf_context.py \
+  core/strategy_narrative.py core/absorption.py core/htf_context.py \
   core/narrative_scoring.py core/pivot_trigger.py core/vol_regime.py \
   deploy/build_backtest_release_manifest.py \
   requirements-backtest.txt | \
@@ -761,11 +777,10 @@ backtest_sandbox forexbot-backtest-smoke-eurusd \
 sudo journalctl -fu forexbot-backtest-smoke-eurusd.service
 ```
 
-For a disconnect-safe full run, start a transient systemd service with no
-network and no LSE/live-bot environment. The fixed current strategy has no
-parameter optimizer yet: the two-year train interval supplies the rolling
-walk-forward boundary and historical context; metrics are reported only for
-the following non-overlapping six-month OOS intervals.
+For a disconnect-safe fixed-strategy baseline, start a transient systemd
+service with no network and no LSE/live-bot environment. In this command the
+two-year train interval supplies only the rolling walk-forward boundary and
+historical context; the fixed production weights are not fitted.
 
 ```bash
 backtest_sandbox forexbot-backtest-run-fx-v1 \
@@ -783,6 +798,40 @@ backtest_sandbox forexbot-backtest-run-fx-v1 \
   --output "$runs/fx-wfo-v1"
 sudo journalctl -fu forexbot-backtest-run-fx-v1.service
 ```
+
+The separate v2 command creates the unbiased research population required for
+replacement-weight fitting. It freezes the five factor votes at every closed
+M15 decision, invokes every technically available trigger independently for
+LONG and SHORT regardless of live trigger switches, labels each technical
+opportunity before stateful execution gates, fits only on mature train labels
+after the purge, freezes the constrained non-negative weights, and replays the
+next OOS fold without a score threshold. An operationally disabled trigger is
+still labelled but remains blocked in replay unless explicitly enabled:
+
+```bash
+backtest_sandbox forexbot-backtest-optimize-v2-fx \
+  "$release_root/venv/bin/python" -m backtest optimize-v2 \
+  --data "$snapshot" \
+  --symbols EURUSD GBPUSD USDCAD \
+  --initial-capital REPLACE_WITH_STARTING_CAPITAL \
+  --risk-fraction 0.01 \
+  --profile production-deterministic \
+  --train 730D --test 180D --step 180D \
+  --intrabar-policy stop-first \
+  --ridge-alpha 1.0 \
+  --min-train-opportunities 400 \
+  --release-commit-file "$release_root/RELEASE_COMMIT" \
+  --release-manifest-file "$release_root/RELEASE_MANIFEST.json" \
+  --environment-lock-file "$release_root/installed.freeze.txt" \
+  --output "$runs/fx-optimize-v2"
+sudo journalctl -fu forexbot-backtest-optimize-v2-fx.service
+```
+
+Add `--orderflow-data /path/to/sealed-orderflow` only when the directory has
+passed `AbsorptionEventDataset` validation. Without it, the run remains valid
+for the other triggers but records Absorption as `DATA_UNAVAILABLE`; it never
+manufactures an OHLCV proxy. Sidecar mapping is one-to-one identity-only;
+cross-market mappings such as crypto footprint into FX are rejected.
 
 The report is atomically published and contains `summary.json`,
 `candidates.csv`, one auditable candidate/policy decision in `executions.csv`,
@@ -808,12 +857,30 @@ describe prior OOS raw `ENTER` signals that also survived execution gates and
 filled; they are not unbiased replacement weights or a fill-probability
 model.
 
-A real replacement-weight optimizer needs a separate v2 research pass. That
-pass must freeze factor vectors on every completed M15 decision, generate
-technical LONG and SHORT opportunities independently of the baseline bias,
-fit weights only inside each train interval, freeze the model, and replay the
-following OOS interval. Without that counterfactual population, directly
-optimizing the five weights would inherit selection bias from the old weights.
+`python -m backtest optimize-v2` is that separate counterfactual pass. Its
+report contains `decision_events.csv`, `technical_opportunities.csv`,
+`opportunity_labels.csv`, `frozen_weight_models.json`,
+`optimizer_predictions.csv`, `optimizer_coefficients.csv`,
+`optimizer_metrics.csv`, `oos_selections.csv`, and the replay
+`executions/setups/legs/folds` tables. `NO_FILL` is an explicit 0R opportunity;
+invalid or censored outcomes do not enter fitting. Weight constraints are
+`0 ≤ wi ≤ 3`, `sum(w)=7`, regularized toward `[2,2,1,1,1]`. Each model is
+frozen before its OOS interval, and the optimizer cannot change the fixed
+starting-capital risk budget of at most 1% per setup.
+
+Identical geometry from different trigger families remains separate.
+Correlated rows from one `decision_event_id x side` share one unit of train
+weight, and the minimum train sample is counted in these independent clusters
+rather than raw trigger rows. `NOT_FIT` folds are reported and skipped without
+falling back to the old weights. OOS label-quality metrics exclude exits after
+that fold's `test_end`; chronological execution replay is authoritative.
+Replay tries pre-gate-eligible alternatives in frozen-score order, falls
+through after a duplicate/invalid/no-fill trigger, and stops after the first
+fill for that M15 decision. Pending entries and positions carry across
+artificial fold boundaries; Friday close, max holding, stop/target or final
+dataset end still closes them. This v2 fits direction-factor weights only;
+trigger-family coefficients are not fitted, and fixed trigger priority resolves
+equal-score ties.
 
 The report is a gross strategy diagnostic, not a broker-accurate PnL
 statement. LSE OHLCV does not contain historical Bid/Ask spread, FxPro

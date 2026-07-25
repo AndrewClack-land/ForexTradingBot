@@ -8,6 +8,10 @@ import time
 import numpy as np
 import pandas as pd
 
+from core.absorption import (
+    AbsorptionThresholds,
+    detect_footprint_absorption,
+)
 from core.htf_context import HtfContext
 from core.narrative_scoring import build_factor_vector
 from core.pivot_trigger import mark_pivots
@@ -19,7 +23,16 @@ except Exception:
 
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
 REJECTION_BLOCK_ENTRY_ENABLED = bool(
-    getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", True)
+    getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", False)
+)
+ABSORPTION_15M_ENTRY_ENABLED = bool(
+    getattr(_cfg, "ABSORPTION_15M_ENTRY_ENABLED", False)
+)
+ABSORPTION_MIN_IMBALANCE_RATIO = float(
+    getattr(_cfg, "ABSORPTION_MIN_IMBALANCE_RATIO", 2.0)
+)
+ABSORPTION_MIN_EDGE_VOLUME = float(
+    getattr(_cfg, "ABSORPTION_MIN_EDGE_VOLUME", 80.0)
 )
 ORDERBLOCK_TOUCH_ATR_K = float(getattr(_cfg, "ORDERBLOCK_TOUCH_ATR_K", 0.15))
 ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.0005))
@@ -83,6 +96,9 @@ class CandidateEntry:
     used_m1: bool = False
     stop_override: Optional[float] = None
     lock_entry_range: bool = False
+    trigger_kind: Optional[str] = None
+    trigger_event_id: Optional[str] = None
+    trigger_meta: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -162,7 +178,7 @@ class NarrativeStrategy:
          breakouts, 1H Order/Rejection Blocks
       2) Bias strictness: 1H FVG regime
       3) SETUP: 15M Rejection Block
-      4) FALLBACK: 15M Turtle Soup
+      4) FALLBACK: 15M footprint Absorption
       5) FALLBACK2: H1 Pivots levels + 15M reclaim
       6) ENTRY DELIVERY: send ENTRY RANGE
          - всё локализуется вокруг последнего 15M close
@@ -175,6 +191,16 @@ class NarrativeStrategy:
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
         self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
+        self.absorption_15m_entry_enabled = ABSORPTION_15M_ENTRY_ENABLED
+        self._absorption_thresholds: Optional[AbsorptionThresholds] = None
+        try:
+            self._absorption_thresholds = AbsorptionThresholds(
+                min_imbalance_ratio=ABSORPTION_MIN_IMBALANCE_RATIO,
+                min_edge_volume=ABSORPTION_MIN_EDGE_VOLUME,
+            )
+        except (TypeError, ValueError):
+            # Invalid runtime calibration disables only this optional trigger.
+            self.absorption_15m_entry_enabled = False
 
         # 3 TPs at clean R-multiples. TP1 = 1R keeps the break-even trigger
         # consistently reachable (the old fixed-% TP1 override made it swing
@@ -717,7 +743,62 @@ class NarrativeStrategy:
 
         return None
 
-    # ================== 15M Turtle Soup Trigger ==================
+    # ================== 15M Footprint Absorption Trigger ==================
+
+    def trigger_15m_absorption(
+        self,
+        df_15M: pd.DataFrame,
+        side: Side,
+        event: Optional[Any],
+        *,
+        symbol: str,
+    ) -> Optional[CandidateEntry]:
+        if (
+            not self.absorption_15m_entry_enabled
+            or self._absorption_thresholds is None
+            or side not in {"LONG", "SHORT"}
+            or event is None
+            or df_15M is None
+            or df_15M.empty
+        ):
+            return None
+
+        try:
+            candle_open_time = pd.Timestamp(df_15M.index[-1])
+            decision_time = candle_open_time + pd.Timedelta(minutes=15)
+            footprint = detect_footprint_absorption(
+                candle=df_15M.iloc[-1].to_dict(),
+                candle_open_time=candle_open_time,
+                event=event,
+                symbol=symbol,
+                side=side,
+                decision_time=decision_time,
+                thresholds=self._absorption_thresholds,
+            )
+        except Exception:
+            # Optional external order flow must never break the base strategy.
+            return None
+        if footprint is None:
+            return None
+
+        close = float(df_15M["close"].iloc[-1])
+        meta = footprint.to_dict()
+        return CandidateEntry(
+            side=side,
+            entry_price=close,
+            tf="15M",
+            reason=(
+                f"Absorption 15M {side} footprint"
+                f" | imbalance={footprint.imbalance_ratio:.3f}"
+                f" rejection={footprint.rejection_fraction:.3f}"
+            ),
+            trigger_kind="absorption_15m",
+            trigger_event_id=footprint.source_bar_hash,
+            trigger_meta=meta,
+        )
+
+    # Legacy Turtle Soup detector retained for historical diagnostics only.
+    # ``generate_signal`` never calls it.
 
     @staticmethod
     def turtle_soup_15m_trigger(
@@ -1111,7 +1192,12 @@ class NarrativeStrategy:
             else None
         )
         if entry is None:
-            entry = self.trigger_15m_turtle_soup(df_15M, side_bias)
+            entry = self.trigger_15m_absorption(
+                df_15M,
+                side_bias,
+                data.get("ORDERFLOW_15M"),
+                symbol=symbol,
+            )
         if entry is None:
             entry = self.trigger_h1_pivot_reclaim_on_15m(df_1H, df_15M, side_bias)
         if entry is None:
@@ -1185,6 +1271,9 @@ class NarrativeStrategy:
             "vc": fvg_text,
             "fvg_regime": fvg_side,
             "trigger_reason": entry.reason,
+            "trigger_kind": entry.trigger_kind,
+            "trigger_event_id": entry.trigger_event_id,
+            "trigger_meta": entry.trigger_meta,
             "m1_localized": False,
         }
 

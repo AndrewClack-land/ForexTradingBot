@@ -15,6 +15,7 @@ SCHEMA = "forexbot-backtest-release/v1"
 RELEASE_PATHS = (
     "backtest",
     "core/__init__.py",
+    "core/absorption.py",
     "core/htf_context.py",
     "core/narrative_scoring.py",
     "core/pivot_trigger.py",

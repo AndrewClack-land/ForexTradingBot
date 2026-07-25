@@ -19,6 +19,8 @@ from backtest.strategy_runner import (
     _metrics_for,
     _sha256_file,
     _time_in_window,
+    _trigger_kind,
+    _trigger_signature,
     _validate_factor_vector,
     run_narrative_backtest,
     verify_release_manifest,
@@ -481,6 +483,56 @@ def test_live_strategy_settings_are_explicit_and_rejection_entry_is_off():
     assert strategy.rejection_block_entry_enabled is False
     assert strategy.orderblock_max_age_bars == 80
     assert strategy.htf_score_margin == 2
+
+
+def test_absorption_trigger_kind_prefers_structured_value_and_reason_fallback():
+    assert (
+        _trigger_kind({"trigger_kind": "absorption_15m"})
+        == "absorption_15m"
+    )
+    assert (
+        _trigger_kind({"trigger_kind": "h1_pivot_reclaim_15m"})
+        == "h1_pivot_reclaim_15m"
+    )
+    assert (
+        _trigger_kind(
+            {"trigger_reason": "Absorption 15M LONG footprint | ratio=4"}
+        )
+        == "absorption_15m"
+    )
+
+
+def test_trigger_signature_keeps_structured_families_and_events_separate():
+    base = {
+        "side": "LONG",
+        "zone_low": 99.0,
+        "zone_high": 100.0,
+        "stop_price": 98.0,
+        "trigger_reason": "shared reason",
+    }
+    pivot = _trigger_signature(
+        {**base, "trigger_kind": "h1_pivot_reclaim_15m"}
+    )
+    order_block = _trigger_signature(
+        {**base, "trigger_kind": "order_block_1h"}
+    )
+    first_event = _trigger_signature(
+        {
+            **base,
+            "trigger_kind": "absorption_15m",
+            "trigger_event_id": "event-a",
+        }
+    )
+    second_event = _trigger_signature(
+        {
+            **base,
+            "trigger_kind": "absorption_15m",
+            "trigger_event_id": "event-b",
+        }
+    )
+
+    assert pivot != order_block
+    assert first_event != second_event
 
 
 def test_forced_close_values_every_remaining_leg_at_the_same_price():
