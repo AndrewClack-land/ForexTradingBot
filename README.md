@@ -835,6 +835,30 @@ for the other triggers but records Absorption as `DATA_UNAVAILABLE`; it never
 manufactures an OHLCV proxy. Sidecar mapping is one-to-one identity-only;
 cross-market mappings such as crypto footprint into FX are rejected.
 
+### Quantower FxPro tick-cluster diagnostic
+
+`integrations/quantower/FxProTickClusterExporter/` contains a standalone
+Quantower 1.146.14 / .NET 10 indicator that exports one closed UTC day of M15
+`Total`, `Trades`, Buy/Sell Volume, Buy/Sell Trades, and every `PriceLevels`
+row. It also records the effective symbol history/volume/delta types and probes
+the same day as `Last` and `BidAsk` history.
+
+FxPro exposes this feed to Quantower as ticks with TickDirection delta, not as
+proven exchange executions. The output schema
+`forexbot.quantower-cluster-diagnostic` v1 is therefore always `UNVERIFIED`,
+has no historical `available_at`, and is intentionally rejected by
+`AbsorptionEventDataset`. A `VALID_DIAGNOSTIC` result requires complete
+PriceLevels plus successful Last/BidAsk probes. Validate without converting:
+
+```bash
+python tools/validate_quantower_cluster_diagnostic.py \
+  /path/to/fxpro-tick-cluster-EURUSD-YYYY-MM-DD-id
+```
+
+See the exporter README for build, Quantower installation, chart-history
+limits, and capture steps. Live Absorption remains off until this evidence is
+reviewed and a causal diagnostic-to-sidecar adapter is approved.
+
 The report is atomically published and contains `summary.json`,
 `candidates.csv`, one auditable candidate/policy decision in `executions.csv`,
 `setups.csv`, `legs.csv`, `folds.csv`, `config.json` and a SHA-256

@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <OutputType>Library</OutputType>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Deterministic>true</Deterministic>
+    <DebugType>portable</DebugType>
+    <AssemblyName>FxProTickClusterExporter</AssemblyName>
+    <RootNamespace>ForexBot.Quantower</RootNamespace>
+    <Version>0.1.0</Version>
+    <QuantowerBin Condition="'$(QuantowerBin)' == ''">E:\Quantower\TradingPlatform\v1.146.14\bin</QuantowerBin>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Reference Include="TradingPlatform.BusinessLayer">
+      <HintPath>$(QuantowerBin)\TradingPlatform.BusinessLayer.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

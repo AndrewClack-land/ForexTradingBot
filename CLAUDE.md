@@ -107,13 +107,34 @@ volume, or quote-only Bid/Ask changes. Missing, delayed, revised, unmapped,
 mixed-feed, or checksum-invalid order flow means `DATA_UNAVAILABLE`, not a
 bearish/bullish false result and never a proxy.
 
-The locally audited Quantower FxPro VolumeAnalysis database currently contains
-no rows. Its FxPro History database has quote ticks but no executed LAST tape,
-sizes, aggressor, or price-level volume. The available Bybit footprint cache is
-for different markets and cannot be mapped to EURUSD/GBPUSD/USDCAD. Therefore
-Absorption must remain OFF on the live VPS until a validated adapter exists.
-Do not copy the downloaded Quantower C# sources or XML layouts into Git: they
-have no repository license, and the XML files contain connection/user state.
+The locally audited persisted Quantower FxPro VolumeAnalysis database contains
+no rows, but that does not prove runtime `VolumeAnalysisData` is absent:
+Quantower can reconstruct Cluster data on demand. The installed FxPro connector
+reports `VolumeType=Ticks`, `DeltaCalculationType=TickDirection`,
+`AllowCalculateRealtimeTicks=true`, and realtime Volume/Trades disabled. Treat
+its `Trades`, Buy/Sell Volume, and PriceLevels as an unverified Quantower tick
+reconstruction, never as exchange executions or proven aggressor flow.
+
+`integrations/quantower/FxProTickClusterExporter/` is the current audited
+diagnostic path. It exports one closed UTC M15 day under schema
+`forexbot.quantower-cluster-diagnostic` v1, plus Last/BidAsk probes, coverage,
+causality metadata, and hashes. Validate it with
+`tools/validate_quantower_cluster_diagnostic.py`. This raw schema is
+deliberately incompatible with `AbsorptionEventDataset` and must never be
+passed to `--orderflow-data`; its safety flags must remain `UNVERIFIED`, false
+for exchange/aggressor proof, and false for sidecar eligibility. Snapshot time
+does not reveal historical feed latency, so `historical_available_at` remains
+null until a separately versioned delay rule is justified. The FxPro vendor
+field is an operator label, not connection identity. `VALID_DIAGNOSTIC`
+requires the DLL hash, Ticks/TickDirection metadata, consistent symbol mapping,
+complete PriceLevels, a closed day with explicit UTC, and successful Last plus
+BidAsk probes containing recognized tick items.
+
+The available Bybit footprint cache is for different markets and cannot be
+mapped to EURUSD/GBPUSD/USDCAD. Absorption remains OFF on the live VPS until the
+diagnostic day is reviewed and a validated causal adapter exists. Do not copy
+the downloaded Quantower C# sources or XML layouts into Git: they have no
+repository license, and the XML files contain connection/user state.
 
 `build_factor_vector()` is the canonical arithmetic. A refactor must preserve
 the resulting bias, scores, margins, factor rows, and live narrative text.

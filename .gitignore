@@ -19,5 +19,9 @@ secrets/
 *.p12
 /.codex_tmp/
 
+# Quantower/.NET local build output
+/integrations/quantower/**/bin/
+/integrations/quantower/**/obj/
+
 # SSH-ключ доступа к VPS — приватный, никогда не коммитить
 deploy/keys/
