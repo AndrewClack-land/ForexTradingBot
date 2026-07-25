@@ -1,0 +1,218 @@
+"""Pure, serializable scoring contract for the narrative factor ensemble.
+
+The production strategy detects market structures.  This module only turns
+those already-known-at-decision-time votes into scores and a bias.  Keeping
+the arithmetic pure makes the live narrative and offline attribution use the
+same weights, margins, and pivotal-factor definition.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+from typing import Any, Mapping, Optional
+
+
+FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v1"
+
+
+@dataclass(frozen=True)
+class FactorDefinition:
+    key: str
+    label: str
+    configured_weight: int
+
+
+FACTOR_DEFINITIONS = (
+    FactorDefinition(
+        "h1_premium_discount",
+        "H1 Premium/Discount",
+        2,
+    ),
+    FactorDefinition(
+        "false_breakout_4h",
+        "4H false fractal breakout",
+        2,
+    ),
+    FactorDefinition(
+        "true_breakout_15m",
+        "15M true fractal breakout",
+        1,
+    ),
+    FactorDefinition(
+        "order_block_1h",
+        "Order Block 1H",
+        1,
+    ),
+    FactorDefinition(
+        "rejection_block_1h",
+        "Valid Rejection Block 1H",
+        1,
+    ),
+)
+
+FACTOR_WEIGHTS = {
+    definition.key: definition.configured_weight
+    for definition in FACTOR_DEFINITIONS
+}
+
+_SIDES = {"LONG", "SHORT", "NEUTRAL"}
+
+
+def _side(value: Any) -> str:
+    normalized = str(value or "NEUTRAL").upper()
+    return normalized if normalized in _SIDES else "NEUTRAL"
+
+
+def bias_from_scores(
+    *,
+    score_long: float,
+    score_short: float,
+    margin_long: float,
+    margin_short: float,
+) -> str:
+    """Return the exact production bias for two directional scores."""
+
+    if score_long >= score_short + margin_long:
+        return "LONG"
+    if score_short >= score_long + margin_short:
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def build_factor_vector(
+    votes: Mapping[str, Mapping[str, Any]],
+    *,
+    base_margin: int,
+    fvg_side: str = "NEUTRAL",
+    weights: Optional[Mapping[str, float]] = None,
+) -> dict[str, Any]:
+    """Build a deterministic factor vector from frozen directional votes.
+
+    ``votes`` may contain ``side`` and an optional JSON-safe ``evidence``
+    mapping for every configured factor. Missing factors are retained as
+    explicit ABSENT rows so absence never gets confused with a zero-valued
+    observation.
+    """
+
+    effective_weights = {
+        definition.key: float(
+            (weights or {}).get(
+                definition.key,
+                definition.configured_weight,
+            )
+        )
+        for definition in FACTOR_DEFINITIONS
+    }
+    invalid_weights = {
+        key: value
+        for key, value in effective_weights.items()
+        if not math.isfinite(value) or value < 0
+    }
+    if invalid_weights:
+        raise ValueError(
+            f"factor weights must be finite and non-negative: {invalid_weights}"
+        )
+    normalized_fvg = _side(fvg_side)
+    normalized_margin = max(1, int(base_margin))
+    margin_long = normalized_margin + (
+        1 if normalized_fvg == "SHORT" else 0
+    )
+    margin_short = normalized_margin + (
+        1 if normalized_fvg == "LONG" else 0
+    )
+
+    factor_rows: list[dict[str, Any]] = []
+    score_long = 0.0
+    score_short = 0.0
+    for definition in FACTOR_DEFINITIONS:
+        raw = votes.get(definition.key) or {}
+        vote_side = _side(raw.get("side"))
+        present = bool(raw.get("present", vote_side != "NEUTRAL"))
+        if not present:
+            vote_side = "NEUTRAL"
+        weight = effective_weights[definition.key]
+        long_contribution = weight if vote_side == "LONG" else 0.0
+        short_contribution = weight if vote_side == "SHORT" else 0.0
+        score_long += long_contribution
+        score_short += short_contribution
+        evidence = raw.get("evidence")
+        factor_rows.append(
+            {
+                "key": definition.key,
+                "label": definition.label,
+                "present": present,
+                "vote_side": vote_side,
+                "configured_weight": definition.configured_weight,
+                "effective_weight": weight,
+                "long_contribution": long_contribution,
+                "short_contribution": short_contribution,
+                "evidence": dict(evidence)
+                if isinstance(evidence, Mapping)
+                else {},
+            }
+        )
+
+    selected_bias = bias_from_scores(
+        score_long=score_long,
+        score_short=score_short,
+        margin_long=margin_long,
+        margin_short=margin_short,
+    )
+    for row in factor_rows:
+        without_long = score_long - float(row["long_contribution"])
+        without_short = score_short - float(row["short_contribution"])
+        without_bias = bias_from_scores(
+            score_long=without_long,
+            score_short=without_short,
+            margin_long=margin_long,
+            margin_short=margin_short,
+        )
+        if selected_bias == "NEUTRAL":
+            selected_contribution = 0.0
+        elif row["vote_side"] == selected_bias:
+            selected_contribution = float(row["effective_weight"])
+        elif row["vote_side"] in {"LONG", "SHORT"}:
+            selected_contribution = -float(row["effective_weight"])
+        else:
+            selected_contribution = 0.0
+        row["selected_side_contribution"] = selected_contribution
+        row["bias_without_factor"] = without_bias
+        row["pivotal_without_factor"] = without_bias != selected_bias
+
+    return {
+        "schema": FACTOR_VECTOR_SCHEMA,
+        "bias": selected_bias,
+        "score_long": score_long,
+        "score_short": score_short,
+        "score_delta_long_minus_short": score_long - score_short,
+        "base_margin": normalized_margin,
+        "margin_long": margin_long,
+        "margin_short": margin_short,
+        "fvg_side": normalized_fvg,
+        "factors": factor_rows,
+    }
+
+
+def rescore_factor_vector(
+    factor_vector: Mapping[str, Any],
+    *,
+    weights: Mapping[str, float],
+) -> dict[str, Any]:
+    """Re-score frozen votes without re-reading candles or future outcomes."""
+
+    votes = {
+        str(row.get("key")): {
+            "present": bool(row.get("present")),
+            "side": row.get("vote_side"),
+            "evidence": row.get("evidence") or {},
+        }
+        for row in factor_vector.get("factors", ())
+        if isinstance(row, Mapping) and row.get("key")
+    }
+    return build_factor_vector(
+        votes,
+        base_margin=int(factor_vector.get("base_margin") or 1),
+        fvg_side=str(factor_vector.get("fvg_side") or "NEUTRAL"),
+        weights=weights,
+    )

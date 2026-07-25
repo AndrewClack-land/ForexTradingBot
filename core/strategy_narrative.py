@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from core.htf_context import HtfContext
+from core.narrative_scoring import build_factor_vector
 from core.pivot_trigger import mark_pivots
 
 try:
@@ -244,6 +245,7 @@ class NarrativeStrategy:
         self.htf_score_margin = max(1, int(HTF_SCORE_MARGIN or 1))
 
         self._last_htf_context: Optional[HtfContext] = None
+        self._last_factor_vector: Optional[Dict[str, Any]] = None
 
     # ================== HELPERS ==================
 
@@ -380,11 +382,11 @@ class NarrativeStrategy:
         """
         ctx = self._build_htf_context(df_4H, df_1H, df_15M)
         if ctx is None:
+            self._last_factor_vector = None
             return "NEUTRAL", "Нет данных 4H/1H/15M для Narrative"
 
         parts: List[str] = []
-        score_long = 0
-        score_short = 0
+        votes: Dict[str, Dict[str, Any]] = {}
 
         # Current M15 close inside the latest completed H1 range.
         if ctx.hourly_range is not None:
@@ -393,10 +395,17 @@ class NarrativeStrategy:
                 f"H1PD pos={hourly.position} "
                 f"(H1H={hourly.high:.5f}/H1L={hourly.low:.5f})"
             )
-            if hourly.bias == "LONG":
-                score_long += 2
-            elif hourly.bias == "SHORT":
-                score_short += 2
+            votes["h1_premium_discount"] = {
+                "present": hourly.bias in {"LONG", "SHORT"},
+                "side": hourly.bias,
+                "evidence": {
+                    "position": str(hourly.position),
+                    "high": float(hourly.high),
+                    "low": float(hourly.low),
+                    "mid": float(hourly.mid),
+                    "observed_close_15m": float(hourly.close),
+                },
+            }
 
         # 4H false fractal breakout: primary reversal vote (+2).
         if ctx.false_breakout_4h is not None:
@@ -405,10 +414,18 @@ class NarrativeStrategy:
                 f"4H {breakout.kind} {breakout.level_kind}@{breakout.level:.5f} "
                 f"-> {breakout.side} ({breakout.bars_ago} bars ago)"
             )
-            if breakout.side == "LONG":
-                score_long += 2
-            elif breakout.side == "SHORT":
-                score_short += 2
+            votes["false_breakout_4h"] = {
+                "present": True,
+                "side": breakout.side,
+                "evidence": {
+                    "kind": str(breakout.kind),
+                    "level": float(breakout.level),
+                    "level_kind": str(breakout.level_kind),
+                    "bar_index": int(breakout.bar_index),
+                    "bars_ago": int(breakout.bars_ago),
+                    "timeframe": str(breakout.timeframe),
+                },
+            }
 
         # 15M true fractal breakout: continuation confirmation (+1).
         if ctx.true_breakout_15m is not None:
@@ -417,10 +434,18 @@ class NarrativeStrategy:
                 f"15M {breakout.kind} {breakout.level_kind}@{breakout.level:.5f} "
                 f"-> {breakout.side} ({breakout.bars_ago} bars ago)"
             )
-            if breakout.side == "LONG":
-                score_long += 1
-            elif breakout.side == "SHORT":
-                score_short += 1
+            votes["true_breakout_15m"] = {
+                "present": True,
+                "side": breakout.side,
+                "evidence": {
+                    "kind": str(breakout.kind),
+                    "level": float(breakout.level),
+                    "level_kind": str(breakout.level_kind),
+                    "bar_index": int(breakout.bar_index),
+                    "bars_ago": int(breakout.bars_ago),
+                    "timeframe": str(breakout.timeframe),
+                },
+            }
 
         zone_snippets: List[str] = []
         active_order_blocks = [
@@ -434,10 +459,20 @@ class NarrativeStrategy:
             zone_snippets.append(
                 f"OB1H {ob.side} @{ob.bottom:.5f}-{ob.top:.5f}"
             )
-            if ob.side == "LONG":
-                score_long += 1
-            elif ob.side == "SHORT":
-                score_short += 1
+            votes["order_block_1h"] = {
+                "present": True,
+                "side": ob.side,
+                "evidence": {
+                    "zone_low": float(min(ob.bottom, ob.top)),
+                    "zone_high": float(max(ob.bottom, ob.top)),
+                    "created_idx": int(ob.created_idx),
+                    "age_bars": max(
+                        0,
+                        int(len(df_1H) - 1 - int(ob.created_idx)),
+                    ),
+                    "active_count": int(len(active_order_blocks)),
+                },
+            }
 
         active_rejection_blocks = [
             rb for rb in (ctx.rejection_blocks or [])
@@ -453,14 +488,31 @@ class NarrativeStrategy:
                 f"@{min(rb.zone_low, rb.zone_high):.5f}-"
                 f"{max(rb.zone_low, rb.zone_high):.5f} valid"
             )
-            if rb.side == "LONG":
-                score_long += 1
-            elif rb.side == "SHORT":
-                score_short += 1
+            votes["rejection_block_1h"] = {
+                "present": True,
+                "side": rb.side,
+                "evidence": {
+                    "zone_low": float(min(rb.zone_low, rb.zone_high)),
+                    "zone_high": float(max(rb.zone_low, rb.zone_high)),
+                    "midline": float(rb.midline),
+                    "wick_ratio": float(rb.wick_ratio),
+                    "intrusion_pct": float(rb.intrusion_pct),
+                    "created_idx": int(rb.created_idx),
+                    "age_bars": max(
+                        0,
+                        int(len(df_1H) - 1 - int(rb.created_idx)),
+                    ),
+                    "active_count": int(len(active_rejection_blocks)),
+                },
+            }
         if zone_snippets:
             parts.append("; ".join(zone_snippets))
 
         if not parts:
+            self._last_factor_vector = build_factor_vector(
+                votes,
+                base_margin=int(getattr(self, "htf_score_margin", 1)),
+            )
             return "NEUTRAL", "HTF: ни одна модель ансамбля не дала голоса"
 
         # FVG regime (1H) tightens the required margin against its direction
@@ -468,15 +520,24 @@ class NarrativeStrategy:
         parts.append(fvg_text)
 
         base_margin = int(getattr(self, "htf_score_margin", 1))
-        margin_long = base_margin + (1 if fvg_side == "SHORT" else 0)
-        margin_short = base_margin + (1 if fvg_side == "LONG" else 0)
+        factor_vector = build_factor_vector(
+            votes,
+            base_margin=base_margin,
+            fvg_side=fvg_side,
+        )
+        self._last_factor_vector = factor_vector
+        score_long = factor_vector["score_long"]
+        score_short = factor_vector["score_short"]
+        margin_long = factor_vector["margin_long"]
+        margin_short = factor_vector["margin_short"]
+        bias = factor_vector["bias"]
 
         summary = " | ".join(parts)
-        if score_long >= score_short + margin_long:
-            return "LONG", f"HTF Bias LONG (scores L/S={score_long}/{score_short}, margin={margin_long}) | {summary}"
-        if score_short >= score_long + margin_short:
-            return "SHORT", f"HTF Bias SHORT (scores L/S={score_long}/{score_short}, margin={margin_short}) | {summary}"
-        return "NEUTRAL", f"HTF mixed (L/S={score_long}/{score_short}) | {summary}"
+        if bias == "LONG":
+            return "LONG", f"HTF Bias LONG (scores L/S={score_long:g}/{score_short:g}, margin={margin_long:g}) | {summary}"
+        if bias == "SHORT":
+            return "SHORT", f"HTF Bias SHORT (scores L/S={score_long:g}/{score_short:g}, margin={margin_short:g}) | {summary}"
+        return "NEUTRAL", f"HTF mixed (L/S={score_long:g}/{score_short:g}) | {summary}"
 
     # ================== 15M Rejection Block Trigger ==================
 
@@ -1027,12 +1088,18 @@ class NarrativeStrategy:
         df_15M = data.get("15M")
 
         if any(d is None or d.empty for d in (df_4H, df_1H, df_15M)):
+            self._last_factor_vector = None
             return {"signal": "NO_DATA"}
 
         side_bias, narrative_text = self.calc_narrative(df_4H, df_1H, df_15M)
+        factor_vector = self._last_factor_vector
         ctx = self._last_htf_context
         if side_bias == "NEUTRAL":
-            return {"signal": "NO_TREND", "narrative": narrative_text}
+            return {
+                "signal": "NO_TREND",
+                "narrative": narrative_text,
+                "factor_vector": factor_vector,
+            }
 
         # EMA-M15 и Volume-Confirmation фильтры удалены: направление и строгость
         # bias регулирует FVG-режим 1H внутри calc_narrative.
@@ -1051,7 +1118,12 @@ class NarrativeStrategy:
             entry = self.trigger_orderblock_touch(df_1H, ctx, side_bias)
 
         if entry is None:
-            return {"signal": "NO_TRIGGER", "narrative": narrative_text, "vc": fvg_text}
+            return {
+                "signal": "NO_TRIGGER",
+                "narrative": narrative_text,
+                "vc": fvg_text,
+                "factor_vector": factor_vector,
+            }
 
         # build entry range (фиксированная 15M локализация)
         if not getattr(entry, "lock_entry_range", False):
@@ -1108,6 +1180,7 @@ class NarrativeStrategy:
             "setup_tf": "15M",
 
             "narrative": narrative_text,
+            "factor_vector": factor_vector,
             # журнал сделок пишет колонку vc — теперь здесь FVG-режим 1H
             "vc": fvg_text,
             "fvg_regime": fvg_side,

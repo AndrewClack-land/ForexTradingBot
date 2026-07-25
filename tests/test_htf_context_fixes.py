@@ -127,6 +127,109 @@ def test_narrative_votes_for_most_recent_active_h1_order_block():
     assert "OB1H SHORT" in text
 
 
+def test_narrative_freezes_exact_structured_factor_vector():
+    ctx = _bias_context(
+        hourly_range=HourlyRange(
+            high=1.2,
+            low=1.0,
+            close=1.05,
+            position="DISCOUNT",
+        ),
+        false_breakout_4h=FractalBreakout(
+            kind="FALSE_BREAK",
+            side="SHORT",
+            level=1.3,
+            level_kind="HIGH",
+            bar_index=7,
+            bars_ago=2,
+            timeframe="4H",
+        ),
+        true_breakout_15m=FractalBreakout(
+            kind="TRUE_BREAK",
+            side="LONG",
+            level=1.1,
+            level_kind="HIGH",
+            bar_index=9,
+            bars_ago=0,
+            timeframe="15M",
+        ),
+        order_blocks=[
+            OrderBlock(
+                side="SHORT",
+                top=1.4,
+                bottom=1.3,
+                created_idx=20,
+            ),
+        ],
+        rejection_blocks=[
+            RejectionBlock(
+                side="LONG",
+                zone_high=1.1,
+                zone_low=1.0,
+                created_idx=21,
+                midline=1.05,
+                wick_ratio=2.5,
+                intrusion_pct=30.0,
+            ),
+        ],
+    )
+    strategy = NarrativeStrategy()
+    strategy.htf_score_margin = 1
+    strategy._build_htf_context = lambda *args, **kwargs: ctx
+    strategy.calc_fvg_regime_1h = lambda df: ("NEUTRAL", "FVG neutral")
+    frame = _bars([(1.0, 1.1, 0.9, 1.0)] * 30)
+
+    side, _ = strategy.calc_narrative(frame, frame, frame)
+    vector = strategy._last_factor_vector
+
+    assert side == "LONG"
+    assert vector is not None
+    assert vector["score_long"] == 4
+    assert vector["score_short"] == 3
+    factors = {row["key"]: row for row in vector["factors"]}
+    assert factors["h1_premium_discount"]["evidence"]["position"] == "DISCOUNT"
+    assert factors["false_breakout_4h"]["evidence"]["bars_ago"] == 2
+    assert factors["order_block_1h"]["evidence"]["created_idx"] == 20
+    assert factors["rejection_block_1h"]["evidence"]["created_idx"] == 21
+
+
+def test_no_trend_and_no_trigger_keep_structured_factor_vector():
+    frame = _bars([(1.0, 1.1, 0.9, 1.0)] * 60)
+
+    neutral = NarrativeStrategy()
+    neutral._build_htf_context = lambda *args, **kwargs: _bias_context()
+    neutral.calc_fvg_regime_1h = lambda df: ("NEUTRAL", "FVG neutral")
+    no_trend = neutral.generate_signal(
+        {"4H": frame, "1H": frame, "15M": frame}
+    )
+
+    directional = NarrativeStrategy()
+    directional._build_htf_context = lambda *args, **kwargs: _bias_context(
+        hourly_range=HourlyRange(
+            high=1.2,
+            low=1.0,
+            close=1.05,
+            position="DISCOUNT",
+        )
+    )
+    directional.calc_fvg_regime_1h = lambda df: (
+        "NEUTRAL",
+        "FVG neutral",
+    )
+    directional.trigger_15m_rejection_block = lambda *args: None
+    directional.trigger_15m_turtle_soup = lambda *args: None
+    directional.trigger_h1_pivot_reclaim_on_15m = lambda *args: None
+    directional.trigger_orderblock_touch = lambda *args: None
+    no_trigger = directional.generate_signal(
+        {"4H": frame, "1H": frame, "15M": frame}
+    )
+
+    assert no_trend["signal"] == "NO_TREND"
+    assert no_trend["factor_vector"]["bias"] == "NEUTRAL"
+    assert no_trigger["signal"] == "NO_TRIGGER"
+    assert no_trigger["factor_vector"]["bias"] == "LONG"
+
+
 def test_h1_premium_discount_uses_latest_m15_close():
     df_1h = _bars([(100.0, 110.0, 90.0, 100.0)])
     df_4h = _bars([(100.0, 111.0, 89.0, 100.0)])

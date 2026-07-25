@@ -292,7 +292,7 @@ git archive --format=tar "$release_commit" \
   backtest \
   core/__init__.py \
   core/strategy_narrative.py core/htf_context.py \
-  core/pivot_trigger.py core/vol_regime.py \
+  core/narrative_scoring.py core/pivot_trigger.py core/vol_regime.py \
   deploy/build_backtest_release_manifest.py \
   requirements-backtest.txt | \
   sudo tar --extract --file=- --directory="$release_stage/app"
@@ -770,9 +770,33 @@ sudo journalctl -fu forexbot-backtest-run-fx-v1.service
 The report is atomically published and contains `summary.json`,
 `candidates.csv`, one auditable candidate/policy decision in `executions.csv`,
 `setups.csv`, `legs.csv`, `folds.csv`, `config.json` and a SHA-256
-`manifest.json`. Empty CSV reports still contain stable headers. A second run
-with `--intrabar-policy tp-first` (or `both`) measures sensitivity to
-unknowable M1 intrabar ordering.
+`manifest.json`. It also freezes the five narrative votes in
+`candidate_factors.csv`, joins outcomes in
+`setup_factor_attribution.csv`, and aggregates them by symbol, side, fold,
+year, quarter, trigger, volatility regime, and FVG side in
+`factor_summary.csv`. Candidate rows start only at raw `ENTER` (a baseline
+directional bias plus a detected trigger); outcome rows are the narrower
+executed-and-filled population. Empty CSV reports still contain stable
+headers. A second run with `--intrabar-policy tp-first` (or `both`) measures
+sensitivity to unknowable M1 intrabar ordering.
+
+The same run creates a conditional, leakage-aware shadow score:
+`shadow_models.json`, `shadow_scores.csv`, `shadow_coefficients.csv`, and
+`shadow_score_metrics.csv`. The rolling ridge model uses only earlier
+`stop-first` setups whose labels have matured before the next fold, with a
+purge equal to entry TTL plus maximum holding time. It never changes candidate
+IDs, entries, fills, SL/TP, execution dispositions, setup count, or risk.
+Its target is `net_R` conditional on a production-filled setup. Coefficients
+describe prior OOS raw `ENTER` signals that also survived execution gates and
+filled; they are not unbiased replacement weights or a fill-probability
+model.
+
+A real replacement-weight optimizer needs a separate v2 research pass. That
+pass must freeze factor vectors on every completed M15 decision, generate
+technical LONG and SHORT opportunities independently of the baseline bias,
+fit weights only inside each train interval, freeze the model, and replay the
+following OOS interval. Without that counterfactual population, directly
+optimizing the five weights would inherit selection bias from the old weights.
 
 The report is a gross strategy diagnostic, not a broker-accurate PnL
 statement. LSE OHLCV does not contain historical Bid/Ask spread, FxPro

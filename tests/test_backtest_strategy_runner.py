@@ -11,6 +11,7 @@ from backtest.data import HistoricalDataset
 from backtest.strategy_runner import (
     NarrativeBacktestConfig,
     StrategyBacktestError,
+    _EMPTY_CSV_FIELDS,
     _REQUIRED_RELEASE_FILES,
     _configure_strategy,
     _default_strategy_factory,
@@ -18,10 +19,12 @@ from backtest.strategy_runner import (
     _metrics_for,
     _sha256_file,
     _time_in_window,
+    _validate_factor_vector,
     run_narrative_backtest,
     verify_release_manifest,
 )
 from backtest.simulator import simulate_split_outcome
+from core.narrative_scoring import build_factor_vector
 
 
 def _frame(index, rows):
@@ -84,6 +87,31 @@ class _AlwaysEnter:
         assert data["15M"].index[-1] == pd.Timestamp(
             "2026-01-01T00:00:00Z"
         )
+        factor_vector = build_factor_vector(
+            {
+                "h1_premium_discount": {
+                    "present": True,
+                    "side": "LONG",
+                    "evidence": {"position": "DISCOUNT"},
+                },
+                "false_breakout_4h": {
+                    "present": True,
+                    "side": "SHORT",
+                    "evidence": {"bars_ago": 1},
+                },
+                "true_breakout_15m": {
+                    "present": True,
+                    "side": "LONG",
+                    "evidence": {"bars_ago": 0},
+                },
+                "rejection_block_1h": {
+                    "present": True,
+                    "side": "LONG",
+                    "evidence": {"age_bars": 2},
+                },
+            },
+            base_margin=1,
+        )
         return {
             "signal": "ENTER",
             "side": "LONG",
@@ -95,6 +123,7 @@ class _AlwaysEnter:
             "trigger_reason": "TEST",
             "narrative": "causal fixture",
             "fvg_regime": "NEUTRAL",
+            "factor_vector": factor_vector,
         }
 
 
@@ -139,6 +168,37 @@ def test_runner_is_causal_and_uses_fixed_initial_capital_risk(tmp_path):
     assert setup["pnl_amount"] == pytest.approx(90.0)
     # The damaging 00:14 and already-open 00:15 bars must not affect outcome.
     assert setup["status"] == "CLOSED"
+
+
+def test_runner_emits_structured_factor_attribution_without_changing_trade(
+    tmp_path,
+):
+    result = run_narrative_backtest(
+        _dataset(tmp_path),
+        _config(),
+        strategy_factory=_AlwaysEnter,
+    )
+
+    assert len(result.candidate_factors) == 5
+    assert len(result.setup_factors) == 5
+    by_factor = {
+        row["factor_key"]: row
+        for row in result.setup_factors
+    }
+    assert by_factor["h1_premium_discount"]["relation"] == "ALIGNED"
+    assert by_factor["false_breakout_4h"]["relation"] == "OPPOSED"
+    assert by_factor["order_block_1h"]["relation"] == "ABSENT"
+    assert by_factor["true_breakout_15m"]["net_r"] == pytest.approx(0.9)
+    coverage = result.summary["factor_attribution"]
+    assert coverage["complete_candidate_vectors"] is True
+    assert coverage["complete_setup_vectors"] is True
+    assert coverage["mode"] == "conditional-production-selection"
+    assert (
+        coverage["candidate_population"]
+        == "raw_enter_bias_plus_detected_trigger"
+    )
+    assert coverage["outcome_population"] == "executed_and_filled_setups"
+    assert result.setups[0]["net_r"] == pytest.approx(0.9)
 
 
 def test_future_candle_mutation_cannot_change_pre_cutoff_result(tmp_path):
@@ -188,6 +248,71 @@ def test_risk_fraction_cannot_exceed_one_percent():
             end="2026-02-01",
             initial_capital=10_000,
             risk_fraction=0.0101,
+        )
+
+
+def test_required_factor_vector_fails_closed_and_score_mismatch_is_rejected():
+    with pytest.raises(StrategyBacktestError, match="missing"):
+        _validate_factor_vector(
+            {"signal": "ENTER", "side": "LONG"},
+            status="ENTER",
+            required=True,
+        )
+    vector = build_factor_vector(
+        {
+            "h1_premium_discount": {
+                "present": True,
+                "side": "LONG",
+            },
+        },
+        base_margin=1,
+    )
+    vector["score_long"] = 99
+    with pytest.raises(StrategyBacktestError, match="do not reproduce"):
+        _validate_factor_vector(
+            {
+                "signal": "ENTER",
+                "side": "LONG",
+                "factor_vector": vector,
+            },
+            status="ENTER",
+            required=True,
+        )
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda vector: vector.update({"margin_long": 99}),
+        lambda vector: vector["factors"][0].update(
+            {"pivotal_without_factor": False}
+        ),
+        lambda vector: vector["factors"].append(
+            dict(vector["factors"][-1])
+        ),
+    ],
+)
+def test_required_factor_vector_rejects_tampered_derived_fields(tamper):
+    vector = build_factor_vector(
+        {
+            "h1_premium_discount": {
+                "present": True,
+                "side": "LONG",
+            },
+        },
+        base_margin=1,
+    )
+    tamper(vector)
+
+    with pytest.raises(StrategyBacktestError, match="factor.vector|five"):
+        _validate_factor_vector(
+            {
+                "signal": "ENTER",
+                "side": "LONG",
+                "factor_vector": vector,
+            },
+            status="ENTER",
+            required=True,
         )
 
 
@@ -292,17 +417,24 @@ def test_report_is_atomic_manifested_and_never_overwritten(tmp_path):
     assert result.write(output) == output.resolve()
     assert {
         "candidates.csv",
+        "candidate_factors.csv",
         "config.json",
         "executions.csv",
+        "factor_summary.csv",
         "folds.csv",
         "legs.csv",
         "manifest.json",
+        "shadow_coefficients.csv",
+        "shadow_models.json",
+        "shadow_score_metrics.csv",
+        "shadow_scores.csv",
+        "setup_factor_attribution.csv",
         "setups.csv",
         "summary.json",
     } == {path.name for path in output.iterdir()}
     manifest = json.loads((output / "manifest.json").read_text(encoding="utf-8"))
-    assert manifest["schema"] == "narrative-backtest/v1"
-    assert len(manifest["files"]) == 7
+    assert manifest["schema"] == "narrative-backtest/v2"
+    assert len(manifest["files"]) == 14
     with pytest.raises(StrategyBacktestError, match="already exists"):
         result.write(output)
 
@@ -315,15 +447,22 @@ def test_empty_reports_keep_stable_csv_headers(tmp_path):
     )
     output = result.write(tmp_path / "empty-report")
 
-    assert tuple(pd.read_csv(output / "candidates.csv").columns[:4]) == (
-        "candidate_id",
-        "fold_index",
-        "symbol",
-        "decision_time",
-    )
-    assert "disposition" in pd.read_csv(output / "executions.csv").columns
-    assert "net_r" in pd.read_csv(output / "setups.csv").columns
-    assert "exit_reason" in pd.read_csv(output / "legs.csv").columns
+    report_schemas = {
+        "candidates.csv": "candidates",
+        "executions.csv": "executions",
+        "setups.csv": "setups",
+        "legs.csv": "legs",
+        "candidate_factors.csv": "candidate_factors",
+        "setup_factor_attribution.csv": "setup_factors",
+        "factor_summary.csv": "factor_summary",
+        "shadow_scores.csv": "shadow_predictions",
+        "shadow_coefficients.csv": "shadow_coefficients",
+        "shadow_score_metrics.csv": "shadow_metrics",
+    }
+    for filename, schema_key in report_schemas.items():
+        assert tuple(pd.read_csv(output / filename).columns) == (
+            _EMPTY_CSV_FIELDS[schema_key]
+        )
 
 
 def test_live_strategy_settings_are_explicit_and_rejection_entry_is_off():

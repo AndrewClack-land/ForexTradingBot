@@ -16,6 +16,7 @@ RELEASE_PATHS = (
     "backtest",
     "core/__init__.py",
     "core/htf_context.py",
+    "core/narrative_scoring.py",
     "core/pivot_trigger.py",
     "core/strategy_narrative.py",
     "core/vol_regime.py",

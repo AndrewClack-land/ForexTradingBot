@@ -29,8 +29,22 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from core.narrative_scoring import (
+    FACTOR_VECTOR_SCHEMA,
+    FACTOR_WEIGHTS,
+    build_factor_vector,
+)
+
+from .attribution import (
+    attribution_coverage,
+    candidate_factor_rows,
+    factor_summary_rows,
+    factor_vector_fields,
+    setup_factor_rows,
+)
 from .data import HistoricalDataset, LIVE_CLOSED_BAR_LIMIT
 from .metrics import aggregate_setup_metrics
+from .optimizer import build_shadow_scores
 from .simulator import LegOutcome, SetupOutcome, simulate_split_outcome
 from .walkforward import split_walk_forward
 
@@ -38,7 +52,7 @@ from .walkforward import split_walk_forward
 ProgressCallback = Callable[[Mapping[str, Any]], None]
 StrategyFactory = Callable[[], Any]
 
-REPORT_SCHEMA = "narrative-backtest/v1"
+REPORT_SCHEMA = "narrative-backtest/v2"
 RELEASE_MANIFEST_SCHEMA = "forexbot-backtest-release/v1"
 _BAR_CLOSE_COLUMN = "bar_close_time"
 _REQUIRED_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d")
@@ -63,14 +77,17 @@ _SESSION_WINDOWS = {
 _REQUIRED_RELEASE_FILES = {
     "backtest/__init__.py",
     "backtest/__main__.py",
+    "backtest/attribution.py",
     "backtest/data.py",
     "backtest/lse_ingest.py",
     "backtest/metrics.py",
+    "backtest/optimizer.py",
     "backtest/simulator.py",
     "backtest/strategy_runner.py",
     "backtest/walkforward.py",
     "core/__init__.py",
     "core/htf_context.py",
+    "core/narrative_scoring.py",
     "core/pivot_trigger.py",
     "core/strategy_narrative.py",
     "core/vol_regime.py",
@@ -95,8 +112,23 @@ _EMPTY_CSV_FIELDS = {
         "gate_reason",
         "vol_r",
         "vol_regime",
+        "vol_em_1d",
+        "vol_tp1_em_ratio",
         "fvg_regime",
         "narrative",
+        "factor_schema",
+        "factor_bias",
+        "factor_score_long",
+        "factor_score_short",
+        "factor_score_delta",
+        "factor_base_margin",
+        "factor_margin_long",
+        "factor_margin_short",
+        "factor_fvg_side",
+        "factor_aligned_count",
+        "factor_opposed_count",
+        "factor_pivotal_count",
+        "factor_vector",
     ),
     "executions": (
         "candidate_id",
@@ -145,7 +177,22 @@ _EMPTY_CSV_FIELDS = {
         "fvg_regime",
         "vol_r",
         "vol_regime",
+        "vol_em_1d",
+        "vol_tp1_em_ratio",
         "narrative",
+        "factor_schema",
+        "factor_bias",
+        "factor_score_long",
+        "factor_score_short",
+        "factor_score_delta",
+        "factor_base_margin",
+        "factor_margin_long",
+        "factor_margin_short",
+        "factor_fvg_side",
+        "factor_aligned_count",
+        "factor_opposed_count",
+        "factor_pivotal_count",
+        "factor_vector",
         "forced_exit_reason",
     ),
     "legs": (
@@ -158,6 +205,158 @@ _EMPTY_CSV_FIELDS = {
         "exit_price",
         "r_multiple",
         "exit_time",
+    ),
+    "candidate_factors": (
+        "attribution_schema",
+        "candidate_id",
+        "event_id",
+        "fold_index",
+        "symbol",
+        "decision_time",
+        "candidate_side",
+        "trigger_kind",
+        "factor_schema",
+        "factor_key",
+        "factor_label",
+        "present",
+        "vote_side",
+        "relation",
+        "alignment",
+        "configured_weight",
+        "effective_weight",
+        "long_contribution",
+        "short_contribution",
+        "candidate_contribution",
+        "pivotal_without_factor",
+        "bias_without_factor",
+        "age_bars",
+        "score_long",
+        "score_short",
+        "score_delta",
+        "selected_bias",
+        "base_margin",
+        "margin_long",
+        "margin_short",
+        "fvg_side",
+        "vol_r",
+        "vol_regime",
+        "vol_em_1d",
+        "vol_tp1_em_ratio",
+        "evidence",
+        "gate",
+        "gate_reason",
+    ),
+    "setup_factors": (
+        "attribution_schema",
+        "candidate_id",
+        "event_id",
+        "setup_id",
+        "policy",
+        "fold_index",
+        "symbol",
+        "decision_time",
+        "candidate_side",
+        "trigger_kind",
+        "factor_schema",
+        "factor_key",
+        "factor_label",
+        "present",
+        "vote_side",
+        "relation",
+        "alignment",
+        "configured_weight",
+        "effective_weight",
+        "long_contribution",
+        "short_contribution",
+        "candidate_contribution",
+        "pivotal_without_factor",
+        "bias_without_factor",
+        "age_bars",
+        "score_long",
+        "score_short",
+        "score_delta",
+        "selected_bias",
+        "base_margin",
+        "margin_long",
+        "margin_short",
+        "fvg_side",
+        "entry_time",
+        "exit_time",
+        "status",
+        "net_r",
+        "pnl_amount",
+        "decision_year",
+        "decision_quarter",
+        "vol_r",
+        "vol_regime",
+        "vol_em_1d",
+        "vol_tp1_em_ratio",
+        "evidence",
+    ),
+    "factor_summary": (
+        "attribution_schema",
+        "policy",
+        "factor_key",
+        "factor_label",
+        "configured_weight",
+        "relation",
+        "dimension",
+        "dimension_value",
+        "setups",
+        "net_r",
+        "expectancy_r",
+        "shrunken_expectancy_r",
+        "prior_strength",
+        "win_rate",
+        "profit_factor",
+        "max_drawdown_r",
+        "average_win_r",
+        "average_loss_r",
+        "wins",
+        "losses",
+        "sample_quality",
+        "interpretation",
+    ),
+    "shadow_predictions": (
+        "schema",
+        "setup_id",
+        "candidate_id",
+        "fold_index",
+        "symbol",
+        "decision_time",
+        "side",
+        "trigger_kind",
+        "policy",
+        "model_status",
+        "model_id",
+        "train_setups",
+        "predicted_expected_r",
+        "actual_net_r",
+        "prediction_error_r",
+    ),
+    "shadow_coefficients": (
+        "schema",
+        "model_id",
+        "fold_index",
+        "train_start",
+        "purge_cutoff",
+        "test_start",
+        "train_setups",
+        "ridge_alpha",
+        "feature",
+        "coefficient",
+    ),
+    "shadow_metrics": (
+        "schema",
+        "dimension",
+        "dimension_value",
+        "setups",
+        "actual_expectancy_r",
+        "predicted_mean_r",
+        "mae_r",
+        "rmse_r",
+        "rank_ic",
+        "top_minus_bottom_quintile_r",
     ),
 }
 
@@ -648,6 +847,13 @@ class StrategyBacktestResult:
     setups: tuple[Mapping[str, Any], ...]
     legs: tuple[Mapping[str, Any], ...]
     folds: tuple[Mapping[str, Any], ...]
+    candidate_factors: tuple[Mapping[str, Any], ...]
+    setup_factors: tuple[Mapping[str, Any], ...]
+    factor_summary: tuple[Mapping[str, Any], ...]
+    shadow_models: Mapping[str, Any]
+    shadow_predictions: tuple[Mapping[str, Any], ...]
+    shadow_coefficients: tuple[Mapping[str, Any], ...]
+    shadow_metrics: tuple[Mapping[str, Any], ...]
 
     def write(self, output: str | Path) -> Path:
         return write_strategy_report(self, output)
@@ -723,8 +929,13 @@ class _Candidate:
             "gate_reason": self.gate_reason,
             "vol_r": self.signal.get("vol_R"),
             "vol_regime": self.signal.get("vol_regime"),
+            "vol_em_1d": self.signal.get("vol_em_1d"),
+            "vol_tp1_em_ratio": self.signal.get(
+                "vol_tp1_em_ratio"
+            ),
             "fvg_regime": self.signal.get("fvg_regime"),
             "narrative": self.signal.get("narrative"),
+            **factor_vector_fields(self.signal.get("factor_vector")),
         }
 
 
@@ -1106,6 +1317,16 @@ def _apply_deterministic_gates(
         for value in (enriched.get("tp_prices") or ())
         if value is not None
     ]
+    entry_value = enriched.get("entry_price")
+    if context.em_1d > 0 and entry_value is not None and targets:
+        tp1_distance = min(
+            abs(float(target) - float(entry_value))
+            for target in targets
+        )
+        enriched["vol_tp1_em_ratio"] = round(
+            float(tp1_distance / context.em_1d),
+            6,
+        )
     allowed, reason = entry_gate(
         context,
         enriched.get("entry_price"),
@@ -1137,6 +1358,174 @@ def _trigger_signature(signal: Mapping[str, Any]) -> str:
     else:
         anchor = f"s{float(signal.get('stop_price') or 0.0):.5f}"
     return f"{signal.get('side')}|{trigger}|{anchor}"
+
+
+def _validate_factor_vector(
+    signal: Mapping[str, Any],
+    *,
+    status: str,
+    required: bool,
+) -> None:
+    vector = signal.get("factor_vector")
+    if not isinstance(vector, Mapping):
+        if required and status in {"ENTER", "NO_TREND", "NO_TRIGGER"}:
+            raise StrategyBacktestError(
+                f"{status} signal is missing its structured factor vector"
+            )
+        return
+    raw_factors = vector.get("factors", ())
+    factors = [
+        row
+        for row in raw_factors
+        if isinstance(row, Mapping)
+    ]
+    if required:
+        actual_key_list = [str(row.get("key")) for row in factors]
+        actual_keys = set(actual_key_list)
+        if vector.get("schema") != FACTOR_VECTOR_SCHEMA:
+            raise StrategyBacktestError("unexpected factor-vector schema")
+        if (
+            len(factors) != len(FACTOR_WEIGHTS)
+            or len(actual_key_list) != len(actual_keys)
+            or actual_keys != set(FACTOR_WEIGHTS)
+        ):
+            raise StrategyBacktestError(
+                "factor vector must contain exactly five unique configured "
+                "factors"
+            )
+        configured = {
+            str(row.get("key")): row.get("configured_weight")
+            for row in factors
+        }
+        if configured != FACTOR_WEIGHTS:
+            raise StrategyBacktestError(
+                "factor vector configured weights do not match production"
+            )
+    score_long = sum(
+        float(row.get("long_contribution") or 0.0)
+        for row in factors
+    )
+    score_short = sum(
+        float(row.get("short_contribution") or 0.0)
+        for row in factors
+    )
+    if not math.isclose(
+        score_long,
+        float(vector.get("score_long") or 0.0),
+        abs_tol=1e-12,
+    ) or not math.isclose(
+        score_short,
+        float(vector.get("score_short") or 0.0),
+        abs_tol=1e-12,
+    ):
+        raise StrategyBacktestError(
+            "factor contributions do not reproduce narrative scores"
+        )
+    if required:
+        try:
+            rebuilt = build_factor_vector(
+                {
+                    str(row["key"]): {
+                        "present": row.get("present"),
+                        "side": row.get("vote_side"),
+                        "evidence": row.get("evidence") or {},
+                    }
+                    for row in factors
+                },
+                base_margin=int(vector["base_margin"]),
+                fvg_side=str(vector.get("fvg_side") or "NEUTRAL"),
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise StrategyBacktestError(
+                "factor vector cannot be reconstructed safely"
+            ) from exc
+
+        def require_equal(field: str, actual: Any, expected: Any) -> None:
+            if actual != expected:
+                raise StrategyBacktestError(
+                    f"factor-vector derived field {field} does not match "
+                    "production scoring"
+                )
+
+        def require_number(field: str, actual: Any, expected: Any) -> None:
+            try:
+                actual_value = float(actual)
+                expected_value = float(expected)
+            except (TypeError, ValueError) as exc:
+                raise StrategyBacktestError(
+                    f"factor-vector numeric field {field} is invalid"
+                ) from exc
+            if (
+                not math.isfinite(actual_value)
+                or not math.isclose(
+                    actual_value,
+                    expected_value,
+                    rel_tol=0.0,
+                    abs_tol=1e-12,
+                )
+            ):
+                raise StrategyBacktestError(
+                    f"factor-vector derived field {field} does not match "
+                    "production scoring"
+                )
+
+        for field in ("bias", "fvg_side"):
+            require_equal(field, vector.get(field), rebuilt[field])
+        for field in (
+            "score_long",
+            "score_short",
+            "score_delta_long_minus_short",
+            "base_margin",
+            "margin_long",
+            "margin_short",
+        ):
+            require_number(field, vector.get(field), rebuilt[field])
+
+        actual_by_key = {
+            str(row["key"]): row
+            for row in factors
+        }
+        for expected_row in rebuilt["factors"]:
+            key = str(expected_row["key"])
+            actual_row = actual_by_key[key]
+            for field in (
+                "label",
+                "vote_side",
+                "bias_without_factor",
+            ):
+                require_equal(
+                    f"{key}.{field}",
+                    actual_row.get(field),
+                    expected_row[field],
+                )
+            for field in ("present", "pivotal_without_factor"):
+                if not isinstance(actual_row.get(field), bool):
+                    raise StrategyBacktestError(
+                        f"factor-vector boolean field {key}.{field} is invalid"
+                    )
+                require_equal(
+                    f"{key}.{field}",
+                    actual_row.get(field),
+                    expected_row[field],
+                )
+            for field in (
+                "configured_weight",
+                "effective_weight",
+                "long_contribution",
+                "short_contribution",
+                "selected_side_contribution",
+            ):
+                require_number(
+                    f"{key}.{field}",
+                    actual_row.get(field),
+                    expected_row[field],
+                )
+    if status == "ENTER" and str(vector.get("bias")) != str(
+        signal.get("side")
+    ):
+        raise StrategyBacktestError(
+            "factor-vector bias does not match ENTER side"
+        )
 
 
 def _trigger_kind(signal: Mapping[str, Any]) -> str:
@@ -1262,6 +1651,13 @@ def _generate_candidates(
                         f"strategy failed: {exc}"
                     ) from exc
                 status = str(raw_signal.get("signal") or "UNKNOWN").upper()
+                _validate_factor_vector(
+                    raw_signal,
+                    status=status,
+                    required=(
+                        config.profile == "production-deterministic"
+                    ),
+                )
                 counters[f"signal_{status.lower()}"] += 1
                 if status == "ENTER":
                     counters["raw_candidates"] += 1
@@ -1419,7 +1815,10 @@ def _outcome_rows(
         "fvg_regime": signal.get("fvg_regime"),
         "vol_r": signal.get("vol_R"),
         "vol_regime": signal.get("vol_regime"),
+        "vol_em_1d": signal.get("vol_em_1d"),
+        "vol_tp1_em_ratio": signal.get("vol_tp1_em_ratio"),
         "narrative": signal.get("narrative"),
+        **factor_vector_fields(signal.get("factor_vector")),
     }
     legs = [
         {
@@ -1971,6 +2370,52 @@ def run_narrative_backtest(
                 }
             )
 
+    candidate_rows = tuple(
+        _safe_json_value(candidate.report_row())
+        for candidate in sorted(
+            all_candidates,
+            key=lambda item: (
+                item.decision_time,
+                item.symbol,
+                item.fold_index,
+            ),
+        )
+    )
+    setup_rows = tuple(
+        sorted(
+            (_safe_json_value(setup) for setup in all_setups),
+            key=lambda item: (
+                item["policy"],
+                item["decision_time"],
+                item["symbol"],
+            ),
+        )
+    )
+    candidate_factor_output = tuple(
+        _safe_json_value(row)
+        for row in candidate_factor_rows(candidate_rows)
+    )
+    setup_factor_output = tuple(
+        _safe_json_value(row)
+        for row in setup_factor_rows(setup_rows)
+    )
+    factor_summary_output = tuple(
+        _safe_json_value(row)
+        for row in factor_summary_rows(setup_factor_output)
+    )
+    factor_coverage = attribution_coverage(
+        candidates=candidate_rows,
+        setups=setup_rows,
+        candidate_factors=candidate_factor_output,
+        setup_factors=setup_factor_output,
+    )
+    shadow = build_shadow_scores(
+        setups=setup_rows,
+        periods=[period.to_dict() for period in periods],
+        symbols=config.symbols,
+        entry_ttl=config.entry_ttl,
+        max_holding=config.max_holding,
+    )
     config_payload = config.to_dict()
     intrabar_sensitivity = _intrabar_sensitivity(
         policy_summaries=policy_summaries,
@@ -1988,6 +2433,8 @@ def run_narrative_backtest(
         "signal_counters": dict(sorted(signal_counters.items())),
         "policies": policy_summaries,
         "intrabar_sensitivity": intrabar_sensitivity,
+        "factor_attribution": factor_coverage,
+        "shadow_score": shadow["summary"],
         "assumptions": {
             "decision": "each completed M15 candle",
             "context": (
@@ -2036,22 +2483,23 @@ def run_narrative_backtest(
                 "through a level and aggregate portfolio open risk are not yet "
                 "broker-accurate."
             ),
+            (
+                "Candidate-factor attribution is conditional on raw ENTER "
+                "signals (baseline directional bias plus a detected trigger). "
+                "Outcome summaries are conditional again on execution gates "
+                "and a fill. They do not identify unbiased replacement weights "
+                "or counterfactual LONG/SHORT outcomes."
+            ),
+            (
+                "The shadow score is diagnostic only and leaves candidate IDs, "
+                "execution dispositions, setup count, and fixed risk unchanged."
+            ),
         ],
     }
     return StrategyBacktestResult(
         summary=_safe_json_value(summary),
         config=_safe_json_value(config_payload),
-        candidates=tuple(
-            candidate.report_row()
-            for candidate in sorted(
-                all_candidates,
-                key=lambda item: (
-                    item.decision_time,
-                    item.symbol,
-                    item.fold_index,
-                ),
-            )
-        ),
+        candidates=candidate_rows,
         executions=tuple(
             sorted(
                 (
@@ -2065,18 +2513,27 @@ def run_narrative_backtest(
                 ),
             )
         ),
-        setups=tuple(
-            sorted(
-                (_safe_json_value(setup) for setup in all_setups),
-                key=lambda item: (
-                    item["policy"],
-                    item["decision_time"],
-                    item["symbol"],
-                ),
-            )
-        ),
+        setups=setup_rows,
         legs=tuple(_safe_json_value(leg) for leg in all_legs),
         folds=tuple(_safe_json_value(row) for row in fold_rows),
+        candidate_factors=candidate_factor_output,
+        setup_factors=setup_factor_output,
+        factor_summary=factor_summary_output,
+        shadow_models=_safe_json_value(
+            {
+                "summary": shadow["summary"],
+                "models": shadow["models"],
+            }
+        ),
+        shadow_predictions=tuple(
+            _safe_json_value(row) for row in shadow["predictions"]
+        ),
+        shadow_coefficients=tuple(
+            _safe_json_value(row) for row in shadow["coefficients"]
+        ),
+        shadow_metrics=tuple(
+            _safe_json_value(row) for row in shadow["metrics"]
+        ),
     )
 
 
@@ -2091,13 +2548,27 @@ def _write_csv(
             if empty_fields:
                 csv.DictWriter(stream, fieldnames=empty_fields).writeheader()
         return
-    fields: list[str] = []
-    seen: set[str] = set()
-    for row in rows:
-        for field in row:
-            if field not in seen:
-                seen.add(field)
-                fields.append(field)
+    fields = list(empty_fields)
+    seen = set(fields)
+    if fields:
+        unexpected = sorted(
+            {
+                str(field)
+                for row in rows
+                for field in row
+                if field not in seen
+            }
+        )
+        if unexpected:
+            raise StrategyBacktestError(
+                f"{path.name} contains undeclared columns: {unexpected}"
+            )
+    else:
+        for row in rows:
+            for field in row:
+                if field not in seen:
+                    seen.add(field)
+                    fields.append(field)
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
@@ -2154,6 +2625,39 @@ def write_strategy_report(
             staging / "legs.csv",
             result.legs,
             empty_fields=_EMPTY_CSV_FIELDS["legs"],
+        )
+        _write_csv(
+            staging / "candidate_factors.csv",
+            result.candidate_factors,
+            empty_fields=_EMPTY_CSV_FIELDS["candidate_factors"],
+        )
+        _write_csv(
+            staging / "setup_factor_attribution.csv",
+            result.setup_factors,
+            empty_fields=_EMPTY_CSV_FIELDS["setup_factors"],
+        )
+        _write_csv(
+            staging / "factor_summary.csv",
+            result.factor_summary,
+            empty_fields=_EMPTY_CSV_FIELDS["factor_summary"],
+        )
+        (staging / "shadow_models.json").write_bytes(
+            _json_bytes(result.shadow_models)
+        )
+        _write_csv(
+            staging / "shadow_scores.csv",
+            result.shadow_predictions,
+            empty_fields=_EMPTY_CSV_FIELDS["shadow_predictions"],
+        )
+        _write_csv(
+            staging / "shadow_coefficients.csv",
+            result.shadow_coefficients,
+            empty_fields=_EMPTY_CSV_FIELDS["shadow_coefficients"],
+        )
+        _write_csv(
+            staging / "shadow_score_metrics.csv",
+            result.shadow_metrics,
+            empty_fields=_EMPTY_CSV_FIELDS["shadow_metrics"],
         )
         _write_csv(staging / "folds.csv", result.folds)
         files = []
