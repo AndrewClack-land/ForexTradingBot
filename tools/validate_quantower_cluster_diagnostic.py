@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
+import struct
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -21,9 +23,23 @@ from uuid import UUID
 
 SCHEMA = "forexbot.quantower-cluster-diagnostic"
 BARS_SCHEMA = "forexbot.quantower-cluster-diagnostic-bars"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 M15 = timedelta(minutes=15)
 UTC = timezone.utc
+EXCLUSIVE_BAR_RIGHT_SEMANTICS = (
+    "quantower_time_right_equals_open_plus_period_used_as_exclusive_period_end"
+)
+INCLUSIVE_BAR_RIGHT_SEMANTICS = (
+    "quantower_time_right_equals_open_plus_period_minus_100ns_normalized_to_exclusive_period_end"
+)
+M15_TICKS = 9_000_000_000
+SOURCE_SPAN_TICKS_BY_SEMANTICS = {
+    EXCLUSIVE_BAR_RIGHT_SEMANTICS: M15_TICKS,
+    INCLUSIVE_BAR_RIGHT_SEMANTICS: M15_TICKS - 1,
+}
+UTC_MILLISECOND_TIMESTAMP = re.compile(
+    r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z"
+)
 
 
 class DiagnosticValidationError(ValueError):
@@ -38,6 +54,7 @@ class ValidationSummary:
     price_levels: int
     missing_slots: int
     content_sha256: str
+    exporter_binary_sha256: str
 
 
 def _fail(location: str, message: str) -> "None":
@@ -115,6 +132,333 @@ def _sha256(value: Any, location: str) -> str:
     return digest
 
 
+def _unpack_from(data: bytes, format_string: str, offset: int, location: str) -> tuple[Any, ...]:
+    size = struct.calcsize(format_string)
+    if offset < 0 or offset + size > len(data):
+        _fail(location, "truncated binary structure")
+    return struct.unpack_from(format_string, data, offset)
+
+
+def _require_binary_range(
+    offset: int,
+    size: int,
+    container_start: int,
+    container_end: int,
+    location: str,
+    description: str,
+) -> int:
+    if (
+        size < 0
+        or offset < container_start
+        or offset > container_end
+        or size > container_end - offset
+    ):
+        _fail(location, f"{description} is outside its declared container")
+    return offset + size
+
+
+def _rva_to_file_range(
+    rva: int,
+    size: int,
+    sections: Sequence[tuple[int, int, int, int]],
+    location: str,
+) -> tuple[int, int]:
+    if size <= 0:
+        _fail(location, "PE directory has an empty range")
+
+    matches: list[tuple[int, int]] = []
+    for virtual_address, _virtual_size, raw_pointer, raw_size in sections:
+        delta = rva - virtual_address
+        if delta < 0 or delta > raw_size or size > raw_size - delta:
+            continue
+        offset = raw_pointer + delta
+        matches.append((offset, offset + size))
+
+    if not matches:
+        _fail(location, f"RVA range 0x{rva:x}+0x{size:x} is outside section raw data")
+    if len(matches) != 1:
+        _fail(location, f"RVA range 0x{rva:x}+0x{size:x} maps ambiguously")
+    return matches[0]
+
+
+def _read_dotnet_mvid_bytes(data: bytes, location: str) -> str:
+    if len(data) < 0x40 or data[:2] != b"MZ":
+        _fail(location, "is not a PE image")
+    (pe_offset,) = _unpack_from(data, "<I", 0x3C, location)
+    if pe_offset < 0x40:
+        _fail(location, "has an invalid PE header offset")
+    if data[pe_offset : pe_offset + 4] != b"PE\x00\x00":
+        _fail(location, "has no PE signature")
+
+    coff_offset = pe_offset + 4
+    _require_binary_range(coff_offset, 20, 0, len(data), location, "COFF header")
+    (_, section_count, _, _, _, optional_size, _) = _unpack_from(
+        data, "<HHIIIHH", coff_offset, location
+    )
+    if section_count < 1:
+        _fail(location, "has no PE sections")
+
+    optional_offset = coff_offset + 20
+    optional_end = _require_binary_range(
+        optional_offset,
+        optional_size,
+        0,
+        len(data),
+        location,
+        "optional header",
+    )
+    (optional_magic,) = _unpack_from(data, "<H", optional_offset, location)
+    if optional_magic == 0x10B:
+        number_of_directories_offset = optional_offset + 92
+        data_directories_offset = optional_offset + 96
+    elif optional_magic == 0x20B:
+        number_of_directories_offset = optional_offset + 108
+        data_directories_offset = optional_offset + 112
+    else:
+        _fail(location, "has an unsupported PE optional-header magic")
+
+    _require_binary_range(
+        number_of_directories_offset,
+        4,
+        optional_offset,
+        optional_end,
+        location,
+        "NumberOfRvaAndSizes",
+    )
+    (number_of_directories,) = _unpack_from(
+        data, "<I", number_of_directories_offset, location
+    )
+    if number_of_directories <= 14:
+        _fail(location, "optional header has no CLR data directory")
+
+    cli_directory_offset = data_directories_offset + 14 * 8
+    _require_binary_range(
+        cli_directory_offset,
+        8,
+        optional_offset,
+        optional_end,
+        location,
+        "CLR data-directory entry",
+    )
+    cli_rva, cli_size = _unpack_from(data, "<II", cli_directory_offset, location)
+    if cli_rva == 0 or cli_size < 0x48:
+        _fail(location, "has no CLR header")
+
+    section_offset = optional_offset + optional_size
+    _require_binary_range(
+        section_offset,
+        section_count * 40,
+        0,
+        len(data),
+        location,
+        "PE section table",
+    )
+    sections: list[tuple[int, int, int, int]] = []
+    for index in range(section_count):
+        current = section_offset + index * 40
+        virtual_size, virtual_address, raw_size, raw_pointer = _unpack_from(
+            data, "<IIII", current + 8, location
+        )
+        if raw_size:
+            _require_binary_range(
+                raw_pointer,
+                raw_size,
+                0,
+                len(data),
+                location,
+                f"PE section {index} raw data",
+            )
+        sections.append((virtual_address, virtual_size, raw_pointer, raw_size))
+
+    cli_offset, cli_end = _rva_to_file_range(cli_rva, cli_size, sections, location)
+    (cli_header_size,) = _unpack_from(data, "<I", cli_offset, location)
+    if cli_header_size < 0x48 or cli_header_size > cli_size:
+        _fail(location, "CLR header size is outside its data-directory range")
+    _require_binary_range(
+        cli_offset, cli_header_size, cli_offset, cli_end, location, "CLR header"
+    )
+    metadata_rva, metadata_size = _unpack_from(data, "<II", cli_offset + 8, location)
+    if metadata_rva == 0 or metadata_size < 20:
+        _fail(location, "CLR header has no metadata root")
+    metadata_offset, metadata_end = _rva_to_file_range(
+        metadata_rva, metadata_size, sections, location
+    )
+
+    _require_binary_range(
+        metadata_offset,
+        16,
+        metadata_offset,
+        metadata_end,
+        location,
+        "CLR metadata root header",
+    )
+    (metadata_signature,) = _unpack_from(data, "<I", metadata_offset, location)
+    if metadata_signature != 0x424A5342:
+        _fail(location, "has no CLR metadata signature")
+
+    (version_length,) = _unpack_from(data, "<I", metadata_offset + 12, location)
+    if version_length < 1:
+        _fail(location, "CLR metadata has an empty version string")
+    version_offset = metadata_offset + 16
+    _require_binary_range(
+        version_offset,
+        version_length,
+        metadata_offset,
+        metadata_end,
+        location,
+        "CLR metadata version string",
+    )
+    if b"\x00" not in data[version_offset : version_offset + version_length]:
+        _fail(location, "CLR metadata version string is not null-terminated")
+
+    stream_header = metadata_offset + ((16 + version_length + 3) & ~3)
+    _require_binary_range(
+        stream_header,
+        4,
+        metadata_offset,
+        metadata_end,
+        location,
+        "CLR storage header",
+    )
+    (_, stream_count) = _unpack_from(data, "<HH", stream_header, location)
+    if stream_count < 1:
+        _fail(location, "CLR metadata has no streams")
+    stream_header += 4
+    streams: dict[str, tuple[int, int]] = {}
+    for _ in range(stream_count):
+        _require_binary_range(
+            stream_header,
+            8,
+            metadata_offset,
+            metadata_end,
+            location,
+            "CLR stream header",
+        )
+        stream_relative_offset, stream_size = _unpack_from(
+            data, "<II", stream_header, location
+        )
+        name_start = stream_header + 8
+        name_end = data.find(
+            b"\x00", name_start, min(name_start + 32, metadata_end)
+        )
+        if name_end < 0:
+            _fail(location, "has an unterminated CLR stream name")
+        try:
+            name = data[name_start:name_end].decode("ascii")
+        except UnicodeDecodeError:
+            _fail(location, "has a non-ASCII CLR stream name")
+        if not name:
+            _fail(location, "has an empty CLR stream name")
+        if name in streams:
+            _fail(location, f"has duplicate CLR stream {name!r}")
+        stream_offset = metadata_offset + stream_relative_offset
+        _require_binary_range(
+            stream_offset,
+            stream_size,
+            metadata_offset,
+            metadata_end,
+            location,
+            f"CLR stream {name!r}",
+        )
+        streams[name] = (stream_offset, stream_size)
+        stream_header += (8 + (name_end - name_start) + 1 + 3) & ~3
+
+    stream_headers_end = stream_header
+    _require_binary_range(
+        stream_headers_end,
+        0,
+        metadata_offset,
+        metadata_end,
+        location,
+        "CLR stream-header table",
+    )
+    stream_ranges = sorted(
+        (offset, offset + size, name)
+        for name, (offset, size) in streams.items()
+        if size
+    )
+    previous_end = stream_headers_end
+    previous_name = "metadata headers"
+    for stream_start, stream_end, stream_name in stream_ranges:
+        if stream_start < stream_headers_end:
+            _fail(location, f"CLR stream {stream_name!r} overlaps metadata headers")
+        if stream_start < previous_end:
+            _fail(
+                location,
+                f"CLR streams {previous_name!r} and {stream_name!r} overlap",
+            )
+        previous_end = stream_end
+        previous_name = stream_name
+
+    if "#~" in streams and "#-" in streams:
+        _fail(location, "has both compressed and uncompressed CLR table streams")
+    tables = streams.get("#~") or streams.get("#-")
+    guid_stream = streams.get("#GUID")
+    if tables is None or guid_stream is None:
+        _fail(location, "is missing CLR tables or GUID metadata")
+    tables_offset, tables_size = tables
+    guid_offset, guid_size = guid_stream
+    if tables_size < 24:
+        _fail(location, "CLR tables stream is truncated")
+    if guid_size < 16 or guid_size % 16:
+        _fail(location, "CLR GUID stream has an invalid size")
+    tables_end = tables_offset + tables_size
+
+    (heap_sizes,) = _unpack_from(data, "<B", tables_offset + 6, location)
+    (valid_mask,) = _unpack_from(data, "<Q", tables_offset + 8, location)
+    row_counts_offset = tables_offset + 24
+    row_counts: dict[int, int] = {}
+    for table_index in range(64):
+        if valid_mask & (1 << table_index):
+            _require_binary_range(
+                row_counts_offset,
+                4,
+                tables_offset,
+                tables_end,
+                location,
+                "CLR table row counts",
+            )
+            (row_count,) = _unpack_from(data, "<I", row_counts_offset, location)
+            row_counts[table_index] = row_count
+            row_counts_offset += 4
+    if row_counts.get(0, 0) != 1:
+        _fail(location, "must contain exactly one CLR Module row")
+
+    string_index_size = 4 if heap_sizes & 0x01 else 2
+    guid_index_size = 4 if heap_sizes & 0x02 else 2
+    module_row_size = 2 + string_index_size + 3 * guid_index_size
+    _require_binary_range(
+        row_counts_offset,
+        module_row_size,
+        tables_offset,
+        tables_end,
+        location,
+        "CLR Module row",
+    )
+    mvid_index_offset = row_counts_offset + 2 + string_index_size
+    mvid_format = "<I" if guid_index_size == 4 else "<H"
+    (mvid_index,) = _unpack_from(data, mvid_format, mvid_index_offset, location)
+    if mvid_index < 1:
+        _fail(location, "has an empty CLR Module MVID")
+    mvid_offset = guid_offset + (mvid_index - 1) * 16
+    _require_binary_range(
+        mvid_offset,
+        16,
+        guid_offset,
+        guid_offset + guid_size,
+        location,
+        "CLR Module MVID",
+    )
+    mvid = UUID(bytes_le=data[mvid_offset : mvid_offset + 16])
+    if mvid.int == 0:
+        _fail(location, "has a zero CLR Module MVID")
+    return str(mvid)
+
+
+def _read_dotnet_mvid(path: Path) -> str:
+    return _read_dotnet_mvid_bytes(path.read_bytes(), f"exporter DLL {path}")
+
+
 def _history_probe(value: Any, location: str, *, expected_history_type: str) -> Mapping[str, Any]:
     probe = _mapping(value, location)
     status = _string(_require(probe, "status", location), f"{location}.status")
@@ -184,15 +528,13 @@ def _decimal(value: Any, location: str, *, nonnegative: bool = False) -> Decimal
 
 def _utc(value: Any, location: str) -> datetime:
     text = _string(value, location)
-    if not text.endswith("Z"):
-        _fail(location, "must use the UTC Z suffix")
+    if UTC_MILLISECOND_TIMESTAMP.fullmatch(text) is None:
+        _fail(location, "must use canonical UTC format YYYY-MM-DDTHH:MM:SS.fffZ")
     try:
-        parsed = datetime.fromisoformat(text[:-1] + "+00:00")
+        parsed = datetime.strptime(text, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=UTC)
     except ValueError:
-        _fail(location, "must be an ISO-8601 UTC timestamp")
-    if parsed.utcoffset() != timedelta(0):
-        _fail(location, "must be UTC")
-    return parsed.astimezone(UTC)
+        _fail(location, "must be a valid canonical UTC timestamp")
+    return parsed
 
 
 def _require(value: Mapping[str, Any], key: str, location: str) -> Any:
@@ -264,6 +606,7 @@ def _validate_bar(
     strategy_symbol: str,
     captured_at_expected: datetime,
     snapshot_finished_at: datetime,
+    bar_right_boundary_semantics: str,
 ) -> tuple[datetime, int, str]:
     location = f"bars.json.bars[{index}]"
     bar = _mapping(raw, location)
@@ -287,17 +630,33 @@ def _validate_bar(
         _fail(f"{location}.bar_open", "must be on an exact M15 boundary")
     if bar_close - bar_open != M15:
         _fail(f"{location}.bar_close", "must equal bar_open + 15 minutes")
+    source_bar_span_ticks = _integer(
+        _require(bar, "source_bar_span_ticks", location),
+        f"{location}.source_bar_span_ticks",
+        minimum=0,
+    )
+    expected_source_span_ticks = SOURCE_SPAN_TICKS_BY_SEMANTICS[
+        bar_right_boundary_semantics
+    ]
+    if source_bar_span_ticks != expected_source_span_ticks:
+        _fail(
+            f"{location}.source_bar_span_ticks",
+            "does not match manifest bar_right_boundary_semantics",
+        )
     if captured_at < bar_close:
         _fail(f"{location}.captured_at", "must not precede bar_close")
     if captured_at != captured_at_expected or captured_at > snapshot_finished_at:
         _fail(f"{location}.captured_at", "does not match manifest snapshot observation")
     if _require(bar, "historical_available_at", location) is not None:
-        _fail(f"{location}.historical_available_at", "must remain null in diagnostic v1")
+        _fail(f"{location}.historical_available_at", "must remain null in diagnostic v2")
     if _require(bar, "availability_semantics", location) != "unknown_historical_latency":
         _fail(f"{location}.availability_semantics", "must remain unknown_historical_latency")
     if _require(bar, "finalized", location) is not True:
         _fail(f"{location}.finalized", "must be true")
-    if _require(bar, "finalization_basis", location) != "bar_close_before_closed_export_day":
+    if (
+        _require(bar, "finalization_basis", location)
+        != "canonical_bar_close_at_or_before_closed_export_day_end"
+    ):
         _fail(f"{location}.finalization_basis", "unexpected finalization rule")
 
     ohlc = _mapping(_require(bar, "ohlc", location), f"{location}.ohlc")
@@ -380,7 +739,11 @@ def _validate_bar(
     return bar_open, len(levels_raw), level_status
 
 
-def validate_export(root: str | Path) -> ValidationSummary:
+def validate_export(
+    root: str | Path,
+    *,
+    exporter_dll: str | Path | None = None,
+) -> ValidationSummary:
     base = Path(root).resolve(strict=True)
     if not base.is_dir():
         _fail(str(base), "must be an export directory")
@@ -425,10 +788,79 @@ def validate_export(root: str | Path) -> ValidationSummary:
         _require(source, "exporter_version", "manifest.json.source"),
         "manifest.json.source.exporter_version",
     )
-    _sha256(
-        _require(source, "exporter_binary_sha256", "manifest.json.source"),
-        "manifest.json.source.exporter_binary_sha256",
+    exporter_binary_sha256_raw = _require(
+        source, "exporter_binary_sha256", "manifest.json.source"
     )
+    exporter_binary_sha256_status = _string(
+        _require(source, "exporter_binary_sha256_status", "manifest.json.source"),
+        "manifest.json.source.exporter_binary_sha256_status",
+    )
+    exporter_module_version_id = _string(
+        _require(source, "exporter_module_version_id", "manifest.json.source"),
+        "manifest.json.source.exporter_module_version_id",
+    )
+    try:
+        if str(UUID(exporter_module_version_id)) != exporter_module_version_id:
+            _fail(
+                "manifest.json.source.exporter_module_version_id",
+                "must be a canonical lowercase UUID",
+            )
+    except ValueError:
+        _fail(
+            "manifest.json.source.exporter_module_version_id",
+            "must be a canonical lowercase UUID",
+        )
+
+    manifest_exporter_sha256: str | None
+    if exporter_binary_sha256_status == "AVAILABLE":
+        manifest_exporter_sha256 = _sha256(
+            exporter_binary_sha256_raw,
+            "manifest.json.source.exporter_binary_sha256",
+        )
+    elif exporter_binary_sha256_status == "UNAVAILABLE_FROM_RUNTIME_ASSEMBLY_PATH":
+        if exporter_binary_sha256_raw is not None:
+            _fail(
+                "manifest.json.source.exporter_binary_sha256",
+                "must be null when runtime assembly path is unavailable",
+            )
+        manifest_exporter_sha256 = None
+    else:
+        _fail(
+            "manifest.json.source.exporter_binary_sha256_status",
+            "unsupported exporter binary SHA-256 status",
+        )
+
+    validated_exporter_sha256 = manifest_exporter_sha256
+    if exporter_dll is not None:
+        exporter_dll_path = Path(exporter_dll).expanduser().resolve(strict=True)
+        if not exporter_dll_path.is_file():
+            _fail(str(exporter_dll_path), "exporter DLL must be a file")
+        exporter_dll_bytes = exporter_dll_path.read_bytes()
+        validated_exporter_sha256 = hashlib.sha256(exporter_dll_bytes).hexdigest()
+        if (
+            _read_dotnet_mvid_bytes(
+                exporter_dll_bytes,
+                f"exporter DLL {exporter_dll_path}",
+            )
+            != exporter_module_version_id
+        ):
+            _fail(
+                str(exporter_dll_path),
+                "CLR Module MVID does not match manifest exporter_module_version_id",
+            )
+        if (
+            manifest_exporter_sha256 is not None
+            and validated_exporter_sha256 != manifest_exporter_sha256
+        ):
+            _fail(
+                str(exporter_dll_path),
+                "SHA-256 does not match manifest exporter_binary_sha256",
+            )
+    elif manifest_exporter_sha256 is None:
+        _fail(
+            "manifest.json.source.exporter_binary_sha256",
+            "runtime path unavailable; validate with --exporter-dll",
+        )
 
     instrument = _mapping(_require(manifest, "instrument", "manifest.json"), "manifest.json.instrument")
     source_symbol = _string(
@@ -445,11 +877,17 @@ def validate_export(root: str | Path) -> ValidationSummary:
     )
     if tick_size <= 0:
         _fail("manifest.json.instrument.tick_size", "must be positive")
-    _decimal(
-        _require(instrument, "min_volume_analysis_tick_size", "manifest.json.instrument"),
-        "manifest.json.instrument.min_volume_analysis_tick_size",
-        nonnegative=True,
+    min_volume_analysis_tick_size = _require(
+        instrument,
+        "min_volume_analysis_tick_size",
+        "manifest.json.instrument",
     )
+    if min_volume_analysis_tick_size is not None:
+        _decimal(
+            min_volume_analysis_tick_size,
+            "manifest.json.instrument.min_volume_analysis_tick_size",
+            nonnegative=True,
+        )
     history_type, _ = _enum_snapshot(
         _require(instrument, "symbol_history_type", "manifest.json.instrument"),
         "manifest.json.instrument.symbol_history_type",
@@ -492,6 +930,19 @@ def validate_export(root: str | Path) -> ValidationSummary:
         _require(calculation, "chart_aggregation", "manifest.json.calculation"),
         "manifest.json.calculation.chart_aggregation",
     )
+    bar_right_boundary_semantics = _string(
+        _require(
+            calculation,
+            "bar_right_boundary_semantics",
+            "manifest.json.calculation",
+        ),
+        "manifest.json.calculation.bar_right_boundary_semantics",
+    )
+    if bar_right_boundary_semantics not in SOURCE_SPAN_TICKS_BY_SEMANTICS:
+        _fail(
+            "manifest.json.calculation.bar_right_boundary_semantics",
+            "unsupported M15 right-boundary normalization",
+        )
     if _boolean(
         _require(calculation, "price_levels_requested", "manifest.json.calculation"),
         "manifest.json.calculation.price_levels_requested",
@@ -518,13 +969,13 @@ def validate_export(root: str | Path) -> ValidationSummary:
         "manifest.json.semantics.classification",
     )
     if classification not in {
-        "quantower_bidask_tick_reconstructed",
+        "quantower_tick_reconstructed_bidask_history_available",
         "trade_capable_source_unverified_calculation",
         "unknown",
     }:
         _fail("manifest.json.semantics.classification", "unknown classification")
     if _require(semantics, "classification_status", "manifest.json.semantics") != "UNVERIFIED":
-        _fail("manifest.json.semantics.classification_status", "diagnostic v1 must remain UNVERIFIED")
+        _fail("manifest.json.semantics.classification_status", "diagnostic v2 must remain UNVERIFIED")
     for description in ("buy_volume", "sell_volume", "trades"):
         _string(
             _require(semantics, description, "manifest.json.semantics"),
@@ -552,9 +1003,8 @@ def validate_export(root: str | Path) -> ValidationSummary:
         _fail("manifest.json.semantics.evidence", "complete diagnostic requires successful Last and BidAsk probes")
     if classification == "unknown":
         _fail("manifest.json.semantics.classification", "complete diagnostic requires a probe-supported classification")
-    if classification == "quantower_bidask_tick_reconstructed" and not (
-        history_type == "BidAsk"
-        and last_probe["status"] == "OK"
+    if classification == "quantower_tick_reconstructed_bidask_history_available" and not (
+        last_probe["status"] == "OK"
         and last_probe["items"] == 0
         and bid_ask_probe["status"] == "OK"
         and bid_ask_probe["items"] > 0
@@ -609,7 +1059,7 @@ def validate_export(root: str | Path) -> ValidationSummary:
 
     files = _sequence(_require(manifest, "files", "manifest.json"), "manifest.json.files")
     if len(files) != 1:
-        _fail("manifest.json.files", "diagnostic v1 must contain only bars.json")
+        _fail("manifest.json.files", "diagnostic v2 must contain only bars.json")
     matching = [item for item in files if isinstance(item, dict) and item.get("path") == "bars.json"]
     if len(matching) != 1:
         _fail("manifest.json.files", "must contain exactly one bars.json entry")
@@ -671,6 +1121,7 @@ def validate_export(root: str | Path) -> ValidationSummary:
             strategy_symbol=strategy_symbol,
             captured_at_expected=created_at,
             snapshot_finished_at=snapshot_finished_at,
+            bar_right_boundary_semantics=bar_right_boundary_semantics,
         )
         opens.append(bar_open)
         level_count += levels
@@ -725,15 +1176,21 @@ def validate_export(root: str | Path) -> ValidationSummary:
         price_levels=level_count,
         missing_slots=len(expected_missing),
         content_sha256=digest,
+        exporter_binary_sha256=validated_exporter_sha256,
     )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("export", type=Path, help="Quantower diagnostic export directory")
+    parser.add_argument(
+        "--exporter-dll",
+        type=Path,
+        help="installed exporter DLL used to verify SHA-256 and CLR Module MVID",
+    )
     args = parser.parse_args(argv)
     try:
-        summary = validate_export(args.export)
+        summary = validate_export(args.export, exporter_dll=args.exporter_dll)
     except (DiagnosticValidationError, FileNotFoundError, OSError) as exc:
         print(f"INVALID: {exc}")
         return 2

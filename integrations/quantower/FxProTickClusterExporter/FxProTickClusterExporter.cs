@@ -25,12 +25,17 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
 {
     private const string DiagnosticSchema = "forexbot.quantower-cluster-diagnostic";
     private const string BarsSchema = "forexbot.quantower-cluster-diagnostic-bars";
-    private const int SchemaVersion = 1;
-    private const string ExporterVersion = "0.1.0";
+    private const int SchemaVersion = 2;
+    private const string ExporterVersion = "0.2.3";
     private const string Timeframe = "15m";
     private const int ExpectedSlots = 96;
+    private const string ExclusiveBarRightSemantics =
+        "quantower_time_right_equals_open_plus_period_used_as_exclusive_period_end";
+    private const string QuantowerInclusiveBarRightSemantics =
+        "quantower_time_right_equals_open_plus_period_minus_100ns_normalized_to_exclusive_period_end";
 
     private static readonly TimeSpan M15 = TimeSpan.FromMinutes(15);
+    private static readonly TimeSpan M15InclusiveRight = M15 - TimeSpan.FromTicks(1);
     private static readonly UTF8Encoding Utf8NoBom = new(false);
     private static readonly JsonSerializerOptions JsonOptions = new()
     {
@@ -179,6 +184,14 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             throw new InvalidOperationException("OUTPUT_DIRECTORY_REQUIRED");
         }
 
+        if (
+            HistoricalData.Aggregation is not HistoryAggregationTime timeAggregation
+            || timeAggregation.Period.Duration != M15
+        )
+        {
+            throw new InvalidOperationException("CHART_IS_NOT_STRICT_M15");
+        }
+
         var progress = HistoricalData.VolumeAnalysisCalculationProgress;
         if (progress is null || progress.State != VolumeAnalysisCalculationState.Finished)
         {
@@ -207,6 +220,20 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
 
         double tickSize = Symbol.TickSize;
         RequireFinitePositive(tickSize, "symbol tick size");
+        double minVolumeAnalysisTickSize = Symbol.MinVolumeAnalysisTickSize;
+        string? minVolumeAnalysisTickSizeText;
+        if (!double.IsFinite(minVolumeAnalysisTickSize))
+        {
+            minVolumeAnalysisTickSizeText = null;
+        }
+        else
+        {
+            if (minVolumeAnalysisTickSize < 0)
+            {
+                throw new InvalidOperationException("MIN_VOLUME_ANALYSIS_TICK_SIZE_NEGATIVE");
+            }
+            minVolumeAnalysisTickSizeText = DecimalString(minVolumeAnalysisTickSize);
+        }
 
         var bars = new List<DiagnosticBar>();
         var seenBarOpens = new HashSet<long>();
@@ -214,6 +241,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         bool allLevelSumsMatch = true;
         int nullPriceLevelBars = 0;
         int emptyPriceLevelBars = 0;
+        string? barRightBoundarySemantics = null;
 
         for (int index = 0; index < HistoricalData.Count; index++)
         {
@@ -223,15 +251,58 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             }
 
             DateTime barOpenUtc = NormalizeUtc(bar.TimeLeft, "bar_open");
-            DateTime barCloseUtc = NormalizeUtc(bar.TimeRight, "bar_close");
+            DateTime barRightUtc = NormalizeUtc(bar.TimeRight, "bar_right");
             if (barOpenUtc < dayStartUtc || barOpenUtc >= dayEndUtc)
             {
                 continue;
             }
 
-            if (barCloseUtc - barOpenUtc != M15)
+            TimeSpan reportedBarSpan = barRightUtc - barOpenUtc;
+            DateTime barCloseUtc;
+            string observedBarRightSemantics;
+            if (reportedBarSpan == M15)
             {
-                throw new InvalidOperationException("CHART_IS_NOT_STRICT_M15");
+                barCloseUtc = barRightUtc;
+                observedBarRightSemantics = ExclusiveBarRightSemantics;
+            }
+            else if (reportedBarSpan == M15InclusiveRight)
+            {
+                barCloseUtc = barOpenUtc.Add(M15);
+                observedBarRightSemantics = QuantowerInclusiveBarRightSemantics;
+            }
+            else
+            {
+                Core.Loggers.Log(
+                    "FxPro Tick Cluster Exporter: M15 boundary mismatch:"
+                        + " aggregation="
+                        + (HistoricalData.Aggregation?.ToString() ?? "UNKNOWN")
+                        + ", open_utc="
+                        + FormatUtc(barOpenUtc)
+                        + ", right_utc="
+                        + FormatUtc(barRightUtc)
+                        + ", duration_ticks="
+                        + reportedBarSpan.Ticks.ToString(CultureInfo.InvariantCulture)
+                        + ", expected_ticks="
+                        + M15.Ticks.ToString(CultureInfo.InvariantCulture)
+                        + ".",
+                    LoggingLevel.Error
+                );
+                throw new InvalidOperationException("UNSUPPORTED_M15_RIGHT_BOUNDARY");
+            }
+
+            if (barRightBoundarySemantics is null)
+            {
+                barRightBoundarySemantics = observedBarRightSemantics;
+            }
+            else if (
+                !string.Equals(
+                    barRightBoundarySemantics,
+                    observedBarRightSemantics,
+                    StringComparison.Ordinal
+                )
+            )
+            {
+                throw new InvalidOperationException("MIXED_M15_RIGHT_BOUNDARY_SEMANTICS");
             }
 
             RequireM15Boundary(barOpenUtc);
@@ -252,6 +323,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
                 tickSize,
                 barOpenUtc,
                 barCloseUtc,
+                reportedBarSpan.Ticks,
                 capturedAtUtc
             );
             bars.Add(snapshot);
@@ -281,6 +353,9 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         {
             throw new InvalidOperationException("NO_BARS_FOR_TARGET_UTC_DAY");
         }
+        string resolvedBarRightBoundarySemantics =
+            barRightBoundarySemantics
+            ?? throw new InvalidOperationException("M15_RIGHT_BOUNDARY_SEMANTICS_UNAVAILABLE");
 
         List<string> missingBarOpens = BuildMissingSlots(dayStartUtc, seenBarOpens);
         ProbeEvidence evidence = RunHistoryProbes
@@ -308,11 +383,12 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             StrategySymbol = strategySymbol,
             ConnectorLabel = connectorLabel,
             TickSize = DecimalString(tickSize),
-            MinVolumeAnalysisTickSize = DecimalString(Symbol.MinVolumeAnalysisTickSize),
+            MinVolumeAnalysisTickSize = minVolumeAnalysisTickSizeText,
             SymbolHistoryType = EnumSnapshot.From(Symbol.HistoryType),
             SymbolVolumeType = EnumSnapshot.From(Symbol.VolumeType),
             DeltaCalculationType = EnumSnapshot.From(Symbol.DeltaCalculationType),
             ChartAggregation = HistoricalData.Aggregation?.ToString() ?? "UNKNOWN",
+            BarRightBoundarySemantics = resolvedBarRightBoundarySemantics,
             AllowCalculateRealtimeTicks = Symbol.AllowCalculateRealtimeTicks,
             AllowCalculateRealtimeVolume = Symbol.AllowCalculateRealtimeVolume,
             AllowCalculateRealtimeTrades = Symbol.AllowCalculateRealtimeTrades,
@@ -339,6 +415,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         double tickSize,
         DateTime barOpenUtc,
         DateTime barCloseUtc,
+        long sourceBarSpanTicks,
         DateTime capturedAtUtc
     )
     {
@@ -435,11 +512,12 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             Timeframe = Timeframe,
             BarOpen = FormatUtc(barOpenUtc),
             BarClose = FormatUtc(barCloseUtc),
+            SourceBarSpanTicks = sourceBarSpanTicks,
             CapturedAt = FormatUtc(capturedAtUtc),
             HistoricalAvailableAt = null,
             AvailabilitySemantics = "unknown_historical_latency",
             Finalized = true,
-            FinalizationBasis = "bar_close_before_closed_export_day",
+            FinalizationBasis = "canonical_bar_close_at_or_before_closed_export_day_end",
             Ohlc = new Ohlc
             {
                 Open = DecimalString(bar.Open),
@@ -569,11 +647,10 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             && evidence.BidAskProbe.Status == "OK"
             && evidence.BidAskProbe.Items > 0
             && evidence.BidAskProbe.TypedItems > 0
-            && Symbol.HistoryType == HistoryType.BidAsk
             && Symbol.VolumeType == SymbolVolumeType.Ticks
         )
         {
-            return "quantower_bidask_tick_reconstructed";
+            return "quantower_tick_reconstructed_bidask_history_available";
         }
 
         if (
@@ -663,6 +740,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         string barsSha256
     )
     {
+        string? exporterBinarySha256 = TryAssemblySha256();
         return new DiagnosticManifest
         {
             Schema = DiagnosticSchema,
@@ -684,7 +762,14 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
                 ConnectorVendor = snapshot.ConnectorLabel,
                 ConnectorVendorSemantics = "operator_label_not_connection_identity",
                 ExporterVersion = ExporterVersion,
-                ExporterBinarySha256 = TryAssemblySha256(),
+                ExporterBinarySha256 = exporterBinarySha256,
+                ExporterBinarySha256Status = exporterBinarySha256 is null
+                    ? "UNAVAILABLE_FROM_RUNTIME_ASSEMBLY_PATH"
+                    : "AVAILABLE",
+                ExporterModuleVersionId = Assembly
+                    .GetExecutingAssembly()
+                    .ManifestModule.ModuleVersionId.ToString("D")
+                    .ToLowerInvariant(),
             },
             Instrument = new InstrumentMetadata
             {
@@ -703,6 +788,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             {
                 Period = Timeframe,
                 ChartAggregation = snapshot.ChartAggregation,
+                BarRightBoundarySemantics = snapshot.BarRightBoundarySemantics,
                 PriceLevelsRequested = true,
                 VolumeBasis = "native_quantower_volume_analysis",
                 Timezone = "UTC",
@@ -857,12 +943,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
 
     private static void RequireM15Boundary(DateTime value)
     {
-        if (
-            value.Kind != DateTimeKind.Utc
-            || value.Minute % 15 != 0
-            || value.Second != 0
-            || value.Millisecond != 0
-        )
+        if (value.Kind != DateTimeKind.Utc || value.TimeOfDay.Ticks % M15.Ticks != 0)
         {
             throw new InvalidOperationException("BAR_OPEN_NOT_ON_M15_UTC_BOUNDARY");
         }
@@ -1031,21 +1112,60 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
 
     private static string? TryAssemblySha256()
     {
-        try
+        Assembly assembly = Assembly.GetExecutingAssembly();
+        string location = assembly.Location;
+        string modulePath = assembly.ManifestModule.FullyQualifiedName;
+        var candidates = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        if (!string.IsNullOrWhiteSpace(location))
         {
-            string location = Assembly.GetExecutingAssembly().Location;
-            if (string.IsNullOrWhiteSpace(location) || !File.Exists(location))
+            candidates.Add(location);
+        }
+        if (
+            !string.IsNullOrWhiteSpace(modulePath)
+            && !string.Equals(modulePath, "<Unknown>", StringComparison.OrdinalIgnoreCase)
+        )
+        {
+            candidates.Add(modulePath);
+        }
+
+        foreach (string candidate in candidates)
+        {
+            if (!File.Exists(candidate))
             {
-                return null;
+                continue;
             }
 
-            using FileStream stream = File.OpenRead(location);
-            return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            try
+            {
+                using FileStream stream = new(
+                    candidate,
+                    FileMode.Open,
+                    FileAccess.Read,
+                    FileShare.ReadWrite | FileShare.Delete
+                );
+                return Convert.ToHexString(SHA256.HashData(stream)).ToLowerInvariant();
+            }
+            catch (Exception ex)
+            {
+                Core.Loggers.Log(
+                    "FxPro Tick Cluster Exporter: binary SHA-256 candidate failed ("
+                        + SafeErrorCode(ex)
+                        + ").",
+                    LoggingLevel.Error
+                );
+            }
         }
-        catch
-        {
-            return null;
-        }
+
+        Core.Loggers.Log(
+            "FxPro Tick Cluster Exporter: binary SHA-256 path unavailable:"
+                + " assembly_location_known="
+                + (!string.IsNullOrWhiteSpace(location)).ToString(CultureInfo.InvariantCulture)
+                + ", module_path_known="
+                + (!string.IsNullOrWhiteSpace(modulePath)).ToString(CultureInfo.InvariantCulture)
+                + ".",
+            LoggingLevel.Error
+        );
+        return null;
     }
 
     private sealed class ExportSnapshot
@@ -1060,11 +1180,12 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         public required string StrategySymbol { get; init; }
         public required string ConnectorLabel { get; init; }
         public required string TickSize { get; init; }
-        public required string MinVolumeAnalysisTickSize { get; init; }
+        public string? MinVolumeAnalysisTickSize { get; init; }
         public required EnumSnapshot SymbolHistoryType { get; init; }
         public required EnumSnapshot SymbolVolumeType { get; init; }
         public required EnumSnapshot DeltaCalculationType { get; init; }
         public required string ChartAggregation { get; init; }
+        public required string BarRightBoundarySemantics { get; init; }
         public required bool AllowCalculateRealtimeTicks { get; init; }
         public required bool AllowCalculateRealtimeVolume { get; init; }
         public required bool AllowCalculateRealtimeTrades { get; init; }
@@ -1124,6 +1245,8 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         public required string ConnectorVendorSemantics { get; init; }
         public required string ExporterVersion { get; init; }
         public string? ExporterBinarySha256 { get; init; }
+        public required string ExporterBinarySha256Status { get; init; }
+        public required string ExporterModuleVersionId { get; init; }
     }
 
     private sealed class InstrumentMetadata
@@ -1131,7 +1254,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         public required string SourceSymbol { get; init; }
         public required string StrategySymbol { get; init; }
         public required string TickSize { get; init; }
-        public required string MinVolumeAnalysisTickSize { get; init; }
+        public string? MinVolumeAnalysisTickSize { get; init; }
         public required EnumSnapshot SymbolHistoryType { get; init; }
         public required EnumSnapshot SymbolVolumeType { get; init; }
         public required EnumSnapshot SymbolDeltaCalculationType { get; init; }
@@ -1144,6 +1267,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
     {
         public required string Period { get; init; }
         public required string ChartAggregation { get; init; }
+        public required string BarRightBoundarySemantics { get; init; }
         public required bool PriceLevelsRequested { get; init; }
         public required string VolumeBasis { get; init; }
         public required string Timezone { get; init; }
@@ -1201,6 +1325,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         public required string Timeframe { get; init; }
         public required string BarOpen { get; init; }
         public required string BarClose { get; init; }
+        public required long SourceBarSpanTicks { get; init; }
         public required string CapturedAt { get; init; }
         public string? HistoricalAvailableAt { get; init; }
         public required string AvailabilitySemantics { get; init; }

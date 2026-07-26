@@ -8,7 +8,7 @@
     <DebugType>portable</DebugType>
     <AssemblyName>FxProTickClusterExporter</AssemblyName>
     <RootNamespace>ForexBot.Quantower</RootNamespace>
-    <Version>0.1.0</Version>
+    <Version>0.2.3</Version>
     <QuantowerBin Condition="'$(QuantowerBin)' == ''">E:\Quantower\TradingPlatform\v1.146.14\bin</QuantowerBin>
   </PropertyGroup>
 

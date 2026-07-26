@@ -843,17 +843,33 @@ Quantower 1.146.14 / .NET 10 indicator that exports one closed UTC day of M15
 row. It also records the effective symbol history/volume/delta types and probes
 the same day as `Last` and `BidAsk` history.
 
+On the audited FxPro/Quantower M15 history, `HistoryItemBar.TimeRight` is the
+inclusive period end `TimeLeft + 15 minutes - 100 ns`. The exporter records
+that exact source convention, but emits canonical UTC half-open bars
+`[bar_open, bar_close)` with `bar_close = bar_open + 15 minutes`. Exact
+exclusive ends are also supported; unknown, approximate, or mixed boundary
+conventions fail closed. Every exported timestamp must use the exact canonical
+format `YYYY-MM-DDTHH:MM:SS.fffZ`; additional fractional digits are rejected
+instead of being rounded or truncated.
+
 FxPro exposes this feed to Quantower as ticks with TickDirection delta, not as
 proven exchange executions. The output schema
-`forexbot.quantower-cluster-diagnostic` v1 is therefore always `UNVERIFIED`,
+`forexbot.quantower-cluster-diagnostic` v2 is therefore always `UNVERIFIED`,
 has no historical `available_at`, and is intentionally rejected by
 `AbsorptionEventDataset`. A `VALID_DIAGNOSTIC` result requires complete
-PriceLevels plus successful Last/BidAsk probes. Validate without converting:
+PriceLevels plus successful Last/BidAsk probes. When Quantower memory-loads the
+indicator and cannot self-hash it, validation also requires the installed DLL;
+the validator matches its CLR MVID to the manifest and reports its SHA-256.
+Validate the completed snapshot without converting:
 
 ```bash
 python tools/validate_quantower_cluster_diagnostic.py \
-  /path/to/fxpro-tick-cluster-EURUSD-YYYY-MM-DD-id
+  /path/to/fxpro-tick-cluster-EURUSD-YYYY-MM-DD-id \
+  --exporter-dll /path/to/FxProTickClusterExporter.dll
 ```
+
+Pass the final snapshot directory containing both `bars.json` and
+`manifest.json`, not the output root or a `.partial-*` directory.
 
 See the exporter README for build, Quantower installation, chart-history
 limits, and capture steps. Live Absorption remains off until this evidence is

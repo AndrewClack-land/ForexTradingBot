@@ -117,9 +117,11 @@ reconstruction, never as exchange executions or proven aggressor flow.
 
 `integrations/quantower/FxProTickClusterExporter/` is the current audited
 diagnostic path. It exports one closed UTC M15 day under schema
-`forexbot.quantower-cluster-diagnostic` v1, plus Last/BidAsk probes, coverage,
+`forexbot.quantower-cluster-diagnostic` v2, plus Last/BidAsk probes, coverage,
 causality metadata, and hashes. Validate it with
-`tools/validate_quantower_cluster_diagnostic.py`. This raw schema is
+`tools/validate_quantower_cluster_diagnostic.py`; when the manifest says the
+runtime assembly path was unavailable, `--exporter-dll` is mandatory and its
+CLR MVID must match the manifest before its SHA-256 is accepted. This raw schema is
 deliberately incompatible with `AbsorptionEventDataset` and must never be
 passed to `--orderflow-data`; its safety flags must remain `UNVERIFIED`, false
 for exchange/aggressor proof, and false for sidecar eligibility. Snapshot time
@@ -129,6 +131,27 @@ field is an operator label, not connection identity. `VALID_DIAGNOSTIC`
 requires the DLL hash, Ticks/TickDirection metadata, consistent symbol mapping,
 complete PriceLevels, a closed day with explicit UTC, and successful Last plus
 BidAsk probes containing recognized tick items.
+
+The audited FxPro/Quantower M15 feed reports `HistoryItemBar.TimeRight` as
+`TimeLeft + 15 minutes - one .NET tick (100 ns)`. Treat raw `TimeRight` only as
+source metadata. Diagnostic rows must use canonical UTC `[bar_open, bar_close)`
+intervals with `bar_close = bar_open + 15 minutes`; each row must retain the
+exact `source_bar_span_ticks`, and the manifest must retain
+`bar_right_boundary_semantics`. Accept only the exact exclusive-period end or
+the exact inclusive-period end minus 100 ns normalized to the exclusive close.
+Reject absent, approximate, unsupported, or mixed boundary semantics. All
+timestamp fields must use the exporter's exact canonical UTC format
+`YYYY-MM-DDTHH:MM:SS.fffZ`; never round or truncate extra fractional digits.
+
+The audited connector's default `HistoryType` is `Bid`, while its explicit
+`BidAsk` probe returns recognized tick items and its `Last` probe returns none.
+The classification
+`quantower_tick_reconstructed_bidask_history_available` means only that
+Quantower can supply reconstructable Bid/Ask tick history; it does not prove
+executions or aggressor polarity. `MinVolumeAnalysisTickSize` may be null when
+Quantower exposes it as non-finite; a finite negative value is an export error,
+not unavailable data. Neither condition may be replaced with a guessed value
+or a stronger provenance claim.
 
 The available Bybit footprint cache is for different markets and cannot be
 mapped to EURUSD/GBPUSD/USDCAD. Absorption remains OFF on the live VPS until the
