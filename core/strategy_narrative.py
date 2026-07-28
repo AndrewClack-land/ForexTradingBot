@@ -1,7 +1,7 @@
 # core/strategy_narrative.py
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Literal, Tuple, Any, List
 
 import time
@@ -284,6 +284,10 @@ class NarrativeStrategy:
             )
         except (TypeError, ValueError):
             self.cluster_rejection_15m_entry_enabled = False
+        # Research-only, per-symbol relaxation of the candle-identity check.
+        # Live keeps the strict production tolerance: an empty map means the
+        # configured FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS applies everywhere.
+        self.cluster_candle_tolerance_ticks_by_symbol: dict[str, int] = {}
         self.quote_pressure_rejection_15m_entry_enabled = (
             FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED
         )
@@ -904,6 +908,15 @@ class NarrativeStrategy:
                 if isinstance(event, dict)
                 else getattr(event, "available_at", None)
             )
+            thresholds = self._cluster_rejection_thresholds
+            override = self.cluster_candle_tolerance_ticks_by_symbol.get(
+                str(symbol or "").strip().upper()
+            )
+            if override is not None:
+                thresholds = replace(
+                    thresholds,
+                    candle_match_tolerance_ticks=int(override),
+                )
             rejection = detect_fxpro_cluster_rejection(
                 candle=df_15M.iloc[position].to_dict(),
                 candle_open_time=candle_open_time,
@@ -911,7 +924,7 @@ class NarrativeStrategy:
                 symbol=symbol,
                 side=side,
                 decision_time=decision_time,
-                thresholds=self._cluster_rejection_thresholds,
+                thresholds=thresholds,
                 allow_research_assumption=(
                     self.cluster_rejection_allow_research_assumption
                 ),

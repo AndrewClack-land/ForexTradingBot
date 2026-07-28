@@ -290,6 +290,22 @@ labelled and reported as such. The canonical baseline keeps volatility/EM
 enabled, the configured production sessions, RB15 entry disabled, OB1H entry
 enabled, and score margin `2`.
 
+`--cluster-candle-tolerance-ticks SYMBOL=TICKS` is another such override and
+needs its own warning. The cluster detector requires the sealed event and the
+candle to agree within `candle_match_tolerance_ticks`, which is sound live
+where both come from one broker. In research the event carries FxPro candles
+while the snapshot carries LSE candles, and the measured venue disagreement
+exceeds the production tolerance of `2` for most bars: over 2026-06-28..07-27
+only `46.5%` of EURUSD bars matched, `2.1%` of GBPUSD and `0.0%` of USDCAD.
+The unrelaxed research population is therefore selected on cross-venue price
+agreement rather than on the pattern, so neither its expectancy nor its win
+rate estimates live behaviour. Relaxing the tolerance restores reachability but
+does not repair the source mismatch: such runs are marked
+`candle_identity_relaxed` with
+`research_only_cross_venue_candle_disagreement_not_live_parity` and must never
+be reported as OOS evidence. The trustworthy path for this factor is
+forward-observed capture where cluster and candle share one venue.
+
 Production-deterministic reports must attest:
 
 - the immutable snapshot manifest;

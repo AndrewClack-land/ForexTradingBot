@@ -317,6 +317,19 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     optimize_v2.add_argument(
+        "--cluster-candle-tolerance-ticks",
+        action="append",
+        metavar="SYMBOL=TICKS",
+        help=(
+            "research-only per-symbol override of the cluster candle-identity "
+            "tolerance, e.g. EURUSD=4; the sealed cluster carries FxPro "
+            "candles while the snapshot carries LSE candles, so the strict "
+            "production tolerance vetoes bars for venue reasons unrelated to "
+            "the pattern. Any run using this is a non-parity sensitivity "
+            "experiment and is marked candle_identity_relaxed in the report"
+        ),
+    )
+    optimize_v2.add_argument(
         "--quote-pressure-data",
         help=(
             "optional sealed FxProQuotePressureEventDataset; when omitted "
@@ -800,6 +813,26 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         if args.quote_pressure_data
         else None
     )
+    candle_tolerance: dict[str, int] = {}
+    for item in args.cluster_candle_tolerance_ticks or ():
+        symbol, separator, ticks = str(item).partition("=")
+        if not separator or not symbol.strip() or not ticks.strip():
+            raise SystemExit(
+                "--cluster-candle-tolerance-ticks expects SYMBOL=TICKS, "
+                f"got: {item}"
+            )
+        try:
+            parsed = int(ticks)
+        except ValueError:
+            raise SystemExit(
+                f"--cluster-candle-tolerance-ticks needs an integer: {item}"
+            ) from None
+        key = symbol.strip().upper()
+        if key in candle_tolerance:
+            raise SystemExit(
+                f"--cluster-candle-tolerance-ticks repeats symbol: {key}"
+            )
+        candle_tolerance[key] = parsed
     progress_stream = sys.stderr if args.json else sys.stdout
 
     def print_progress(event: Mapping[str, Any]) -> None:
@@ -829,6 +862,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         config,
         cluster_proxy=cluster_proxy,
         quote_pressure=quote_pressure,
+        cluster_candle_tolerance_ticks=candle_tolerance,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
         progress=print_progress,

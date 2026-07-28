@@ -463,6 +463,42 @@ def _trigger_attribution(
     return output
 
 
+def _normalized_candle_tolerance(
+    overrides: Optional[Mapping[str, int]],
+    symbols: Sequence[str],
+) -> dict[str, int]:
+    """Validate research-only per-symbol candle-identity tolerances.
+
+    The production tolerance exists because live pairs a cluster with a candle
+    from the same broker.  Research pairs an FxPro cluster with an LSE candle,
+    so the check measures venue disagreement rather than candle identity.  A
+    relaxed tolerance therefore makes the trigger reachable but cannot be read
+    as evidence about live behaviour.
+    """
+
+    if not overrides:
+        return {}
+    known = {str(symbol).strip().upper() for symbol in symbols}
+    normalized: dict[str, int] = {}
+    for raw_symbol, raw_ticks in overrides.items():
+        symbol = str(raw_symbol or "").strip().upper()
+        if symbol not in known:
+            raise StrategyBacktestError(
+                f"cluster candle tolerance names an unknown symbol: {symbol}"
+            )
+        if isinstance(raw_ticks, bool):
+            raise StrategyBacktestError(
+                f"cluster candle tolerance for {symbol} must be an integer"
+            )
+        ticks = int(raw_ticks)
+        if ticks < 0:
+            raise StrategyBacktestError(
+                f"cluster candle tolerance for {symbol} must be nonnegative"
+            )
+        normalized[symbol] = ticks
+    return dict(sorted(normalized.items()))
+
+
 def _decision_event_id(
     *,
     manifest_sha256: str,
@@ -680,6 +716,7 @@ def _generate_symbol_universe(
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
     cluster_proxy: Optional[FxProClusterEventDataset],
+    candle_tolerance_ticks: Mapping[str, int],
     quote_pressure: Optional[FxProQuotePressureEventDataset],
     strategy_factory: StrategyFactory,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
@@ -703,6 +740,13 @@ def _generate_symbol_universe(
         # assumption.  This override exists only in the isolated WFO runner.
         strategy.cluster_rejection_15m_entry_enabled = True
         strategy.cluster_rejection_allow_research_assumption = True
+        # Diagnostic only: the sealed cluster carries FxPro candles while the
+        # snapshot carries LSE candles, so the strict production identity check
+        # vetoes most bars for reasons unrelated to the pattern.  Any run using
+        # this override is a non-parity sensitivity experiment.
+        strategy.cluster_candle_tolerance_ticks_by_symbol = dict(
+            candle_tolerance_ticks
+        )
     if quote_pressure is not None:
         # Research-only activation is tied to a sealed FxPro sidecar.
         # Production remains controlled by its independent live opt-in flag.
@@ -1332,6 +1376,7 @@ def run_counterfactual_backtest(
     *,
     cluster_proxy: Optional[FxProClusterEventDataset] = None,
     quote_pressure: Optional[FxProQuotePressureEventDataset] = None,
+    cluster_candle_tolerance_ticks: Optional[Mapping[str, int]] = None,
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     min_train_opportunities: int = DEFAULT_MIN_TRAIN_OPPORTUNITIES,
@@ -1367,6 +1412,14 @@ def run_counterfactual_backtest(
         raise StrategyBacktestError(
             "Requested decision range is outside common M15 coverage"
         )
+    tolerance_overrides = _normalized_candle_tolerance(
+        cluster_candle_tolerance_ticks,
+        config.symbols,
+    )
+    if tolerance_overrides and cluster_proxy is None:
+        raise StrategyBacktestError(
+            "cluster candle tolerance overrides require --cluster-proxy-data"
+        )
     periods = _periods(config)
     prepared_by_symbol = {
         symbol: _prepare_symbol(dataset, symbol)
@@ -1385,6 +1438,7 @@ def run_counterfactual_backtest(
                 config=config,
                 cluster_proxy=cluster_proxy,
                 quote_pressure=quote_pressure,
+                candle_tolerance_ticks=tolerance_overrides,
                 strategy_factory=strategy_factory,
                 progress=progress,
             )
@@ -1519,6 +1573,7 @@ def run_counterfactual_backtest(
             if cluster_proxy is not None
             else None
         ),
+        "cluster_candle_tolerance_ticks": dict(tolerance_overrides),
         "quote_pressure_manifest_sha256": (
             quote_pressure.manifest_sha256
             if quote_pressure is not None
@@ -1590,6 +1645,13 @@ def run_counterfactual_backtest(
             "execution_proof_claimed": False,
             "aggressor_polarity_claimed": False,
             "data_kind": "tick_direction_cluster_proxy_no_execution_proof",
+            "candle_tolerance_ticks": dict(tolerance_overrides),
+            "candle_identity_relaxed": bool(tolerance_overrides),
+            "candle_identity_relaxation_semantics": (
+                "research_only_cross_venue_candle_disagreement_not_live_parity"
+                if tolerance_overrides
+                else "production_candle_identity_tolerance"
+            ),
         },
         "fxpro_quote_pressure_rejection": {
             "enabled": quote_pressure is not None,

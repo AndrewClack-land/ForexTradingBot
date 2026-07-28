@@ -430,6 +430,64 @@ def test_stale_cluster_lookback_is_bounded_and_still_causal(
         )
 
 
+def _shifted_candle(ticks: float) -> dict:
+    """The same candle as the event, moved by `ticks` of 0.0001."""
+
+    offset = ticks * 0.0001
+    return {field: value + offset for field, value in _candle().items()}
+
+
+def test_cross_venue_candle_is_vetoed_by_the_production_tolerance():
+    # Four ticks of venue disagreement is ordinary between LSE and FxPro and
+    # must still fail the strict production identity check.
+    frame = pd.DataFrame([_shifted_candle(4)], index=[BAR_OPEN])
+    strategy = NarrativeStrategy()
+    strategy.cluster_rejection_15m_entry_enabled = True
+    strategy.cluster_rejection_allow_research_assumption = True
+
+    assert (
+        strategy.trigger_15m_cluster_rejection(
+            frame, "LONG", _event(), symbol="EURUSD"
+        )
+        is None
+    )
+
+
+def test_research_tolerance_override_is_per_symbol_and_opt_in():
+    frame = pd.DataFrame([_shifted_candle(4)], index=[BAR_OPEN])
+    strategy = NarrativeStrategy()
+    strategy.cluster_rejection_15m_entry_enabled = True
+    strategy.cluster_rejection_allow_research_assumption = True
+
+    # Default map is empty, so live keeps the production tolerance.
+    assert strategy.cluster_candle_tolerance_ticks_by_symbol == {}
+
+    # An override for a different symbol must not leak.
+    strategy.cluster_candle_tolerance_ticks_by_symbol = {"GBPUSD": 8}
+    assert (
+        strategy.trigger_15m_cluster_rejection(
+            frame, "LONG", _event(), symbol="EURUSD"
+        )
+        is None
+    )
+
+    strategy.cluster_candle_tolerance_ticks_by_symbol = {"EURUSD": 8}
+    entry = strategy.trigger_15m_cluster_rejection(
+        frame, "LONG", _event(), symbol="EURUSD"
+    )
+    assert entry is not None
+    assert entry.trigger_kind == "fxpro_cluster_rejection_15m"
+
+    # The override widens the gate but never disables it.
+    far = pd.DataFrame([_shifted_candle(20)], index=[BAR_OPEN])
+    assert (
+        strategy.trigger_15m_cluster_rejection(
+            far, "LONG", _event(), symbol="EURUSD"
+        )
+        is None
+    )
+
+
 def test_strategy_pairs_stale_event_with_its_own_candle():
     second_open = BAR_OPEN + pd.Timedelta(minutes=15)
     # Only the first row matches the event; the decision candle is different.
