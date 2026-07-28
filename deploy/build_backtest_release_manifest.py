@@ -17,6 +17,7 @@ RELEASE_PATHS = (
     "core/__init__.py",
     "core/absorption.py",
     "core/htf_context.py",
+    "core/liquidity_rejection.py",
     "core/narrative_scoring.py",
     "core/pivot_trigger.py",
     "core/strategy_narrative.py",

@@ -56,6 +56,12 @@ from config import (
     VOL_REGIME_REFRESH_MIN,
     POSITION_ADDING_ENABLED,
     IDEA_MAX_ENTRIES,
+    FXPRO_DOM_CAPTURE_ENABLED,
+    FXPRO_DOM_SYMBOLS,
+    FXPRO_DOM_DATA_DIR,
+    FXPRO_DOM_POLL_MS,
+    FXPRO_DOM_MAX_LEVELS,
+    FXPRO_DOM_HEARTBEAT_SEC,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -65,6 +71,7 @@ _install_mt5_guard()
 
 from core.data_cache import DataCache
 from core.data_feed import DataFeed
+from core.fxpro_dom import FxProDomRecorder
 from core.market_scanner import MarketScanner
 from core.strategy_narrative import NarrativeStrategy, ActiveTrade
 from bot.telegram_bot import TelegramBot
@@ -226,6 +233,37 @@ class Core:
 
         if self.mt5_executor:
             self._hydrate_active_trades_from_mt5()
+
+        self.fxpro_dom_recorder: Optional[FxProDomRecorder] = None
+        if FXPRO_DOM_CAPTURE_ENABLED:
+            try:
+                import MetaTrader5 as _mt5
+
+                capture_symbols = [
+                    self.universe.get(symbol, symbol)
+                    for symbol in FXPRO_DOM_SYMBOLS
+                ]
+                self.fxpro_dom_recorder = FxProDomRecorder(
+                    mt5_module=_mt5,
+                    symbols=capture_symbols,
+                    output_dir=FXPRO_DOM_DATA_DIR,
+                    poll_interval_ms=FXPRO_DOM_POLL_MS,
+                    max_levels=FXPRO_DOM_MAX_LEVELS,
+                    heartbeat_seconds=FXPRO_DOM_HEARTBEAT_SEC,
+                )
+                self.fxpro_dom_recorder.start()
+                print(
+                    "[FxPro DOM] capture started; "
+                    "Liquidity Rejection entry remains independently gated"
+                )
+            except Exception as exc:
+                self.fxpro_dom_recorder = None
+                print(f"[FxPro DOM] capture unavailable: {exc}")
+
+    def close(self) -> None:
+        recorder = getattr(self, "fxpro_dom_recorder", None)
+        if recorder is not None:
+            recorder.stop()
 
     def _try_create_executor(self) -> bool:
         """Create the MT5 executor. Safe to call repeatedly — used both at startup
@@ -1052,6 +1090,34 @@ class Core:
                 out[tf] = df
         return out
 
+    def _strategy_view(
+        self,
+        data: Dict[str, Any],
+        *,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """Closed OHLC bars plus the matching causal FxPro M15 DOM event."""
+
+        view = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
+        recorder = getattr(self, "fxpro_dom_recorder", None)
+        df_15m = view.get("15M") if isinstance(view, dict) else None
+        if (
+            recorder is None
+            or df_15m is None
+            or getattr(df_15m, "empty", True)
+        ):
+            return view
+        event = recorder.event_asof(
+            symbol,
+            df_15m.index[-1],
+            datetime.now(timezone.utc),
+        )
+        if event is None:
+            return view
+        enriched = dict(view)
+        enriched["FXPRO_LIQUIDITY_15M"] = event
+        return enriched
+
     def _move_entry_to_breakeven(
         self, symbol: str, entry: ActiveTrade, *, reason: str
     ) -> bool:
@@ -1492,7 +1558,7 @@ class Core:
         ):
             return None
 
-        strategy_data = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
+        strategy_data = self._strategy_view(data, symbol=symbol)
         raw_sig = self.strategy.generate_signal(strategy_data, symbol=symbol)
         if raw_sig.get("signal") != "ENTER":
             return None
@@ -2355,7 +2421,7 @@ class Core:
                     self._log_signal(symbol, manage)
                     continue
 
-                strategy_data = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
+                strategy_data = self._strategy_view(data, symbol=symbol)
                 with prof.section("strategy"):
                     raw_sig = self.strategy.generate_signal(strategy_data, symbol=symbol)
                 if DEBUG_RAW_SIGNALS and raw_sig.get("signal") != "NO_TRIGGER":
@@ -2520,6 +2586,7 @@ if __name__ == "__main__":
     if not _acquire_pid_lock(_LOCK_PATH):
         raise SystemExit(1)
 
+    core: Optional[Core] = None
     bridge_stop: Optional[threading.Event] = None
     bridge_thread: Optional[threading.Thread] = None
     try:
@@ -2532,6 +2599,8 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         pass
     finally:
+        if core is not None:
+            core.close()
         if bridge_stop:
             bridge_stop.set()
         if bridge_thread:

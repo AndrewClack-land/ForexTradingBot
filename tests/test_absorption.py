@@ -337,59 +337,12 @@ def test_invalid_thresholds_are_rejected():
         AbsorptionThresholds(min_edge_volume=-1.0)
 
 
-def test_strategy_absorption_is_off_by_default_and_bad_data_never_raises():
+def test_absorption_remains_archived_outside_production_strategy():
     strategy = NarrativeStrategy()
-    frame = pd.DataFrame(
-        [_candle()],
-        index=pd.DatetimeIndex([OPEN_TIME]),
-    )
 
-    assert strategy.absorption_15m_entry_enabled is False
-    assert (
-        strategy.trigger_15m_absorption(
-            frame,
-            "LONG",
-            {"bad": "event"},
-            symbol="EURUSD",
-        )
-        is None
-    )
-
-
-def test_strategy_wraps_valid_footprint_as_candidate_without_stop_override():
-    strategy = NarrativeStrategy()
-    strategy.absorption_15m_entry_enabled = True
-    frame = pd.DataFrame(
-        [_candle()],
-        index=pd.DatetimeIndex([OPEN_TIME]),
-    )
-
-    candidate = strategy.trigger_15m_absorption(
-        frame,
-        "LONG",
-        _event(),
-        symbol="EURUSD",
-    )
-
-    assert candidate is not None
-    assert candidate.side == "LONG"
-    assert candidate.trigger_kind == "absorption_15m"
-    assert candidate.trigger_event_id == _event()["checksum"]
-    assert candidate.stop_override is None
-    assert candidate.entry_price == pytest.approx(106.0)
-    assert candidate.trigger_meta["source"] == "sealed-test-footprint"
-
-    delayed = strategy.trigger_15m_absorption(
-        frame,
-        "LONG",
-        _event(
-            available_at=(
-                DECISION_TIME + pd.Timedelta(seconds=1)
-            ).isoformat()
-        ),
-        symbol="EURUSD",
-    )
-    assert delayed is None
+    assert not hasattr(strategy, "absorption_15m_entry_enabled")
+    assert not hasattr(strategy, "trigger_15m_absorption")
+    assert strategy.liquidity_rejection_15m_entry_enabled is False
 
 
 def test_checksum_must_match_normalized_event_content():

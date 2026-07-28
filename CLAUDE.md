@@ -22,12 +22,18 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `backtest/counterfactual.py`
 - Train-only constrained replacement weights:
   `backtest/weight_optimizer.py`
-- Sealed footprint sidecar validation: `backtest/orderflow_data.py`
+- Active FxPro DOM capture and M15 aggregation: `core/fxpro_dom.py`
+- Active fail-closed Liquidity Rejection detector:
+  `core/liquidity_rejection.py`
+- Active immutable Liquidity Rejection WFO sidecar:
+  `backtest/liquidity_data.py`, CLI
+  `tools/seal_fxpro_liquidity_sidecar.py`
+- Archived footprint sidecar validation: `backtest/orderflow_data.py`
 - Sealed footprint sidecar construction from an executed-trade tape:
   `backtest/orderflow_ingest.py`, CLI `tools/build_absorption_sidecar.py`
 - Read-only trade-tape preflight profiling: `backtest/orderflow_inspect.py`,
   CLI `tools/inspect_trade_tape.py`
-- Pure fail-closed Absorption detector: `core/absorption.py`
+- Archived pure Absorption detector: `core/absorption.py`
 - Historical snapshot ingest/audit: `backtest/lse_ingest.py`,
   `backtest/data.py`
 - Release manifest builder: `deploy/build_backtest_release_manifest.py`
@@ -39,11 +45,50 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `tests/test_backtest_orderflow_data.py`,
   `tests/test_backtest_orderflow_ingest.py`,
   `tests/test_backtest_orderflow_inspect.py`,
+  `tests/test_fxpro_liquidity_rejection.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
 Do not reconstruct factor rules by parsing the human-readable narrative text.
 Use the structured `factor_vector`.
+
+## FxPro Liquidity Rejection contract
+
+`fxpro_liquidity_rejection_15m` is the active replacement for Turtle Soup.
+The old Turtle detector may remain only as unreachable historical diagnostic
+code. The executed-tape Absorption and Quantower cluster pipelines are archived
+research and must not be reintroduced into live or `optimize-v2`.
+
+The factor is broker-specific and must never be named True Absorption. FxPro
+MT5 Market Depth is `otc_aggregated_liquidity` with data kind
+`depth_quotes_no_execution_proof`. A removed quote is not proof of a fill, and
+DOM changes must not be labelled Trades, Buy Volume, Sell Volume, aggressor
+flow, footprint, or CME MBO.
+
+Non-negotiable implementation rules:
+
+- keep `FXPRO_DOM_CAPTURE_ENABLED` independent from
+  `FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED`; capture may be on while entries
+  stay off for shadow/WFO collection;
+- write raw snapshots append-only and publish only finalized closed-M15
+  summaries; never expose the forming accumulator to strategy code;
+- preserve exact source `fxpro_mt5_market_book`, venue `FxPro`, schema version,
+  UTC bar identity, `available_at`, quality fields, and event checksum;
+- count depletion and replenishment conservatively at price levels observed in
+  consecutive snapshots; a new level is not replenishment and removed volume
+  is not an execution;
+- fail closed for unsupported/empty DOM, missing events, partial coverage,
+  excessive gaps, insufficient book depth/changes, delayed availability,
+  symbol mismatch, wrong provenance, and checksum failure;
+- never synthesize this factor from LSE OHLCV, candle volume, MT5 tick volume,
+  Quantower clusters, or the old Absorption sidecar;
+- load historical events in WFO only through a sealed immutable
+  `FxProLiquidityEventDataset`; enforce `available_at <= decision_time`;
+- regenerate both LONG and SHORT and every trigger inside every train window;
+  do not let production weights preselect the train population;
+- do not enable live entries until the sealed history has representative
+  coverage and the frozen OOS/shadow result is reviewed. Enabling capture on a
+  VPS does not authorize enabling the entry factor.
 
 ## Current production factor contract
 
@@ -86,7 +131,8 @@ Important distinctions:
 Production trigger priority is:
 
 1. quarantined 15M Rejection Block, only if separately enabled;
-2. 15M footprint Absorption;
+2. FxPro Liquidity Rejection 15M, only if a matching finalized DOM event is
+   causally available and the independent live flag is enabled;
 3. H1 Pivot Reclaim on 15M;
 4. 1H Order Block touch.
 
@@ -94,128 +140,16 @@ Turtle Soup is retired from the production call path. Do not add a re-enable
 flag, fallback call, or implicit compatibility path. The legacy pure detector
 may remain only for reproducing historical reports.
 
-Absorption defaults OFF and is fail-closed. The audited definition is:
+The active second trigger is governed exclusively by the FxPro Liquidity
+Rejection contract above. Missing DOM is `DATA_UNAVAILABLE`, so the strategy
+falls through to later triggers; it must not reject the complete market entry
+solely because broker depth is absent. `optimize-v2` may generate this trigger
+only from `--liquidity-data` and a sealed `FxProLiquidityEventDataset`.
 
-- LONG: `low_sell_volume >= 80`,
-  `low_sell_volume >= 2 * low_buy_volume`, and close strictly above the M15
-  midpoint;
-- SHORT: `high_buy_volume >= 80`,
-  `high_buy_volume >= 2 * high_sell_volume`, and close strictly below the M15
-  midpoint.
-
-The input must be a finalized, provenance-pinned 15M footprint with executed
-aggressor Buy/Sell volume at price. `backtest/orderflow_data.py` is the sealed
-sidecar contract. Schema v1 requires `revision=0`, a causal `available_at`,
-source, venue, polarity and a lowercase SHA-256 event checksum. Symbol mapping
-is one-to-one identity-only; cross-market proxy mappings are rejected. Never
-infer Buy/Sell delta, aggressor, or volume-at-price from LSE OHLCV, tick
-volume, or quote-only Bid/Ask changes. Missing, delayed, revised, unmapped,
-mixed-feed, or checksum-invalid order flow means `DATA_UNAVAILABLE`, not a
-bearish/bullish false result and never a proxy.
-
-The locally audited persisted Quantower FxPro VolumeAnalysis database contains
-no rows, but that does not prove runtime `VolumeAnalysisData` is absent:
-Quantower can reconstruct Cluster data on demand. The installed FxPro connector
-reports `VolumeType=Ticks`, `DeltaCalculationType=TickDirection`,
-`AllowCalculateRealtimeTicks=true`, and realtime Volume/Trades disabled. Treat
-its `Trades`, Buy/Sell Volume, and PriceLevels as an unverified Quantower tick
-reconstruction, never as exchange executions or proven aggressor flow.
-
-`integrations/quantower/FxProTickClusterExporter/` is the current audited
-diagnostic path. It exports one closed UTC M15 day under schema
-`forexbot.quantower-cluster-diagnostic` v2, plus Last/BidAsk probes, coverage,
-causality metadata, and hashes. Validate it with
-`tools/validate_quantower_cluster_diagnostic.py`; when the manifest says the
-runtime assembly path was unavailable, `--exporter-dll` is mandatory and its
-CLR MVID must match the manifest before its SHA-256 is accepted. This raw schema is
-deliberately incompatible with `AbsorptionEventDataset` and must never be
-passed to `--orderflow-data`; its safety flags must remain `UNVERIFIED`, false
-for exchange/aggressor proof, and false for sidecar eligibility. Snapshot time
-does not reveal historical feed latency, so `historical_available_at` remains
-null until a separately versioned delay rule is justified. The FxPro vendor
-field is an operator label, not connection identity. `VALID_DIAGNOSTIC`
-requires the DLL hash, Ticks/TickDirection metadata, consistent symbol mapping,
-complete PriceLevels, a closed day with explicit UTC, and successful Last plus
-BidAsk probes containing recognized tick items.
-
-The audited FxPro/Quantower M15 feed reports `HistoryItemBar.TimeRight` as
-`TimeLeft + 15 minutes - one .NET tick (100 ns)`. Treat raw `TimeRight` only as
-source metadata. Diagnostic rows must use canonical UTC `[bar_open, bar_close)`
-intervals with `bar_close = bar_open + 15 minutes`; each row must retain the
-exact `source_bar_span_ticks`, and the manifest must retain
-`bar_right_boundary_semantics`. Accept only the exact exclusive-period end or
-the exact inclusive-period end minus 100 ns normalized to the exclusive close.
-Reject absent, approximate, unsupported, or mixed boundary semantics. All
-timestamp fields must use the exporter's exact canonical UTC format
-`YYYY-MM-DDTHH:MM:SS.fffZ`; never round or truncate extra fractional digits.
-
-The audited connector's default `HistoryType` is `Bid`, while its explicit
-`BidAsk` probe returns recognized tick items and its `Last` probe returns none.
-The classification
-`quantower_tick_reconstructed_bidask_history_available` means only that
-Quantower can supply reconstructable Bid/Ask tick history; it does not prove
-executions or aggressor polarity. `MinVolumeAnalysisTickSize` may be null when
-Quantower exposes it as non-finite; a finite negative value is an export error,
-not unavailable data. Neither condition may be replaced with a guessed value
-or a stronger provenance claim.
-
-The available Bybit footprint cache is for different markets and cannot be
-mapped to EURUSD/GBPUSD/USDCAD. Absorption remains OFF on the live VPS until the
-diagnostic day is reviewed and a validated causal adapter exists. Do not copy
-the downloaded Quantower C# sources or XML layouts into Git: they have no
-repository license, and the XML files contain connection/user state.
-
-`backtest/orderflow_ingest.py` is the only supported producer of a schema-v1
-sidecar. It converts an executed-trade tape into events carrying aggressor
-volume at the bar's highest and lowest traded price level, and it is
-fail-closed: the aggressor must be `exchange_reported_aggressor` or
-`venue_reported_aggressor`, and `tick_rule_reconstructed`, `quote_inferred`,
-`delta_inferred` and `unknown` are permanently refused. The operator must
-attest the closed `[covers_from, covers_through]` interval the tape covers, so
-a truncated tail is never sealed as `finalized`. Prices must lie exactly on the
-declared tick grid, the tape must be sorted, and any unmapped aggressor label,
-non-positive size or unparseable row aborts the build instead of being dropped.
-The symbol must be a six-letter spot pair under identity mapping; a futures or
-cross-market tape such as `6E` is refused pending a separately versioned proxy
-schema. `--volume-measure` selects `executed_size` or `trade_count`; the
-audited `min_edge_volume = 80` threshold is scale-dependent and must be
-re-justified for whichever measure a dataset uses.
-
-`available_at` comes from a named, versioned rule with no default and no
-implicit `available_at = bar_close`:
-
-- `bar_close_plus_measured_vendor_delay.v1` requires a measured `delay_ms` plus
-  a `delay_measurement` evidence text whose SHA-256 is sealed into the manifest
-  `source` descriptor;
-- `max_observed_arrival_plus_margin.v1` requires a per-print arrival timestamp
-  and yields `max(bar_close, max(arrival) + margin_ms)`.
-
-Schema v1 closes both the manifest field set and the sidecar file set, so the
-converter's full audit receipt (input hashes, rule parameters and evidence,
-coverage attestation, quality gates, excluded-bar reasons) is written outside
-the sealed root and the sealed provenance descriptor lives in `source`.
-Input files are hashed before and after conversion and must remain byte-stable.
-Sidecar shards and manifest are built in a sibling staging directory and only
-published by an atomic rename; a failed seal must leave neither the final root
-nor a stale partial directory.
-
-`backtest/orderflow_inspect.py` profiles a candidate tape before any build. It
-is read-only and must never emit sidecar events: it counts and samples bad rows
-and unexpected aggressor labels instead of raising, because a third `unknown`
-bucket is the finding that decides whether a tape is usable. Its derived tick
-size is the greatest common divisor of the observed prices and can overstate
-the instrument tick on a small sample, so declare the vendor's real tick rather
-than the derived one.
-
-`build_factor_vector()` is the canonical arithmetic. A refactor must preserve
-the resulting bias, scores, margins, factor rows, and live narrative text.
-The structured vector must contain exactly five unique factors and must be
-strictly JSON serializable.
-
-`pivotal_without_factor` is a leave-one-factor-out diagnostic: it means that
-removing one frozen vote changes the final bias while preserving the same FVG
-margin. It is not a causal estimate and not a Shapley value.
-
+The old Quantower cluster diagnostic, executed-trade tape ingest,
+`AbsorptionEventDataset`, and pure Absorption detector remain archived research.
+They may still be tested for reproducibility, but they are not active live/WFO
+inputs and must not be passed through compatibility aliases.
 ## Risk contract
 
 - Aggregate stop-loss risk for one setup/entry must never exceed `1%` of its
@@ -451,9 +385,9 @@ The v2 command produces `decision_events.csv`,
 `technical_opportunities.csv`, `opportunity_labels.csv`,
 `frozen_weight_models.json`, optimizer predictions/coefficients/metrics, OOS
 selections, and the chronological replay tables. All files must be covered by
-the report manifest. A run without a sealed order-flow sidecar must state
-Absorption `DATA_UNAVAILABLE`; it is a no-Turtle/remaining-trigger challenger,
-not evidence about Absorption.
+the report manifest. A run without a sealed FxPro liquidity sidecar must state
+Liquidity Rejection `DATA_UNAVAILABLE`; it is a remaining-trigger challenger,
+not evidence for or against broker liquidity rejection.
 
 The existing `--train` interval does not fit replacement factor weights. It
 defines rolling history/OOS boundaries for the fixed baseline. The current
@@ -485,8 +419,9 @@ After code changes:
 
 ```bash
 python -m ruff check core/narrative_scoring.py \
-  core/absorption.py backtest/attribution.py backtest/optimizer.py \
-  backtest/orderflow_data.py backtest/weight_optimizer.py \
+  core/liquidity_rejection.py core/fxpro_dom.py \
+  backtest/liquidity_data.py backtest/attribution.py backtest/optimizer.py \
+  backtest/weight_optimizer.py \
   backtest/counterfactual.py \
   backtest/strategy_runner.py
 python -m pytest -q -p no:cacheprovider --basetemp <fresh-temp-dir>

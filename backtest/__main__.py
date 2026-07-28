@@ -309,10 +309,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
     )
     optimize_v2.add_argument(
-        "--orderflow-data",
+        "--liquidity-data",
         help=(
-            "optional sealed AbsorptionEventDataset directory; when omitted "
-            "Absorption remains DATA_UNAVAILABLE and no OHLCV proxy is used"
+            "optional sealed FxProLiquidityEventDataset directory; when "
+            "omitted Liquidity Rejection remains DATA_UNAVAILABLE and no "
+            "OHLCV/tick-volume proxy is used"
         ),
     )
     optimize_v2.add_argument(
@@ -705,7 +706,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     """Run the all-M15 replacement-weight optimizer in an isolated release."""
 
     from .counterfactual import run_counterfactual_backtest
-    from .orderflow_data import AbsorptionEventDataset
+    from .liquidity_data import FxProLiquidityEventDataset
 
     release_commit = _read_release_commit(args.release_commit_file)
     attestation_fields = (
@@ -780,9 +781,9 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
     )
-    orderflow = (
-        AbsorptionEventDataset.load(Path(args.orderflow_data))
-        if args.orderflow_data
+    liquidity = (
+        FxProLiquidityEventDataset.load(Path(args.liquidity_data))
+        if args.liquidity_data
         else None
     )
     progress_stream = sys.stderr if args.json else sys.stdout
@@ -812,7 +813,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     result = run_counterfactual_backtest(
         dataset,
         config,
-        orderflow=orderflow,
+        liquidity=liquidity,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
         progress=print_progress,
@@ -848,11 +849,11 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         f"PF={pf_text} maxDD={metrics['max_drawdown_r']:.3f}R"
     )
     print(
-        "  Absorption sidecar: "
+        "  FxPro Liquidity Rejection sidecar: "
         + (
             "sealed and loaded"
-            if orderflow is not None
-            else "DATA_UNAVAILABLE (no OHLCV proxy)"
+            if liquidity is not None
+            else "DATA_UNAVAILABLE (no OHLCV/tick-volume proxy)"
         )
     )
     return 0

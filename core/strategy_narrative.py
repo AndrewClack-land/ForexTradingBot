@@ -8,9 +8,9 @@ import time
 import numpy as np
 import pandas as pd
 
-from core.absorption import (
-    AbsorptionThresholds,
-    detect_footprint_absorption,
+from core.liquidity_rejection import (
+    LiquidityRejectionThresholds,
+    detect_fxpro_liquidity_rejection,
 )
 from core.htf_context import HtfContext
 from core.narrative_scoring import build_factor_vector
@@ -25,14 +25,38 @@ ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
 REJECTION_BLOCK_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", False)
 )
-ABSORPTION_15M_ENTRY_ENABLED = bool(
-    getattr(_cfg, "ABSORPTION_15M_ENTRY_ENABLED", False)
+FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED = bool(
+    getattr(_cfg, "FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED", False)
 )
-ABSORPTION_MIN_IMBALANCE_RATIO = float(
-    getattr(_cfg, "ABSORPTION_MIN_IMBALANCE_RATIO", 2.0)
+FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE", 0.15)
 )
-ABSORPTION_MIN_EDGE_VOLUME = float(
-    getattr(_cfg, "ABSORPTION_MIN_EDGE_VOLUME", 80.0)
+FXPRO_LIQUIDITY_MIN_REPLENISHMENT_RATIO = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_REPLENISHMENT_RATIO", 0.50)
+)
+FXPRO_LIQUIDITY_MIN_REPLENISHMENT_SHARE = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_REPLENISHMENT_SHARE", 0.55)
+)
+FXPRO_LIQUIDITY_MIN_REJECTION_FRACTION = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_REJECTION_FRACTION", 0.60)
+)
+FXPRO_LIQUIDITY_MAX_PRICE_RESPONSE_EFFICIENCY = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MAX_PRICE_RESPONSE_EFFICIENCY", 0.35)
+)
+FXPRO_LIQUIDITY_MIN_COVERAGE_RATIO = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_COVERAGE_RATIO", 0.98)
+)
+FXPRO_LIQUIDITY_MAX_GAP_SECONDS = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MAX_GAP_SECONDS", 5.0)
+)
+FXPRO_LIQUIDITY_MIN_CHANGED_SNAPSHOTS = int(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_CHANGED_SNAPSHOTS", 20)
+)
+FXPRO_LIQUIDITY_MIN_BOOK_LEVELS = int(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MIN_BOOK_LEVELS", 2)
+)
+FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS = float(
+    getattr(_cfg, "FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS", 5.0)
 )
 ORDERBLOCK_TOUCH_ATR_K = float(getattr(_cfg, "ORDERBLOCK_TOUCH_ATR_K", 0.15))
 ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.0005))
@@ -178,7 +202,7 @@ class NarrativeStrategy:
          breakouts, 1H Order/Rejection Blocks
       2) Bias strictness: 1H FVG regime
       3) SETUP: 15M Rejection Block
-      4) FALLBACK: 15M footprint Absorption
+      4) FALLBACK: FxPro broker Liquidity Rejection on 15M
       5) FALLBACK2: H1 Pivots levels + 15M reclaim
       6) ENTRY DELIVERY: send ENTRY RANGE
          - всё локализуется вокруг последнего 15M close
@@ -191,16 +215,44 @@ class NarrativeStrategy:
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
         self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
-        self.absorption_15m_entry_enabled = ABSORPTION_15M_ENTRY_ENABLED
-        self._absorption_thresholds: Optional[AbsorptionThresholds] = None
+        self.liquidity_rejection_15m_entry_enabled = (
+            FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED
+        )
+        self._liquidity_rejection_thresholds: Optional[
+            LiquidityRejectionThresholds
+        ] = None
         try:
-            self._absorption_thresholds = AbsorptionThresholds(
-                min_imbalance_ratio=ABSORPTION_MIN_IMBALANCE_RATIO,
-                min_edge_volume=ABSORPTION_MIN_EDGE_VOLUME,
+            self._liquidity_rejection_thresholds = (
+                LiquidityRejectionThresholds(
+                    min_abs_quote_pressure=(
+                        FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE
+                    ),
+                    min_replenishment_ratio=(
+                        FXPRO_LIQUIDITY_MIN_REPLENISHMENT_RATIO
+                    ),
+                    min_replenishment_share=(
+                        FXPRO_LIQUIDITY_MIN_REPLENISHMENT_SHARE
+                    ),
+                    min_rejection_fraction=(
+                        FXPRO_LIQUIDITY_MIN_REJECTION_FRACTION
+                    ),
+                    max_price_response_efficiency=(
+                        FXPRO_LIQUIDITY_MAX_PRICE_RESPONSE_EFFICIENCY
+                    ),
+                    min_coverage_ratio=FXPRO_LIQUIDITY_MIN_COVERAGE_RATIO,
+                    max_gap_seconds=FXPRO_LIQUIDITY_MAX_GAP_SECONDS,
+                    min_changed_snapshots=(
+                        FXPRO_LIQUIDITY_MIN_CHANGED_SNAPSHOTS
+                    ),
+                    min_book_levels=FXPRO_LIQUIDITY_MIN_BOOK_LEVELS,
+                    max_mean_spread_bps=(
+                        FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS
+                    ),
+                )
             )
         except (TypeError, ValueError):
             # Invalid runtime calibration disables only this optional trigger.
-            self.absorption_15m_entry_enabled = False
+            self.liquidity_rejection_15m_entry_enabled = False
 
         # 3 TPs at clean R-multiples. TP1 = 1R keeps the break-even trigger
         # consistently reachable (the old fixed-% TP1 override made it swing
@@ -280,9 +332,12 @@ class NarrativeStrategy:
         if df is None or df.empty or len(df) < period + 2:
             return 0.0
         h = df["high"].astype(float)
-        l = df["low"].astype(float)
+        low = df["low"].astype(float)
         c_prev = df["close"].astype(float).shift(1)
-        tr = np.maximum(h - l, np.maximum((h - c_prev).abs(), (l - c_prev).abs()))
+        tr = np.maximum(
+            h - low,
+            np.maximum((h - c_prev).abs(), (low - c_prev).abs()),
+        )
         v = tr.rolling(period).mean().iloc[-1]
         return float(v) if pd.notna(v) else 0.0
 
@@ -605,7 +660,7 @@ class NarrativeStrategy:
 
         o0, h0, l0, cl0 = float(c0["open"]), float(c0["high"]), float(c0["low"]), float(c0["close"])
         o1, h1, l1, cl1 = float(c1["open"]), float(c1["high"]), float(c1["low"]), float(c1["close"])
-        o2, h2, l2, cl2 = float(c2["open"]), float(c2["high"]), float(c2["low"]), float(c2["close"])
+        o2, cl2 = float(c2["open"]), float(c2["close"])
 
         body_top_1 = self._body_top(o1, cl1)
         body_bot_1 = self._body_bottom(o1, cl1)
@@ -743,9 +798,9 @@ class NarrativeStrategy:
 
         return None
 
-    # ================== 15M Footprint Absorption Trigger ==================
+    # ================== FxPro 15M Liquidity Rejection ==================
 
-    def trigger_15m_absorption(
+    def trigger_15m_liquidity_rejection(
         self,
         df_15M: pd.DataFrame,
         side: Side,
@@ -754,8 +809,8 @@ class NarrativeStrategy:
         symbol: str,
     ) -> Optional[CandidateEntry]:
         if (
-            not self.absorption_15m_entry_enabled
-            or self._absorption_thresholds is None
+            not self.liquidity_rejection_15m_entry_enabled
+            or self._liquidity_rejection_thresholds is None
             or side not in {"LONG", "SHORT"}
             or event is None
             or df_15M is None
@@ -765,35 +820,42 @@ class NarrativeStrategy:
 
         try:
             candle_open_time = pd.Timestamp(df_15M.index[-1])
-            decision_time = candle_open_time + pd.Timedelta(minutes=15)
-            footprint = detect_footprint_absorption(
+            # The event becomes causal on ``available_at`` (normally the first
+            # DOM observation after the M15 close), never retroactively.
+            decision_time = pd.Timestamp(
+                event.get("available_at")
+                if isinstance(event, dict)
+                else getattr(event, "available_at", None)
+            )
+            rejection = detect_fxpro_liquidity_rejection(
                 candle=df_15M.iloc[-1].to_dict(),
                 candle_open_time=candle_open_time,
                 event=event,
                 symbol=symbol,
                 side=side,
                 decision_time=decision_time,
-                thresholds=self._absorption_thresholds,
+                thresholds=self._liquidity_rejection_thresholds,
             )
         except Exception:
-            # Optional external order flow must never break the base strategy.
+            # Optional broker depth must never break the base strategy.
             return None
-        if footprint is None:
+        if rejection is None:
             return None
 
         close = float(df_15M["close"].iloc[-1])
-        meta = footprint.to_dict()
+        meta = rejection.to_dict()
         return CandidateEntry(
             side=side,
             entry_price=close,
             tf="15M",
             reason=(
-                f"Absorption 15M {side} footprint"
-                f" | imbalance={footprint.imbalance_ratio:.3f}"
-                f" rejection={footprint.rejection_fraction:.3f}"
+                f"FxPro Liquidity Rejection 15M {side}"
+                f" | quote_pressure={rejection.quote_pressure:.3f}"
+                f" replenishment={rejection.replenishment_ratio:.3f}"
+                f" rejection={rejection.rejection_fraction:.3f}"
             ),
-            trigger_kind="absorption_15m",
-            trigger_event_id=footprint.source_bar_hash,
+            trigger_kind="fxpro_liquidity_rejection_15m",
+            trigger_event_id=rejection.source_bar_hash,
             trigger_meta=meta,
         )
 
@@ -1192,10 +1254,10 @@ class NarrativeStrategy:
             else None
         )
         if entry is None:
-            entry = self.trigger_15m_absorption(
+            entry = self.trigger_15m_liquidity_rejection(
                 df_15M,
                 side_bias,
-                data.get("ORDERFLOW_15M"),
+                data.get("FXPRO_LIQUIDITY_15M"),
                 symbol=symbol,
             )
         if entry is None:

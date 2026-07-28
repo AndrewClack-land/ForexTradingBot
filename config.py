@@ -109,19 +109,63 @@ SYMBOL_DECIMALS = {
     "USDCAD": 5,
 }
 
-# ================== ORDERBLOCK SETTINGS ==================
+# ================== ORDERBLOCK / FXPRO LIQUIDITY SETTINGS ==================
 ORDERBLOCK_ENTRY_ENABLED = os.getenv("ORDERBLOCK_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
 REJECTION_BLOCK_ENTRY_ENABLED = os.getenv(
     "REJECTION_BLOCK_ENTRY_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-ABSORPTION_15M_ENTRY_ENABLED = os.getenv(
-    "ABSORPTION_15M_ENTRY_ENABLED", "0"
+FXPRO_DOM_CAPTURE_ENABLED = os.getenv(
+    "FXPRO_DOM_CAPTURE_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
-ABSORPTION_MIN_IMBALANCE_RATIO = _env_float(
-    "ABSORPTION_MIN_IMBALANCE_RATIO", 2.0
+FXPRO_DOM_SYMBOLS = [
+    item.strip().upper()
+    for item in os.getenv(
+        "FXPRO_DOM_SYMBOLS", "EURUSD,GBPUSD,USDCAD"
+    ).split(",")
+    if item.strip()
+]
+FXPRO_DOM_DATA_DIR = Path(
+    os.getenv("FXPRO_DOM_DATA_DIR", "").strip()
+    or str(AI_DATA_DIR / "fxpro_dom")
 )
-ABSORPTION_MIN_EDGE_VOLUME = _env_float(
-    "ABSORPTION_MIN_EDGE_VOLUME", 80.0
+FXPRO_DOM_POLL_MS = _env_int("FXPRO_DOM_POLL_MS") or 500
+FXPRO_DOM_MAX_LEVELS = _env_int("FXPRO_DOM_MAX_LEVELS") or 20
+FXPRO_DOM_HEARTBEAT_SEC = _env_float("FXPRO_DOM_HEARTBEAT_SEC", 1.0)
+
+# FxPro Liquidity Rejection is deliberately opt-in. DOM capture may run while
+# entries stay disabled until the broker-specific history passes causal WFO.
+FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED = os.getenv(
+    "FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE = _env_float(
+    "FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE", 0.15
+)
+FXPRO_LIQUIDITY_MIN_REPLENISHMENT_RATIO = _env_float(
+    "FXPRO_LIQUIDITY_MIN_REPLENISHMENT_RATIO", 0.50
+)
+FXPRO_LIQUIDITY_MIN_REPLENISHMENT_SHARE = _env_float(
+    "FXPRO_LIQUIDITY_MIN_REPLENISHMENT_SHARE", 0.55
+)
+FXPRO_LIQUIDITY_MIN_REJECTION_FRACTION = _env_float(
+    "FXPRO_LIQUIDITY_MIN_REJECTION_FRACTION", 0.60
+)
+FXPRO_LIQUIDITY_MAX_PRICE_RESPONSE_EFFICIENCY = _env_float(
+    "FXPRO_LIQUIDITY_MAX_PRICE_RESPONSE_EFFICIENCY", 0.35
+)
+FXPRO_LIQUIDITY_MIN_COVERAGE_RATIO = _env_float(
+    "FXPRO_LIQUIDITY_MIN_COVERAGE_RATIO", 0.98
+)
+FXPRO_LIQUIDITY_MAX_GAP_SECONDS = _env_float(
+    "FXPRO_LIQUIDITY_MAX_GAP_SECONDS", 5.0
+)
+FXPRO_LIQUIDITY_MIN_CHANGED_SNAPSHOTS = (
+    _env_int("FXPRO_LIQUIDITY_MIN_CHANGED_SNAPSHOTS") or 20
+)
+FXPRO_LIQUIDITY_MIN_BOOK_LEVELS = (
+    _env_int("FXPRO_LIQUIDITY_MIN_BOOK_LEVELS") or 2
+)
+FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS = _env_float(
+    "FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS", 5.0
 )
 ORDERBLOCK_TOUCH_ATR_K = _env_float("ORDERBLOCK_TOUCH_ATR_K", 0.15)
 ORDERBLOCK_TOUCH_MIN_ABS = _env_float("ORDERBLOCK_TOUCH_MIN_ABS", 0.0005)

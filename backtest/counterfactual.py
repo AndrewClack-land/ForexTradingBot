@@ -8,9 +8,9 @@ labelled before stateful
 execution gates, fitted inside the outer training window only, and replayed
 chronologically with one frozen model in the following OOS window.
 
-Turtle Soup is not part of the trigger manifest.  Absorption is available only
-when a sealed, causal order-flow event is supplied; OHLCV is never used as a
-proxy.
+Turtle Soup and True Absorption are not part of the trigger manifest. FxPro
+Liquidity Rejection is available only when a sealed, causal broker-DOM event
+is supplied; OHLCV and tick volume are never used as proxies.
 """
 
 from __future__ import annotations
@@ -29,7 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .data import HistoricalDataset
-from .orderflow_data import AbsorptionEventDataset
+from .liquidity_data import FxProLiquidityEventDataset
 from .simulator import simulate_split_outcome
 from .strategy_runner import (
     NarrativeBacktestConfig,
@@ -66,7 +66,7 @@ from .weight_optimizer import (
 COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v1"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
-    "absorption_15m",
+    "fxpro_liquidity_rejection_15m",
     "h1_pivot_reclaim_15m",
     "order_block_1h",
 )
@@ -110,7 +110,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "production_bias_ignored_for_generation",
         "factor_vector",
         "fvg_side",
-        "orderflow_status",
+        "liquidity_status",
         "technical_triggers",
     ),
     "technical_opportunities.csv": (
@@ -496,7 +496,7 @@ def _detect_entries(
     df_1h = data["1H"]
     df_15m = data["15M"]
     context = getattr(strategy, "_last_htf_context", None)
-    orderflow_event = data.get("ORDERFLOW_15M")
+    liquidity_event = data.get("FXPRO_LIQUIDITY_15M")
     detected: list[tuple[str, Any]] = []
 
     for side in ("LONG", "SHORT"):
@@ -504,14 +504,14 @@ def _detect_entries(
         if entry is not None:
             detected.append(("rejection_block_15m", entry))
 
-        entry = strategy.trigger_15m_absorption(
+        entry = strategy.trigger_15m_liquidity_rejection(
             df_15m,
             side,
-            orderflow_event,
+            liquidity_event,
             symbol=symbol,
         )
         if entry is not None:
-            detected.append(("absorption_15m", entry))
+            detected.append(("fxpro_liquidity_rejection_15m", entry))
 
         entry = strategy.trigger_h1_pivot_reclaim_on_15m(
             df_1h,
@@ -557,7 +557,7 @@ def _generate_symbol_universe(
     prepared: Mapping[str, Any],
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
-    orderflow: Optional[AbsorptionEventDataset],
+    liquidity: Optional[FxProLiquidityEventDataset],
     strategy_factory: StrategyFactory,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
 ) -> tuple[
@@ -575,11 +575,10 @@ def _generate_symbol_universe(
     # Operationally disabled families are still labelled, then remain blocked
     # in OOS replay unless the research command explicitly enables them.
     strategy.orderblock_entry_enabled = True
-    if orderflow is not None:
-        # Research-only activation is tied to a sealed sidecar.  Production
-        # remains controlled by ABSORPTION_15M_ENTRY_ENABLED and currently has
-        # no order-flow adapter on the VPS.
-        strategy.absorption_15m_entry_enabled = True
+    if liquidity is not None:
+        # Research-only activation is tied to a sealed FxPro sidecar.
+        # Production remains controlled by its independent live opt-in flag.
+        strategy.liquidity_rejection_15m_entry_enabled = True
     decisions: list[dict[str, Any]] = []
     opportunities: list[_Opportunity] = []
     counters: Counter[str] = Counter()
@@ -600,19 +599,19 @@ def _generate_symbol_universe(
             counters["warmup_skipped"] += 1
             continue
 
-        orderflow_status = "DATA_UNAVAILABLE"
+        liquidity_status = "DATA_UNAVAILABLE"
         event = None
-        if orderflow is not None:
-            event = orderflow.event_asof(
+        if liquidity is not None:
+            event = liquidity.event_asof(
                 symbol,
                 data["15M"].index[-1],
                 decision_time,
             )
-            orderflow_status = (
+            liquidity_status = (
                 "AVAILABLE" if event is not None else "MISSING_OR_DELAYED"
             )
         data = dict(data)
-        data["ORDERFLOW_15M"] = event
+        data["FXPRO_LIQUIDITY_15M"] = event
 
         try:
             baseline_bias, narrative = strategy.calc_narrative(
@@ -658,11 +657,11 @@ def _generate_symbol_universe(
             "production_bias_ignored_for_generation": baseline_bias,
             "factor_vector": dict(factor_vector),
             "fvg_side": fvg_side,
-            "orderflow_status": orderflow_status,
+            "liquidity_status": liquidity_status,
             "technical_triggers": len(detected),
         }
         decisions.append(decision_row)
-        counters[f"orderflow_{orderflow_status.lower()}"] += 1
+        counters[f"liquidity_{liquidity_status.lower()}"] += 1
 
         for trigger_kind, entry in detected:
             signal = _materialize_entry(
@@ -1177,7 +1176,7 @@ def run_counterfactual_backtest(
     dataset: HistoricalDataset,
     config: NarrativeBacktestConfig,
     *,
-    orderflow: Optional[AbsorptionEventDataset] = None,
+    liquidity: Optional[FxProLiquidityEventDataset] = None,
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     min_train_opportunities: int = DEFAULT_MIN_TRAIN_OPPORTUNITIES,
@@ -1229,7 +1228,7 @@ def run_counterfactual_backtest(
                 prepared=prepared_by_symbol[symbol],
                 periods=periods,
                 config=config,
-                orderflow=orderflow,
+                liquidity=liquidity,
                 strategy_factory=strategy_factory,
                 progress=progress,
             )
@@ -1334,8 +1333,8 @@ def run_counterfactual_backtest(
         enabled_triggers.append("order_block_1h")
     if config.rejection_block_entry_enabled:
         enabled_triggers.append("rejection_block_15m")
-    if orderflow is not None:
-        enabled_triggers.append("absorption_15m")
+    if liquidity is not None:
+        enabled_triggers.append("fxpro_liquidity_rejection_15m")
     enabled_triggers = sorted(
         set(enabled_triggers),
         key=lambda item: _TRIGGER_PRIORITY.get(item, 999),
@@ -1356,8 +1355,8 @@ def run_counterfactual_backtest(
             "score_threshold": None,
             "primary_label_policy": _PRIMARY_POLICY,
         },
-        "orderflow_manifest_sha256": (
-            orderflow.manifest_sha256 if orderflow is not None else None
+        "liquidity_manifest_sha256": (
+            liquidity.manifest_sha256 if liquidity is not None else None
         ),
     }
     summary = {
@@ -1406,13 +1405,16 @@ def run_counterfactual_backtest(
         "enabled_trigger_manifest": enabled_triggers,
         "generated_trigger_manifest": generated_triggers,
         "turtle_soup_called": False,
-        "absorption": {
-            "enabled": orderflow is not None,
-            "orderflow_sidecar_loaded": orderflow is not None,
-            "orderflow_manifest_sha256": (
-                orderflow.manifest_sha256 if orderflow is not None else None
+        "fxpro_liquidity_rejection": {
+            "enabled": liquidity is not None,
+            "liquidity_sidecar_loaded": liquidity is not None,
+            "liquidity_manifest_sha256": (
+                liquidity.manifest_sha256 if liquidity is not None else None
             ),
             "ohlcv_proxy_used": False,
+            "tick_volume_proxy_used": False,
+            "execution_proof_claimed": False,
+            "data_kind": "depth_quotes_no_execution_proof",
         },
         "assumptions": {
             "generation": (
@@ -1462,9 +1464,10 @@ def run_counterfactual_backtest(
                 "swap, slippage and historical tick ordering are unavailable."
             ),
             (
-                "Absorption is DATA_UNAVAILABLE unless a sealed footprint "
-                "sidecar supplies executed Bid/Ask volume at price. LSE OHLCV "
-                "is never converted into a proxy."
+                "FxPro Liquidity Rejection is DATA_UNAVAILABLE unless a "
+                "sealed broker-DOM sidecar supplies causal quote-depth "
+                "events. Quote removal is not execution proof; LSE OHLCV and "
+                "tick volume are never converted into proxies."
             ),
             (
                 "Removing Turtle Soup was decided after observing historical "

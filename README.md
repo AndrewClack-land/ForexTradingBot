@@ -12,7 +12,7 @@ causal backtesting, attribution semantics, and VPS release discipline.
 
 - **Python 3.11** + официальный пакет **MetaTrader5** — котировки и исполнение напрямую через терминал;
 - **Smart Money Concepts / ICT**: premium/discount, ордерблоки, rejection-блоки,
-  FVG, проверенный footprint absorption, фракталы Вильямса;
+  FVG, FxPro Liquidity Rejection по брокерскому DOM, фракталы Вильямса;
 - **python-telegram-bot** — сигналы и команды (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — журнал сделок и статистика для AI-фильтра;
 - сигналы считаются **только по закрытым свечам** (без перерисовки).
@@ -53,20 +53,19 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 
 ## Триггеры входа
 
-Проверяются по очереди, первый сработавший даёт сигнал ENTER:
+Проверяются по очереди; первый сработавший формирует ENTER:
 
-1. **15M Rejection Block** — отклонение от блока с длинной тенью по направлению bias;
-2. **15M Absorption** — поглощение агрессивного объёма на краю footprint закрытой
-   15M-свечи; работает только с проверенным Bid/Ask volume-at-price;
-3. **H1 Pivot Reclaim на 15M** — возврат цены за пивот-уровень 1H;
-4. **Касание ордерблока 1H** — вход от валидного OB (порог касания в долях ATR).
+1. **15M Rejection Block** — только при отдельном разрешении;
+2. **FxPro Liquidity Rejection 15M** — отклонение цены при давлении котировок
+   и восстановлении защитной стороны брокерского DOM;
+3. **H1 Pivot Reclaim на 15M**;
+4. **Касание Order Block 1H**.
 
-Turtle Soup удалён из production-цепочки без флага обратного включения.
-Absorption по умолчанию выключен и fail-closed: LSE OHLCV или котировочные
-Bid/Ask ticks не преобразуются в псевдо-order-flow. Для включения нужен
-финализированный и запечатанный 15M footprint sidecar с executed Buy/Sell
-volume-at-price и однозначным mapping рынка.
-
+Turtle Soup удалён из production-цепочки. FxPro Liquidity Rejection по
+умолчанию выключен для входов и работает fail-closed. DOM содержит агрегированную
+котируемую ликвидность FxPro, а не доказанные сделки: снятая котировка не
+называется исполнением или True Absorption. При отсутствии качественного
+закрытого M15 DOM-события стратегия переходит к следующим триггерам.
 ## Риск и сопровождение
 
 - **Стоп** — за фрактал Вильямса на 1H с ATR-буфером, риск ограничен коридором min/max ATR
@@ -148,7 +147,7 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 - **Python 3.11** + the official **MetaTrader5** package — quotes and execution directly through the terminal;
 - **Smart Money Concepts / ICT**: premium/discount, order blocks, rejection blocks,
-  FVG, verified footprint absorption, Williams fractals;
+  FVG, FxPro broker-DOM Liquidity Rejection, Williams fractals;
 - **python-telegram-bot** — signals and commands (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — trade journal and statistics for the AI filter;
 - signals are computed on **closed candles only** (no repainting).
@@ -191,20 +190,16 @@ votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 
 Checked in order; the first one that fires produces an ENTER signal:
 
-1. **15M Rejection Block** — rejection from a block with a long wick in the bias direction;
-2. **15M Absorption** — aggressive flow absorbed at the edge of a closed M15
-   footprint; requires verified Bid/Ask volume-at-price;
-3. **H1 Pivot Reclaim on 15M** — price reclaiming an H1 pivot level;
-4. **1H Order Block touch** — entry off a valid OB (touch threshold in ATR fractions).
+1. **15M Rejection Block** — only when separately enabled;
+2. **FxPro Liquidity Rejection 15M** — price rejection under quote pressure
+   with replenishment of the protective side of the broker DOM;
+3. **H1 Pivot Reclaim on 15M**;
+4. **1H Order Block touch**.
 
-Turtle Soup is retired from the production path with no re-enable switch.
-Absorption defaults OFF and fails closed: LSE OHLCV and quote-only Bid/Ask
-ticks are never converted into fake order flow. Activation requires a
-finalized, sealed M15 footprint sidecar with executed Buy/Sell volume-at-price
-and strict one-to-one identity mapping for the same market. Schema v1 accepts
-only unrevised `revision=0` events whose `available_at` timestamp was known at
-the M15 decision.
-
+Turtle Soup is retired. FxPro Liquidity Rejection defaults OFF for entries and
+fails closed. DOM is aggregated FxPro quoted liquidity, not execution proof;
+removed quotes are never called fills or True Absorption. Without a valid
+closed-M15 DOM event, the strategy falls through to the remaining triggers.
 ### Risk & trade management
 
 - **Stop** — behind a 1H Williams fractal with an ATR buffer; risk clamped to a min/max ATR corridor
@@ -829,11 +824,10 @@ backtest_sandbox forexbot-backtest-optimize-v2-fx \
 sudo journalctl -fu forexbot-backtest-optimize-v2-fx.service
 ```
 
-Add `--orderflow-data /path/to/sealed-orderflow` only when the directory has
-passed `AbsorptionEventDataset` validation. Without it, the run remains valid
-for the other triggers but records Absorption as `DATA_UNAVAILABLE`; it never
-manufactures an OHLCV proxy. Sidecar mapping is one-to-one identity-only;
-cross-market mappings such as crypto footprint into FX are rejected.
+Add `--liquidity-data /path/to/sealed-fxpro-liquidity` only after the directory
+passes `FxProLiquidityEventDataset` validation. Without it, the run remains
+valid for the other triggers but records Liquidity Rejection as
+`DATA_UNAVAILABLE`; it never manufactures an OHLCV or tick-volume proxy.
 
 ### Quantower FxPro tick-cluster diagnostic
 
@@ -872,12 +866,59 @@ Pass the final snapshot directory containing both `bars.json` and
 `manifest.json`, not the output root or a `.partial-*` directory.
 
 See the exporter README for build, Quantower installation, chart-history
-limits, and capture steps. Live Absorption remains off until this evidence is
-reviewed and a causal diagnostic-to-sidecar adapter is approved.
+limits, and capture steps. The Quantower/Absorption branch is archived research
+and is not called by the production strategy or `optimize-v2`.
 
-### Executed-trade tape to Absorption sidecar
+### FxPro DOM Liquidity Rejection (active Turtle Soup replacement)
 
-A production `forexbot.absorption-15m` sidecar can be built only from a spot-FX
+The bot records its own FxPro MT5 Market Depth and names the broker-specific
+factor `fxpro_liquidity_rejection_15m`. It must never be called True Absorption:
+FxPro DOM is OTC aggregated quoted liquidity, and a removed quote may be a
+cancellation, replacement, or execution. It does not prove executed aggressor
+side and does not expose exchange MBO.
+
+Capture and entry activation are intentionally separate. Start with capture
+enabled and entries disabled:
+
+```dotenv
+FXPRO_DOM_CAPTURE_ENABLED=1
+FXPRO_DOM_SYMBOLS=EURUSD,GBPUSD,USDCAD
+FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED=0
+```
+
+The read-only recorder writes append-only raw snapshots under
+`ai_data/fxpro_dom/snapshots/YYYY-MM-DD/SYMBOL.jsonl`, finalized causal M15
+summaries under `events/`, and the latest closed summary under `latest/`.
+Unsupported or empty FxPro DOM, partial coverage, excessive gaps, shallow book,
+late data, invalid provenance, and checksum failures all produce no factor and
+do not block the remaining strategy triggers. Replenishment is counted only
+when volume removed from an already observed price level later returns at the
+same level; removed volume is never labelled as a trade.
+
+After a representative capture period, seal a new immutable research sidecar:
+
+```bash
+python tools/seal_fxpro_liquidity_sidecar.py \
+  ai_data/fxpro_dom /data/fxpro-liquidity-2026q3-v1
+```
+
+Then add it to the existing `optimize-v2` command:
+
+```bash
+python -m backtest optimize-v2 ... \
+  --liquidity-data /data/fxpro-liquidity-2026q3-v1
+```
+
+The sidecar hashes every event shard and normalized event population.
+`available_at` is enforced in live and WFO paths, so an M15 summary cannot be
+used at candle close if it was finalized later. WFO regenerates LONG and SHORT
+plus every trigger inside each train window. Only after OOS and shadow evidence
+should `FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED` be considered for live use.
+
+### Archived executed-trade tape to Absorption sidecar
+
+This independent research path is no longer in the active live/WFO trigger
+manifest. A `forexbot.absorption-15m` sidecar can be built only from a spot-FX
 executed-trade tape whose aggressor is reported by the venue or exchange. The
 FxPro/Quantower diagnostic above is reconstructed from Bid/Ask ticks and is
 therefore deliberately refused by this path; do not relabel it as executed
