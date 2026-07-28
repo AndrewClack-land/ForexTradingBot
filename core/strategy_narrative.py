@@ -8,6 +8,10 @@ import time
 import numpy as np
 import pandas as pd
 
+from core.fxpro_cluster_rejection import (
+    ClusterRejectionThresholds,
+    detect_fxpro_cluster_rejection,
+)
 from core.fxpro_quote_pressure import (
     LiquidityRejectionThresholds,
     detect_fxpro_quote_pressure_rejection,
@@ -24,6 +28,39 @@ except Exception:
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
 REJECTION_BLOCK_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", False)
+)
+FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = bool(
+    getattr(_cfg, "FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED", False)
+)
+FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION = bool(
+    getattr(_cfg, "FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION", False)
+)
+FXPRO_CLUSTER_EDGE_FRACTION = float(
+    getattr(_cfg, "FXPRO_CLUSTER_EDGE_FRACTION", 0.20)
+)
+FXPRO_CLUSTER_MIN_CLASSIFIED_VOLUME = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_CLASSIFIED_VOLUME", 20.0)
+)
+FXPRO_CLUSTER_MIN_CLASSIFICATION_RATIO = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_CLASSIFICATION_RATIO", 0.80)
+)
+FXPRO_CLUSTER_MIN_EDGE_VOLUME_SHARE = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_EDGE_VOLUME_SHARE", 0.12)
+)
+FXPRO_CLUSTER_MIN_EDGE_IMBALANCE_RATIO = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_EDGE_IMBALANCE_RATIO", 1.50)
+)
+FXPRO_CLUSTER_MIN_REJECTION_FRACTION = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_REJECTION_FRACTION", 0.60)
+)
+FXPRO_CLUSTER_MIN_WICK_FRACTION = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_WICK_FRACTION", 0.20)
+)
+FXPRO_CLUSTER_MIN_SCORE = float(
+    getattr(_cfg, "FXPRO_CLUSTER_MIN_SCORE", 0.60)
+)
+FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS = int(
+    getattr(_cfg, "FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS", 2)
 )
 FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = bool(
     getattr(_cfg, "FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED", False)
@@ -202,9 +239,10 @@ class NarrativeStrategy:
          breakouts, 1H Order/Rejection Blocks
       2) Bias strictness: 1H FVG regime
       3) SETUP: 15M Rejection Block
-      4) FALLBACK: FxPro Quote Pressure Rejection on 15M
-      5) FALLBACK2: H1 Pivots levels + 15M reclaim
-      6) ENTRY DELIVERY: send ENTRY RANGE
+      4) FALLBACK: FxPro/Quantower Cluster Rejection proxy on 15M
+      5) FALLBACK2: FxPro Quote Pressure Rejection on 15M
+      6) FALLBACK3: H1 Pivots levels + 15M reclaim
+      7) ENTRY DELIVERY: send ENTRY RANGE
          - всё локализуется вокруг последнего 15M close
          - если есть RB зона -> диапазон зажимается внутри неё
       7) Stop: 1H fractal (3-bar) + ATR buffer + candle floor
@@ -215,6 +253,37 @@ class NarrativeStrategy:
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
         self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
+        self.cluster_rejection_15m_entry_enabled = (
+            FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED
+        )
+        self.cluster_rejection_allow_research_assumption = (
+            FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION
+        )
+        self._cluster_rejection_thresholds: Optional[
+            ClusterRejectionThresholds
+        ] = None
+        try:
+            self._cluster_rejection_thresholds = ClusterRejectionThresholds(
+                edge_fraction=FXPRO_CLUSTER_EDGE_FRACTION,
+                min_classified_volume=FXPRO_CLUSTER_MIN_CLASSIFIED_VOLUME,
+                min_classification_ratio=(
+                    FXPRO_CLUSTER_MIN_CLASSIFICATION_RATIO
+                ),
+                min_edge_volume_share=FXPRO_CLUSTER_MIN_EDGE_VOLUME_SHARE,
+                min_edge_imbalance_ratio=(
+                    FXPRO_CLUSTER_MIN_EDGE_IMBALANCE_RATIO
+                ),
+                min_rejection_fraction=(
+                    FXPRO_CLUSTER_MIN_REJECTION_FRACTION
+                ),
+                min_wick_fraction=FXPRO_CLUSTER_MIN_WICK_FRACTION,
+                min_cluster_score=FXPRO_CLUSTER_MIN_SCORE,
+                candle_match_tolerance_ticks=(
+                    FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS
+                ),
+            )
+        except (TypeError, ValueError):
+            self.cluster_rejection_15m_entry_enabled = False
         self.quote_pressure_rejection_15m_entry_enabled = (
             FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED
         )
@@ -798,6 +867,69 @@ class NarrativeStrategy:
 
         return None
 
+    # ================== FxPro 15M Cluster Rejection proxy ==================
+
+    def trigger_15m_cluster_rejection(
+        self,
+        df_15M: pd.DataFrame,
+        side: Side,
+        event: Optional[Any],
+        *,
+        symbol: str,
+    ) -> Optional[CandidateEntry]:
+        if (
+            not self.cluster_rejection_15m_entry_enabled
+            or self._cluster_rejection_thresholds is None
+            or side not in {"LONG", "SHORT"}
+            or event is None
+            or df_15M is None
+            or df_15M.empty
+        ):
+            return None
+
+        try:
+            candle_open_time = pd.Timestamp(df_15M.index[-1])
+            decision_time = pd.Timestamp(
+                event.get("available_at")
+                if isinstance(event, dict)
+                else getattr(event, "available_at", None)
+            )
+            rejection = detect_fxpro_cluster_rejection(
+                candle=df_15M.iloc[-1].to_dict(),
+                candle_open_time=candle_open_time,
+                event=event,
+                symbol=symbol,
+                side=side,
+                decision_time=decision_time,
+                thresholds=self._cluster_rejection_thresholds,
+                allow_research_assumption=(
+                    self.cluster_rejection_allow_research_assumption
+                ),
+            )
+        except Exception:
+            # Optional cluster history must never break the base strategy.
+            return None
+        if rejection is None:
+            return None
+
+        close = float(df_15M["close"].iloc[-1])
+        meta = rejection.to_dict()
+        return CandidateEntry(
+            side=side,
+            entry_price=close,
+            tf="15M",
+            reason=(
+                f"FxPro Cluster Rejection 15M {side}"
+                f" | score={rejection.cluster_score:.3f}"
+                f" edge_imbalance={rejection.edge_imbalance_ratio:.3f}"
+                f" edge_share={rejection.edge_volume_share:.3f}"
+                f" rejection={rejection.rejection_fraction:.3f}"
+            ),
+            trigger_kind="fxpro_cluster_rejection_15m",
+            trigger_event_id=rejection.source_bar_hash,
+            trigger_meta=meta,
+        )
+
     # ================== FxPro 15M Quote Pressure Rejection ==================
 
     def trigger_15m_quote_pressure_rejection(
@@ -1253,6 +1385,13 @@ class NarrativeStrategy:
             if self.rejection_block_entry_enabled
             else None
         )
+        if entry is None:
+            entry = self.trigger_15m_cluster_rejection(
+                df_15M,
+                side_bias,
+                data.get("FXPRO_CLUSTER_REJECTION_15M"),
+                symbol=symbol,
+            )
         if entry is None:
             entry = self.trigger_15m_quote_pressure_rejection(
                 df_15M,

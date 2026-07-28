@@ -22,10 +22,15 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `backtest/counterfactual.py`
 - Train-only constrained replacement weights:
   `backtest/weight_optimizer.py`
+- Active FxPro Cluster Rejection detector:
+  `core/fxpro_cluster_rejection.py`
+- Immutable FxPro Cluster Rejection sidecar and diagnostic sealer:
+  `backtest/fxpro_cluster_data.py`, CLI
+  `tools/seal_quantower_cluster_proxy_sidecar.py`
 - Active FxPro DOM capture and M15 aggregation: `core/fxpro_dom.py`
-- Active fail-closed FxPro Quote Pressure Rejection detector:
+- Optional fail-closed FxPro Quote Pressure Rejection detector:
   `core/fxpro_quote_pressure.py`
-- Active immutable Quote Pressure Rejection WFO sidecar:
+- Immutable Quote Pressure Rejection WFO sidecar:
   `backtest/fxpro_quote_pressure_data.py`, CLI
   `tools/seal_fxpro_quote_pressure_sidecar.py`
 - Archived footprint sidecar validation: `backtest/orderflow_data.py`
@@ -46,21 +51,64 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `tests/test_backtest_orderflow_ingest.py`,
   `tests/test_backtest_orderflow_inspect.py`,
   `tests/test_fxpro_quote_pressure_rejection.py`,
+  `tests/test_fxpro_cluster_rejection.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
 Do not reconstruct factor rules by parsing the human-readable narrative text.
 Use the structured `factor_vector`.
 
+## FxPro Cluster Rejection contract
+
+`fxpro_cluster_rejection_15m` is the current technical replacement for Turtle
+Soup. It is a broker-specific cluster proxy, not True Absorption. Quantower
+classifies FxPro ticks by TickDirection into reconstructed Buy/Sell values at
+PriceLevels; this does not prove exchange executions, aggressor side, order
+identity, or CME MBO. Preserve source `quantower_fxpro_tick_cluster`, venue
+`FxPro`, market type `otc_reconstructed_bidask_ticks`, data kind
+`tick_direction_cluster_proxy_no_execution_proof`, and classification
+`quantower_tickdirection_buy_sell`.
+
+Non-negotiable implementation rules:
+
+- accept only complete, checksum-valid closed-M15 events with full PriceLevels,
+  matching OHLC/tick size/symbol/provenance, and
+  `available_at <= decision_time`;
+- load research/live events only through an immutable
+  `FxProClusterEventDataset`; never pass raw Quantower files directly to the
+  strategy;
+- diagnostic history has no proven historical publication time. Conversion
+  therefore requires an explicit nonnegative delay plus evidence note, marks
+  every event `availability_mode=research_assumption`, and seals the sidecar
+  as `research_only=true`;
+- live detection must reject `research_assumption`. It may accept only
+  forward-observed, finalized events whose publication time was recorded after
+  collection; do not infer or rewrite `available_at`;
+- never synthesize the proxy from LSE OHLCV, candle volume, MT5 tick volume,
+  broker DOM, the Quote Pressure sidecar, or the archived Absorption sidecar;
+- missing, late, incomplete, low-quality, mismatched, or tampered data is
+  `DATA_UNAVAILABLE`; it falls through to later triggers and never blocks the
+  entire market entry;
+- keep `FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED` disabled until representative
+  immutable history, frozen OOS results, and forward shadow evidence have been
+  reviewed;
+- regenerate both LONG and SHORT plus every trigger inside every train window;
+  production weights must never preselect the learning population.
+
+The current Quantower C# exporter is diagnostic-only: it exports a completed
+historical UTC day, but it does not yet publish forward-observed live events.
+The Python live reader is ready, but this does not authorize configuring
+`FXPRO_CLUSTER_LIVE_SIDECAR_DIR` or enabling entries until a reviewed
+forward writer/uploader exists.
+
 ## FxPro Quote Pressure Rejection contract
 
-`fxpro_quote_pressure_rejection_15m` is the active replacement for Turtle Soup.
-The old Turtle detector may remain only as unreachable historical diagnostic
-code. The executed-tape Absorption and Quantower cluster pipelines are archived
-research and must not be reintroduced into live or `optimize-v2`.
+`fxpro_quote_pressure_rejection_15m` remains a separate broker-DOM challenger,
+not an alias or fallback for the cluster proxy. The old Turtle detector may
+remain only as unreachable historical diagnostic code.
 
-The factor is broker-specific and must never be named True Absorption. FxPro
-MT5 Market Depth is `otc_aggregated_liquidity` with data kind
+This factor must never be named True Absorption. FxPro MT5 Market Depth is
+`otc_aggregated_liquidity` with data kind
 `depth_quotes_no_execution_proof`. A removed quote is not proof of a fill, and
 DOM changes must not be labelled Trades, Buy Volume, Sell Volume, aggressor
 flow, footprint, or CME MBO.
@@ -133,28 +181,31 @@ Important distinctions:
 Production trigger priority is:
 
 1. quarantined 15M Rejection Block, only if separately enabled;
-2. FxPro Quote Pressure Rejection 15M, only if a matching finalized DOM event is
-   causally available and the independent live flag is enabled;
-3. H1 Pivot Reclaim on 15M;
-4. 1H Order Block touch.
+2. FxPro Cluster Rejection 15M, only with a causally available sealed cluster
+   event and the independent live flag enabled;
+3. FxPro Quote Pressure Rejection 15M, only with a causally available finalized
+   DOM event and its independent live flag enabled;
+4. H1 Pivot Reclaim on 15M;
+5. 1H Order Block touch.
 
 Turtle Soup is retired from the production call path. Do not add a re-enable
 flag, fallback call, or implicit compatibility path. The legacy pure detector
 may remain only for reproducing historical reports.
 
-The active second trigger is governed exclusively by the FxPro Quote Pressure
-Rejection contract above. Missing DOM is `DATA_UNAVAILABLE`, so the strategy
-falls through to later triggers; it must not reject the complete market entry
-solely because broker depth is absent. `optimize-v2` may generate this trigger
-only from `--quote-pressure-data` and a sealed
-`FxProQuotePressureEventDataset`. Its pre-gate attribution must be exported in
+Missing cluster or DOM data is `DATA_UNAVAILABLE`, so the strategy falls
+through to later triggers; absence of an optional broker feed must never reject
+the complete market entry. `optimize-v2` may generate Cluster Rejection only
+from `--cluster-proxy-data` and a sealed `FxProClusterEventDataset`, and Quote
+Pressure only from `--quote-pressure-data` and a sealed
+`FxProQuotePressureEventDataset`. Both are exported in
 `trigger_attribution.csv` beside H1 Order Block and H1 Pivot Reclaim, grouped
 by trigger, market, direction, quarter, and their combined intersection.
 
-The old Quantower cluster diagnostic, executed-trade tape ingest,
-`AbsorptionEventDataset`, and pure Absorption detector remain archived research.
-They may still be tested for reproducibility, but they are not active live/WFO
-inputs and must not be passed through compatibility aliases.
+The executed-trade tape ingest, `AbsorptionEventDataset`, and pure Absorption
+detector remain archived research. The Quantower diagnostic is now an accepted
+input only to the explicit research-assumption Cluster Rejection sealer; it
+must never enter the executed-trade Absorption path or live trading directly.
+
 ## Risk contract
 
 - Aggregate stop-loss risk for one setup/entry must never exceed `1%` of its
@@ -391,9 +442,10 @@ The v2 command produces `decision_events.csv`,
 `trigger_attribution.csv`,
 `frozen_weight_models.json`, optimizer predictions/coefficients/metrics, OOS
 selections, and the chronological replay tables. All files must be covered by
-the report manifest. A run without a sealed FxPro Quote Pressure sidecar must
-state Quote Pressure Rejection `DATA_UNAVAILABLE`; it is a remaining-trigger
-challenger, not evidence for or against broker quote-pressure rejection.
+the report manifest. A run without a sealed Cluster Rejection sidecar must
+state Cluster Rejection `DATA_UNAVAILABLE`; a run without a sealed FxPro Quote
+Pressure sidecar must state Quote Pressure Rejection `DATA_UNAVAILABLE`.
+Neither missing optional feed is evidence for or against its trigger family.
 
 The existing `--train` interval does not fit replacement factor weights. It
 defines rolling history/OOS boundaries for the fixed baseline. The current

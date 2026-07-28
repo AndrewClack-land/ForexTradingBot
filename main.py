@@ -62,6 +62,7 @@ from config import (
     FXPRO_DOM_POLL_MS,
     FXPRO_DOM_MAX_LEVELS,
     FXPRO_DOM_HEARTBEAT_SEC,
+    FXPRO_CLUSTER_LIVE_SIDECAR_DIR,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -69,6 +70,7 @@ from core.mt5_guard import install as _install_mt5_guard
 # call with a shared lock (tick loop, DataCacheLoop and MT5Bridge all use it).
 _install_mt5_guard()
 
+from backtest.fxpro_cluster_data import FxProClusterEventDataset
 from core.data_cache import DataCache
 from core.data_feed import DataFeed
 from core.fxpro_dom import FxProDomRecorder
@@ -259,6 +261,52 @@ class Core:
             except Exception as exc:
                 self.fxpro_dom_recorder = None
                 print(f"[FxPro DOM] capture unavailable: {exc}")
+
+        self.fxpro_cluster_dataset: Optional[
+            FxProClusterEventDataset
+        ] = None
+        self._fxpro_cluster_manifest_mtime_ns: Optional[int] = None
+        self._fxpro_cluster_reload_error_ts = 0.0
+        if FXPRO_CLUSTER_LIVE_SIDECAR_DIR is not None:
+            self._refresh_fxpro_cluster_dataset(force=True)
+
+    def _refresh_fxpro_cluster_dataset(
+        self,
+        *,
+        force: bool = False,
+    ) -> Optional[FxProClusterEventDataset]:
+        """Reload an atomically published forward-observed cluster sidecar."""
+
+        root = FXPRO_CLUSTER_LIVE_SIDECAR_DIR
+        if root is None:
+            return None
+        manifest = Path(root) / "manifest.json"
+        try:
+            mtime_ns = manifest.stat().st_mtime_ns
+            if (
+                not force
+                and self.fxpro_cluster_dataset is not None
+                and self._fxpro_cluster_manifest_mtime_ns == mtime_ns
+            ):
+                return self.fxpro_cluster_dataset
+            dataset = FxProClusterEventDataset.load(root)
+            if dataset.research_only:
+                raise ValueError(
+                    "research_only cluster sidecar is refused by live Core"
+                )
+            self.fxpro_cluster_dataset = dataset
+            self._fxpro_cluster_manifest_mtime_ns = mtime_ns
+            print(
+                "[FxPro Cluster] forward-observed sidecar loaded: "
+                f"events={len(dataset.events)} "
+                f"manifest={dataset.manifest_sha256[:12]}"
+            )
+        except Exception as exc:
+            now = time.time()
+            if now - self._fxpro_cluster_reload_error_ts >= 60.0:
+                print(f"[FxPro Cluster] live sidecar unavailable: {exc}")
+                self._fxpro_cluster_reload_error_ts = now
+        return self.fxpro_cluster_dataset
 
     def close(self) -> None:
         recorder = getattr(self, "fxpro_dom_recorder", None)
@@ -1096,26 +1144,34 @@ class Core:
         *,
         symbol: str,
     ) -> Dict[str, Any]:
-        """Closed OHLC bars plus the matching causal FxPro M15 DOM event."""
+        """Closed OHLC plus matching causal cluster and DOM M15 events."""
 
         view = self._closed_bars_view(data) if SIGNAL_ON_CLOSED_BARS else data
-        recorder = getattr(self, "fxpro_dom_recorder", None)
         df_15m = view.get("15M") if isinstance(view, dict) else None
-        if (
-            recorder is None
-            or df_15m is None
-            or getattr(df_15m, "empty", True)
-        ):
+        if df_15m is None or getattr(df_15m, "empty", True):
             return view
-        event = recorder.event_asof(
-            symbol,
-            df_15m.index[-1],
-            datetime.now(timezone.utc),
-        )
-        if event is None:
-            return view
+
+        decision_time = datetime.now(timezone.utc)
         enriched = dict(view)
-        enriched["FXPRO_QUOTE_PRESSURE_15M"] = event
+        cluster_dataset = self._refresh_fxpro_cluster_dataset()
+        if cluster_dataset is not None:
+            cluster_event = cluster_dataset.event_asof(
+                symbol,
+                df_15m.index[-1],
+                decision_time,
+            )
+            if cluster_event is not None:
+                enriched["FXPRO_CLUSTER_REJECTION_15M"] = cluster_event
+
+        recorder = getattr(self, "fxpro_dom_recorder", None)
+        if recorder is not None:
+            quote_event = recorder.event_asof(
+                symbol,
+                df_15m.index[-1],
+                decision_time,
+            )
+            if quote_event is not None:
+                enriched["FXPRO_QUOTE_PRESSURE_15M"] = quote_event
         return enriched
 
     def _move_entry_to_breakeven(

@@ -132,6 +132,53 @@ FXPRO_DOM_POLL_MS = _env_int("FXPRO_DOM_POLL_MS") or 500
 FXPRO_DOM_MAX_LEVELS = _env_int("FXPRO_DOM_MAX_LEVELS") or 20
 FXPRO_DOM_HEARTBEAT_SEC = _env_float("FXPRO_DOM_HEARTBEAT_SEC", 1.0)
 
+# FxPro/Quantower Cluster Rejection is an opt-in broker-specific proxy.
+# Historical diagnostic conversions are research assumptions and stay refused
+# by live detection unless an isolated research runner overrides the guard.
+FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = os.getenv(
+    "FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+_FXPRO_CLUSTER_LIVE_SIDECAR_DIR = os.getenv(
+    "FXPRO_CLUSTER_LIVE_SIDECAR_DIR", ""
+).strip()
+FXPRO_CLUSTER_LIVE_SIDECAR_DIR = (
+    Path(_FXPRO_CLUSTER_LIVE_SIDECAR_DIR)
+    if _FXPRO_CLUSTER_LIVE_SIDECAR_DIR
+    else None
+)
+FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION = os.getenv(
+    "FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+FXPRO_CLUSTER_EDGE_FRACTION = _env_float(
+    "FXPRO_CLUSTER_EDGE_FRACTION", 0.20
+)
+FXPRO_CLUSTER_MIN_CLASSIFIED_VOLUME = _env_float(
+    "FXPRO_CLUSTER_MIN_CLASSIFIED_VOLUME", 20.0
+)
+FXPRO_CLUSTER_MIN_CLASSIFICATION_RATIO = _env_float(
+    "FXPRO_CLUSTER_MIN_CLASSIFICATION_RATIO", 0.80
+)
+FXPRO_CLUSTER_MIN_EDGE_VOLUME_SHARE = _env_float(
+    "FXPRO_CLUSTER_MIN_EDGE_VOLUME_SHARE", 0.12
+)
+FXPRO_CLUSTER_MIN_EDGE_IMBALANCE_RATIO = _env_float(
+    "FXPRO_CLUSTER_MIN_EDGE_IMBALANCE_RATIO", 1.50
+)
+FXPRO_CLUSTER_MIN_REJECTION_FRACTION = _env_float(
+    "FXPRO_CLUSTER_MIN_REJECTION_FRACTION", 0.60
+)
+FXPRO_CLUSTER_MIN_WICK_FRACTION = _env_float(
+    "FXPRO_CLUSTER_MIN_WICK_FRACTION", 0.20
+)
+FXPRO_CLUSTER_MIN_SCORE = _env_float(
+    "FXPRO_CLUSTER_MIN_SCORE", 0.60
+)
+FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS = (
+    _env_int("FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS")
+)
+if FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS is None:
+    FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS = 2
+
 # FxPro Quote Pressure Rejection is opt-in. DOM capture may run while
 # entries stay disabled until the broker-specific history passes causal WFO.
 FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = os.getenv(

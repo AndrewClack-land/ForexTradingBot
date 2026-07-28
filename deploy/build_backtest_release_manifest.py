@@ -17,6 +17,7 @@ RELEASE_PATHS = (
     "core/__init__.py",
     "core/absorption.py",
     "core/htf_context.py",
+    "core/fxpro_cluster_rejection.py",
     "core/fxpro_quote_pressure.py",
     "core/narrative_scoring.py",
     "core/pivot_trigger.py",

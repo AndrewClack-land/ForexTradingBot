@@ -9,8 +9,9 @@ execution gates, fitted inside the outer training window only, and replayed
 chronologically with one frozen model in the following OOS window.
 
 Turtle Soup and True Absorption are not part of the trigger manifest. FxPro
-Quote Pressure Rejection is available only with a causal broker-DOM event
-is supplied; OHLCV and tick volume are never used as proxies.
+Cluster Rejection is available only from a sealed Quantower/FxPro cluster
+sidecar, and Quote Pressure Rejection only from a causal broker-DOM event.
+OHLCV and MT5 tick volume are never used as substitutes.
 """
 
 from __future__ import annotations
@@ -29,6 +30,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .data import HistoricalDataset
+from .fxpro_cluster_data import FxProClusterEventDataset
 from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
 from .simulator import simulate_split_outcome
 from .strategy_runner import (
@@ -66,6 +68,7 @@ from .weight_optimizer import (
 COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v1"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
+    "fxpro_cluster_rejection_15m",
     "fxpro_quote_pressure_rejection_15m",
     "h1_pivot_reclaim_15m",
     "order_block_1h",
@@ -110,6 +113,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "production_bias_ignored_for_generation",
         "factor_vector",
         "fvg_side",
+        "cluster_proxy_status",
         "quote_pressure_status",
         "technical_triggers",
     ),
@@ -604,6 +608,7 @@ def _detect_entries(
     df_1h = data["1H"]
     df_15m = data["15M"]
     context = getattr(strategy, "_last_htf_context", None)
+    cluster_event = data.get("FXPRO_CLUSTER_REJECTION_15M")
     quote_pressure_event = data.get("FXPRO_QUOTE_PRESSURE_15M")
     detected: list[tuple[str, Any]] = []
 
@@ -611,6 +616,15 @@ def _detect_entries(
         entry = strategy.trigger_15m_rejection_block(df_15m, side)
         if entry is not None:
             detected.append(("rejection_block_15m", entry))
+
+        entry = strategy.trigger_15m_cluster_rejection(
+            df_15m,
+            side,
+            cluster_event,
+            symbol=symbol,
+        )
+        if entry is not None:
+            detected.append(("fxpro_cluster_rejection_15m", entry))
 
         entry = strategy.trigger_15m_quote_pressure_rejection(
             df_15m,
@@ -665,6 +679,7 @@ def _generate_symbol_universe(
     prepared: Mapping[str, Any],
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
+    cluster_proxy: Optional[FxProClusterEventDataset],
     quote_pressure: Optional[FxProQuotePressureEventDataset],
     strategy_factory: StrategyFactory,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
@@ -683,6 +698,11 @@ def _generate_symbol_universe(
     # Operationally disabled families are still labelled, then remain blocked
     # in OOS replay unless the research command explicitly enables them.
     strategy.orderblock_entry_enabled = True
+    if cluster_proxy is not None:
+        # Historical conversions carry an explicit research-only availability
+        # assumption.  This override exists only in the isolated WFO runner.
+        strategy.cluster_rejection_15m_entry_enabled = True
+        strategy.cluster_rejection_allow_research_assumption = True
     if quote_pressure is not None:
         # Research-only activation is tied to a sealed FxPro sidecar.
         # Production remains controlled by its independent live opt-in flag.
@@ -707,19 +727,35 @@ def _generate_symbol_universe(
             counters["warmup_skipped"] += 1
             continue
 
+        cluster_proxy_status = "DATA_UNAVAILABLE"
+        cluster_event = None
+        if cluster_proxy is not None:
+            cluster_event = cluster_proxy.event_asof(
+                symbol,
+                data["15M"].index[-1],
+                decision_time,
+            )
+            cluster_proxy_status = (
+                "AVAILABLE"
+                if cluster_event is not None
+                else "MISSING_OR_DELAYED"
+            )
         quote_pressure_status = "DATA_UNAVAILABLE"
-        event = None
+        quote_event = None
         if quote_pressure is not None:
-            event = quote_pressure.event_asof(
+            quote_event = quote_pressure.event_asof(
                 symbol,
                 data["15M"].index[-1],
                 decision_time,
             )
             quote_pressure_status = (
-                "AVAILABLE" if event is not None else "MISSING_OR_DELAYED"
+                "AVAILABLE"
+                if quote_event is not None
+                else "MISSING_OR_DELAYED"
             )
         data = dict(data)
-        data["FXPRO_QUOTE_PRESSURE_15M"] = event
+        data["FXPRO_CLUSTER_REJECTION_15M"] = cluster_event
+        data["FXPRO_QUOTE_PRESSURE_15M"] = quote_event
 
         try:
             baseline_bias, narrative = strategy.calc_narrative(
@@ -765,10 +801,14 @@ def _generate_symbol_universe(
             "production_bias_ignored_for_generation": baseline_bias,
             "factor_vector": dict(factor_vector),
             "fvg_side": fvg_side,
+            "cluster_proxy_status": cluster_proxy_status,
             "quote_pressure_status": quote_pressure_status,
             "technical_triggers": len(detected),
         }
         decisions.append(decision_row)
+        counters[
+            f"cluster_proxy_{cluster_proxy_status.lower()}"
+        ] += 1
         counters[
             f"quote_pressure_{quote_pressure_status.lower()}"
         ] += 1
@@ -1286,6 +1326,7 @@ def run_counterfactual_backtest(
     dataset: HistoricalDataset,
     config: NarrativeBacktestConfig,
     *,
+    cluster_proxy: Optional[FxProClusterEventDataset] = None,
     quote_pressure: Optional[FxProQuotePressureEventDataset] = None,
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
@@ -1338,6 +1379,7 @@ def run_counterfactual_backtest(
                 prepared=prepared_by_symbol[symbol],
                 periods=periods,
                 config=config,
+                cluster_proxy=cluster_proxy,
                 quote_pressure=quote_pressure,
                 strategy_factory=strategy_factory,
                 progress=progress,
@@ -1444,6 +1486,8 @@ def run_counterfactual_backtest(
         enabled_triggers.append("order_block_1h")
     if config.rejection_block_entry_enabled:
         enabled_triggers.append("rejection_block_15m")
+    if cluster_proxy is not None:
+        enabled_triggers.append("fxpro_cluster_rejection_15m")
     if quote_pressure is not None:
         enabled_triggers.append("fxpro_quote_pressure_rejection_15m")
     enabled_triggers = sorted(
@@ -1466,6 +1510,11 @@ def run_counterfactual_backtest(
             "score_threshold": None,
             "primary_label_policy": _PRIMARY_POLICY,
         },
+        "cluster_proxy_manifest_sha256": (
+            cluster_proxy.manifest_sha256
+            if cluster_proxy is not None
+            else None
+        ),
         "quote_pressure_manifest_sha256": (
             quote_pressure.manifest_sha256
             if quote_pressure is not None
@@ -1519,6 +1568,25 @@ def run_counterfactual_backtest(
         "enabled_trigger_manifest": enabled_triggers,
         "generated_trigger_manifest": generated_triggers,
         "turtle_soup_called": False,
+        "fxpro_cluster_rejection": {
+            "enabled": cluster_proxy is not None,
+            "cluster_sidecar_loaded": cluster_proxy is not None,
+            "cluster_manifest_sha256": (
+                cluster_proxy.manifest_sha256
+                if cluster_proxy is not None
+                else None
+            ),
+            "research_only": (
+                cluster_proxy.research_only
+                if cluster_proxy is not None
+                else None
+            ),
+            "ohlcv_proxy_used": False,
+            "mt5_tick_volume_proxy_used": False,
+            "execution_proof_claimed": False,
+            "aggressor_polarity_claimed": False,
+            "data_kind": "tick_direction_cluster_proxy_no_execution_proof",
+        },
         "fxpro_quote_pressure_rejection": {
             "enabled": quote_pressure is not None,
             "quote_pressure_sidecar_loaded": quote_pressure is not None,
@@ -1578,6 +1646,12 @@ def run_counterfactual_backtest(
             (
                 "This is a gross OHLCV research replay. Spread, commission, "
                 "swap, slippage and historical tick ordering are unavailable."
+            ),
+            (
+                "FxPro Cluster Rejection is DATA_UNAVAILABLE unless a sealed "
+                "Quantower/FxPro cluster-proxy sidecar is supplied. Historical "
+                "diagnostics use an explicit research availability assumption; "
+                "TickDirection Buy/Sell is not execution or aggressor proof."
             ),
             (
                 "FxPro Quote Pressure Rejection is DATA_UNAVAILABLE unless a "

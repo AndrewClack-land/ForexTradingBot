@@ -309,6 +309,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
     )
     optimize_v2.add_argument(
+        "--cluster-proxy-data",
+        help=(
+            "optional sealed FxProClusterEventDataset; when omitted Cluster "
+            "Rejection remains DATA_UNAVAILABLE; converted diagnostics retain "
+            "their explicit research-only availability assumption"
+        ),
+    )
+    optimize_v2.add_argument(
         "--quote-pressure-data",
         help=(
             "optional sealed FxProQuotePressureEventDataset; when omitted "
@@ -706,6 +714,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     """Run the all-M15 replacement-weight optimizer in an isolated release."""
 
     from .counterfactual import run_counterfactual_backtest
+    from .fxpro_cluster_data import FxProClusterEventDataset
     from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
 
     release_commit = _read_release_commit(args.release_commit_file)
@@ -781,6 +790,11 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
     )
+    cluster_proxy = (
+        FxProClusterEventDataset.load(Path(args.cluster_proxy_data))
+        if args.cluster_proxy_data
+        else None
+    )
     quote_pressure = (
         FxProQuotePressureEventDataset.load(Path(args.quote_pressure_data))
         if args.quote_pressure_data
@@ -813,6 +827,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     result = run_counterfactual_backtest(
         dataset,
         config,
+        cluster_proxy=cluster_proxy,
         quote_pressure=quote_pressure,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
@@ -847,6 +862,14 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         f"net={metrics['net_r']:.3f}R "
         f"expectancy={metrics['expectancy_r']:.3f}R "
         f"PF={pf_text} maxDD={metrics['max_drawdown_r']:.3f}R"
+    )
+    print(
+        "  FxPro Cluster Rejection sidecar: "
+        + (
+            "sealed research proxy loaded"
+            if cluster_proxy is not None
+            else "DATA_UNAVAILABLE (no OHLCV/MT5-volume substitute)"
+        )
     )
     print(
         "  FxPro Quote Pressure Rejection sidecar: "

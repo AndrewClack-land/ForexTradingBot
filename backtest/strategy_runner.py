@@ -81,6 +81,7 @@ _REQUIRED_RELEASE_FILES = {
     "backtest/counterfactual.py",
     "backtest/data.py",
     "backtest/lse_ingest.py",
+    "backtest/fxpro_cluster_data.py",
     "backtest/fxpro_quote_pressure_data.py",
     "backtest/metrics.py",
     "backtest/optimizer.py",
@@ -92,6 +93,7 @@ _REQUIRED_RELEASE_FILES = {
     "core/__init__.py",
     "core/absorption.py",
     "core/htf_context.py",
+    "core/fxpro_cluster_rejection.py",
     "core/fxpro_quote_pressure.py",
     "core/narrative_scoring.py",
     "core/pivot_trigger.py",
@@ -1090,6 +1092,8 @@ def _default_strategy_factory() -> Any:
             shim = types.ModuleType("config")
             shim.ORDERBLOCK_ENTRY_ENABLED = True
             shim.REJECTION_BLOCK_ENTRY_ENABLED = False
+            shim.FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = False
+            shim.FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION = False
             shim.FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = False
             shim.ORDERBLOCK_TOUCH_ATR_K = 0.15
             shim.ORDERBLOCK_TOUCH_MIN_ABS = 0.0005
@@ -1546,6 +1550,7 @@ def _trigger_kind(signal: Mapping[str, Any]) -> str:
     if structured in {
         "rejection_block_15m",
         "absorption_15m",
+        "fxpro_cluster_rejection_15m",
         "fxpro_quote_pressure_rejection_15m",
         "h1_pivot_reclaim_15m",
         "order_block_1h",
@@ -1557,6 +1562,8 @@ def _trigger_kind(signal: Mapping[str, Any]) -> str:
         return "rejection_block_15m"
     if reason.startswith("absorption 15m"):
         return "absorption_15m"
+    if reason.startswith("fxpro cluster rejection 15m"):
+        return "fxpro_cluster_rejection_15m"
     if reason.startswith("fxpro quote pressure rejection 15m"):
         return "fxpro_quote_pressure_rejection_15m"
     if reason.startswith("turtlesoup 15m"):

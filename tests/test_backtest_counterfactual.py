@@ -127,6 +127,12 @@ class _AllSideAllTriggerStrategy:
         type(self).calls[("rejection_block_15m", side)] += 1
         return self._entry(side, "rejection_block_15m", 0.00)
 
+    def trigger_15m_cluster_rejection(self, _, side, event, *, symbol):
+        assert event is None
+        assert symbol == "EURUSD"
+        type(self).calls[("fxpro_cluster_rejection_15m", side)] += 1
+        return self._entry(side, "fxpro_cluster_rejection_15m", 0.05)
+
     def trigger_15m_quote_pressure_rejection(self, _, side, event, *, symbol):
         assert event is None
         assert symbol == "EURUSD"

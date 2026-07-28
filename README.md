@@ -12,7 +12,8 @@ causal backtesting, attribution semantics, and VPS release discipline.
 
 - **Python 3.11** + официальный пакет **MetaTrader5** — котировки и исполнение напрямую через терминал;
 - **Smart Money Concepts / ICT**: premium/discount, ордерблоки, rejection-блоки,
-  FVG, FxPro Quote Pressure Rejection по брокерскому DOM, фракталы Вильямса;
+  FVG, FxPro Cluster Rejection по M15-кластерам, Quote Pressure Rejection по
+  брокерскому DOM, фракталы Вильямса;
 - **python-telegram-bot** — сигналы и команды (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — журнал сделок и статистика для AI-фильтра;
 - сигналы считаются **только по закрытым свечам** (без перерисовки).
@@ -56,16 +57,19 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 Проверяются по очереди; первый сработавший формирует ENTER:
 
 1. **15M Rejection Block** — только при отдельном разрешении;
-2. **FxPro Quote Pressure Rejection 15M** — отклонение цены при давлении котировок
+2. **FxPro Cluster Rejection 15M** — отклонение цены от края M15-кластера
+   Quantower/FxPro при выраженном TickDirection Buy/Sell-дисбалансе;
+3. **FxPro Quote Pressure Rejection 15M** — отклонение цены при давлении котировок
    и восстановлении защитной стороны брокерского DOM;
-3. **H1 Pivot Reclaim на 15M**;
-4. **Касание Order Block 1H**.
+4. **H1 Pivot Reclaim на 15M**;
+5. **Касание Order Block 1H**.
 
-Turtle Soup удалён из production-цепочки. FxPro Quote Pressure Rejection по
-умолчанию выключен для входов и работает fail-closed. DOM содержит агрегированную
-котируемую ликвидность FxPro, а не доказанные сделки: снятая котировка не
-называется исполнением или True Absorption. При отсутствии качественного
-закрытого M15 DOM-события стратегия переходит к следующим триггерам.
+Turtle Soup удалён из production-цепочки. Cluster Rejection и Quote Pressure
+по умолчанию выключены для входов и работают fail-closed. Кластерные Buy/Sell —
+это реконструкция Quantower по направлению тиков, а DOM — агрегированная
+котируемая ликвидность FxPro; ни один из источников не доказывает сделки или
+True Absorption. При отсутствии валидного закрытого M15-события стратегия
+переходит к следующим триггерам.
 ## Риск и сопровождение
 
 - **Стоп** — за фрактал Вильямса на 1H с ATR-буфером, риск ограничен коридором min/max ATR
@@ -147,7 +151,8 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 - **Python 3.11** + the official **MetaTrader5** package — quotes and execution directly through the terminal;
 - **Smart Money Concepts / ICT**: premium/discount, order blocks, rejection blocks,
-  FVG, FxPro broker-DOM Quote Pressure Rejection, Williams fractals;
+  FVG, FxPro M15 Cluster Rejection, broker-DOM Quote Pressure Rejection,
+  Williams fractals;
 - **python-telegram-bot** — signals and commands (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — trade journal and statistics for the AI filter;
 - signals are computed on **closed candles only** (no repainting).
@@ -191,15 +196,18 @@ votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 Checked in order; the first one that fires produces an ENTER signal:
 
 1. **15M Rejection Block** — only when separately enabled;
-2. **FxPro Quote Pressure Rejection 15M** — price rejection under quote pressure
+2. **FxPro Cluster Rejection 15M** — rejection from an M15 cluster edge under a
+   strong Quantower/FxPro TickDirection Buy/Sell imbalance;
+3. **FxPro Quote Pressure Rejection 15M** — price rejection under quote pressure
    with replenishment of the protective side of the broker DOM;
-3. **H1 Pivot Reclaim on 15M**;
-4. **1H Order Block touch**.
+4. **H1 Pivot Reclaim on 15M**;
+5. **1H Order Block touch**.
 
-Turtle Soup is retired. FxPro Quote Pressure Rejection defaults OFF for entries and
-fails closed. DOM is aggregated FxPro quoted liquidity, not execution proof;
-removed quotes are never called fills or True Absorption. Without a valid
-closed-M15 DOM event, the strategy falls through to the remaining triggers.
+Turtle Soup is retired. Cluster Rejection and Quote Pressure default OFF for
+entries and fail closed. Cluster Buy/Sell values are reconstructed by Quantower
+from tick direction, while DOM is aggregated FxPro quoted liquidity; neither
+source proves executions or True Absorption. Without a valid closed-M15 event,
+the strategy falls through to the remaining triggers.
 ### Risk & trade management
 
 - **Stop** — behind a 1H Williams fractal with an ATR buffer; risk clamped to a min/max ATR corridor
@@ -310,7 +318,8 @@ git archive --format=tar "$release_commit" \
   backtest \
   core/__init__.py \
   core/strategy_narrative.py core/absorption.py \
-  core/fxpro_quote_pressure.py core/htf_context.py \
+  core/fxpro_cluster_rejection.py core/fxpro_quote_pressure.py \
+  core/htf_context.py \
   core/narrative_scoring.py core/pivot_trigger.py core/vol_regime.py \
   deploy/build_backtest_release_manifest.py \
   requirements-backtest.txt | \
@@ -825,10 +834,12 @@ backtest_sandbox forexbot-backtest-optimize-v2-fx \
 sudo journalctl -fu forexbot-backtest-optimize-v2-fx.service
 ```
 
-Add `--quote-pressure-data /path/to/sealed-fxpro-quote-pressure` only after the
-directory passes `FxProQuotePressureEventDataset` validation. Without it, the
-run remains valid for the other triggers but records Quote Pressure Rejection as
-`DATA_UNAVAILABLE`; it never manufactures an OHLCV or tick-volume proxy.
+Add `--cluster-proxy-data /path/to/sealed-fxpro-cluster-proxy` only after the
+directory passes `FxProClusterEventDataset` validation. Add
+`--quote-pressure-data /path/to/sealed-fxpro-quote-pressure` only after its
+own dataset validation. Without either optional sidecar, the run remains valid
+for the other triggers and records that trigger as `DATA_UNAVAILABLE`; it
+never manufactures an OHLCV, candle-volume, or MT5 tick-volume substitute.
 
 ### Quantower FxPro tick-cluster diagnostic
 
@@ -867,10 +878,57 @@ Pass the final snapshot directory containing both `bars.json` and
 `manifest.json`, not the output root or a `.partial-*` directory.
 
 See the exporter README for build, Quantower installation, chart-history
-limits, and capture steps. The Quantower/Absorption branch is archived research
-and is not called by the production strategy or `optimize-v2`.
+limits, and capture steps. The diagnostic can now be sealed only as an explicit
+research-assumption Cluster Rejection dataset; it remains invalid for True
+Absorption.
 
-### FxPro Quote Pressure Rejection 15M (active Turtle Soup replacement)
+### FxPro Cluster Rejection 15M (current Turtle Soup replacement)
+
+Validate each completed diagnostic export first, then seal one or more days
+into an immutable research-only sidecar:
+
+```bash
+python tools/seal_quantower_cluster_proxy_sidecar.py \
+  --export /data/fxpro-tick-cluster-EURUSD-YYYY-MM-DD-id \
+  --output /data/fxpro-cluster-proxy-v1 \
+  --availability-delay-ms 1000 \
+  --availability-evidence "Historical Quantower diagnostic; assumed one-second publication delay"
+```
+
+The sealer revalidates the diagnostic, preserves every PriceLevels row, hashes
+the event population, and marks it `research_only=true` with
+`availability_mode=research_assumption`. This is an explicit causal research
+assumption because the historical exporter did not observe original
+publication time. Live code rejects these events by default.
+
+Use the sealed sidecar in the counterfactual run:
+
+```bash
+python -m backtest optimize-v2 ... \
+  --cluster-proxy-data /data/fxpro-cluster-proxy-v1
+```
+
+The detector evaluates directional pressure at the relevant cluster edge,
+classified-volume quality, edge concentration, wick and close rejection. It
+does not call the signal True Absorption and never substitutes OHLCV or MT5 tick
+volume. WFO regenerates LONG and SHORT plus all trigger families inside every
+train window before fitting the five directional weights.
+
+Live support is intentionally incomplete: the Python consumer accepts only a
+sealed forward-observed sidecar configured through
+`FXPRO_CLUSTER_LIVE_SIDECAR_DIR`, but the current Quantower C# exporter writes
+historical daily diagnostics and is not yet a forward publisher/uploader.
+Therefore keep:
+
+```dotenv
+FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED=0
+FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION=0
+```
+
+until a forward writer, representative capture, frozen OOS run, and shadow
+review are complete.
+
+### FxPro Quote Pressure Rejection 15M (separate broker-DOM challenger)
 
 The bot records its own FxPro MT5 Market Depth and names the broker-specific
 factor `fxpro_quote_pressure_rejection_15m`. It must never be called True
@@ -915,9 +973,9 @@ The sidecar hashes every event shard and normalized event population.
 `available_at` is enforced in live and WFO paths, so an M15 summary cannot be
 used at candle close if it was finalized later. WFO regenerates LONG and SHORT
 plus every trigger inside each train window. The report
-`trigger_attribution.csv` compares Quote Pressure Rejection directly with H1
-Order Block and H1 Pivot Reclaim across symbols, directions, quarters, and
-their intersections. Only after OOS and shadow evidence should
+`trigger_attribution.csv` compares Cluster Rejection, Quote Pressure
+Rejection, H1 Order Block, and H1 Pivot Reclaim across symbols, directions,
+quarters, and their intersections. Only after OOS and shadow evidence should
 `FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED` be considered for live use.
 
 ### Archived executed-trade tape to Absorption sidecar
