@@ -26,7 +26,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
     private const string DiagnosticSchema = "forexbot.quantower-cluster-diagnostic";
     private const string BarsSchema = "forexbot.quantower-cluster-diagnostic-bars";
     private const int SchemaVersion = 2;
-    private const string ExporterVersion = "0.2.3";
+    private const string ExporterVersion = "0.3.0";
     private const string Timeframe = "15m";
     private const int ExpectedSlots = 96;
     private const string ExclusiveBarRightSemantics =
@@ -50,6 +50,12 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
 
     [InputParameter("UTC days ago", 10, 1, 30, 1, 0)]
     public int DaysAgo = 1;
+
+    // Quantower computes PriceLevels for the whole loaded chart history, so a
+    // range costs one Volume Analysis pass; only the per-day Last/BidAsk probes
+    // repeat. 0 keeps the historical single-day behaviour.
+    [InputParameter("UTC days ago oldest (0 = single day)", 15, 0, 30, 1, 0)]
+    public int DaysAgoOldest = 0;
 
     [InputParameter("Output directory", 20)]
     public string OutputDirectory = Path.Combine(
@@ -95,6 +101,15 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
             );
         }
 
+        if (DaysAgoOldest != 0 && DaysAgoOldest < DaysAgo)
+        {
+            Core.Loggers.Log(
+                "FxPro Tick Cluster Exporter: UTC days ago oldest must be 0 or"
+                    + " at least UTC days ago.",
+                LoggingLevel.Error
+            );
+        }
+
         if (Symbol is null || HistoricalData is null)
         {
             Core.Loggers.Log(
@@ -124,37 +139,81 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         }
 
         int activeGeneration = Volatile.Read(ref generation);
+        int newestDaysAgo = DaysAgo;
+        int oldestDaysAgo = DaysAgoOldest > 0 ? DaysAgoOldest : DaysAgo;
+        if (oldestDaysAgo < newestDaysAgo)
+        {
+            Core.Loggers.Log(
+                "FxPro Tick Cluster Exporter: export failed (INVALID_DAY_RANGE).",
+                LoggingLevel.Error
+            );
+            return;
+        }
+
+        int captured = 0;
+        var skippedDays = new List<string>();
 
         try
         {
-            ExportSnapshot snapshot = CaptureSnapshot();
-
-            _ = Task.Run(() =>
+            for (
+                int daysAgo = newestDaysAgo;
+                daysAgo <= oldestDaysAgo;
+                daysAgo++
+            )
             {
+                // A settings change or chart reload cancels the remaining days
+                // instead of publishing a half-configured range.
+                if (activeGeneration != Volatile.Read(ref generation))
+                {
+                    return;
+                }
+
+                ExportSnapshot snapshot;
                 try
                 {
-                    if (activeGeneration != Volatile.Read(ref generation))
-                    {
-                        return;
-                    }
-
-                    string finalDirectory = WriteSnapshot(snapshot, activeGeneration);
-                    Core.Loggers.Log(
-                        "FxPro Tick Cluster Exporter: diagnostic snapshot completed: "
-                            + Path.GetFileName(finalDirectory),
-                        LoggingLevel.System
-                    );
+                    snapshot = CaptureSnapshot(daysAgo);
                 }
-                catch (Exception ex)
+                catch (InvalidOperationException ex)
+                    when (ex.Message == "NO_BARS_FOR_TARGET_UTC_DAY")
                 {
-                    Core.Loggers.Log(
-                        "FxPro Tick Cluster Exporter: export failed ("
-                            + SafeErrorCode(ex)
-                            + ").",
-                        LoggingLevel.Error
+                    // Weekends and holidays are expected inside a range and must
+                    // not abort the days that do have bars.
+                    skippedDays.Add(
+                        DateTime.UtcNow.Date
+                            .AddDays(-daysAgo)
+                            .ToString("yyyy-MM-dd", CultureInfo.InvariantCulture)
                     );
+                    continue;
                 }
-            });
+
+                captured++;
+                _ = Task.Run(() =>
+                {
+                    try
+                    {
+                        if (activeGeneration != Volatile.Read(ref generation))
+                        {
+                            return;
+                        }
+
+                        string finalDirectory = WriteSnapshot(snapshot, activeGeneration);
+                        Core.Loggers.Log(
+                            "FxPro Tick Cluster Exporter: diagnostic snapshot completed: "
+                                + Path.GetFileName(finalDirectory),
+                            LoggingLevel.System
+                        );
+                    }
+                    catch (Exception ex)
+                    {
+                        Core.Loggers.Log(
+                            "FxPro Tick Cluster Exporter: export failed ("
+                                + SafeErrorCode(ex)
+                                + ").",
+                            LoggingLevel.Error
+                        );
+                    }
+                });
+            }
         }
         catch (Exception ex)
         {
@@ -164,12 +223,34 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
                     + ").",
                 LoggingLevel.Error
             );
+            return;
+        }
+
+        if (oldestDaysAgo > newestDaysAgo || skippedDays.Count > 0)
+        {
+            Core.Loggers.Log(
+                "FxPro Tick Cluster Exporter: range capture finished:"
+                    + " days_ago="
+                    + newestDaysAgo.ToString(CultureInfo.InvariantCulture)
+                    + ".."
+                    + oldestDaysAgo.ToString(CultureInfo.InvariantCulture)
+                    + ", captured="
+                    + captured.ToString(CultureInfo.InvariantCulture)
+                    + ", skipped_without_bars="
+                    + (
+                        skippedDays.Count == 0
+                            ? "none"
+                            : string.Join("/", skippedDays)
+                    )
+                    + ".",
+                captured > 0 ? LoggingLevel.System : LoggingLevel.Error
+            );
         }
     }
 
-    private ExportSnapshot CaptureSnapshot()
+    private ExportSnapshot CaptureSnapshot(int daysAgo)
     {
-        if (DaysAgo < 1)
+        if (daysAgo < 1)
         {
             throw new InvalidOperationException("CURRENT_OR_FUTURE_DAY_REJECTED");
         }
@@ -199,7 +280,7 @@ public sealed class FxProTickClusterExporter : Indicator, IVolumeAnalysisIndicat
         }
 
         DateTime capturedAtUtc = DateTime.UtcNow;
-        DateTime dayStartUtc = capturedAtUtc.Date.AddDays(-DaysAgo);
+        DateTime dayStartUtc = capturedAtUtc.Date.AddDays(-daysAgo);
         DateTime dayEndUtc = dayStartUtc.AddDays(1);
         if (dayEndUtc > capturedAtUtc)
         {
