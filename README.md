@@ -887,8 +887,9 @@ FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED=0
 ```
 
 The read-only recorder writes append-only raw snapshots under
-`ai_data/fxpro_dom/snapshots/YYYY-MM-DD/SYMBOL.jsonl`, finalized causal M15
-summaries under `events/`, and the latest closed summary under `latest/`.
+`ai_data/fxpro_dom/snapshots/YYYY-MM-DD/SYMBOL.jsonl`, atomically gzip-compresses
+completed UTC days to `.jsonl.gz`, writes finalized causal M15 summaries under
+`events/`, and keeps the latest closed summary under `latest/`.
 Unsupported or empty FxPro DOM, partial coverage, excessive gaps, shallow book,
 late data, invalid provenance, and checksum failures all produce no factor and
 do not block the remaining strategy triggers. Replenishment is counted only

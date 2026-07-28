@@ -12,6 +12,7 @@ price level later returns at that same price.
 from __future__ import annotations
 
 import hashlib
+import gzip
 import json
 import logging
 import math
@@ -386,6 +387,7 @@ class FxProDomRecorder:
             list(self.symbols),
             self.poll_interval,
         )
+        self._compress_completed_raw_files()
         while not self._stop.is_set():
             started = time.monotonic()
             try:
@@ -550,12 +552,58 @@ class FxProDomRecorder:
             old = self._raw_handles.pop(old_key)
             old.flush()
             old.close()
+            old_path = (
+                self.output_dir
+                / "snapshots"
+                / old_key[1]
+                / f"{symbol}.jsonl"
+            )
+            self._compress_raw_path(old_path)
         directory = self.output_dir / "snapshots" / date_key
         directory.mkdir(parents=True, exist_ok=True)
         path = directory / f"{symbol}.jsonl"
         handle = path.open("a", encoding="utf-8", newline="\n")
         self._raw_handles[key] = handle
         return handle
+
+    def _compress_completed_raw_files(self) -> None:
+        today = _utc_now().strftime("%Y-%m-%d")
+        for path in sorted((self.output_dir / "snapshots").glob("*/*.jsonl")):
+            if path.parent.name < today:
+                self._compress_raw_path(path)
+
+    def _compress_raw_path(self, path: Path) -> None:
+        """Atomically gzip one closed append-only raw day without data loss."""
+
+        if not path.is_file():
+            return
+        destination = path.with_suffix(path.suffix + ".gz")
+        temporary = destination.with_suffix(destination.suffix + ".tmp")
+        if destination.exists():
+            self.logger.warning(
+                "Raw DOM compression skipped because destination exists: %s",
+                destination,
+            )
+            return
+        try:
+            with path.open("rb") as source, gzip.open(
+                temporary,
+                "wb",
+                compresslevel=6,
+            ) as target:
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    target.write(chunk)
+            with temporary.open("r+b") as handle:
+                os.fsync(handle.fileno())
+            os.replace(temporary, destination)
+            path.unlink()
+            self.logger.info("Compressed closed FxPro DOM day: %s", destination)
+        except Exception as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            self.logger.warning("Raw DOM compression failed for %s: %s", path, exc)
 
     def _write_raw_if_due(
         self,

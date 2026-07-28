@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import gzip
 
 import pandas as pd
 import pytest
@@ -222,6 +223,38 @@ def test_recorder_publishes_only_closed_m15_event_asof(tmp_path):
     assert visible is not None
     assert visible["available_at"] == "2026-07-27T10:15:01+00:00"
     assert (tmp_path / "latest" / "EURUSD.json").is_file()
+
+
+def test_recorder_compresses_closed_raw_day_on_rotation(tmp_path):
+    recorder = FxProDomRecorder(
+        mt5_module=_NoopMt5(),
+        symbols=["EURUSD"],
+        output_dir=tmp_path,
+    )
+    recorder._observe(
+        _snapshot(
+            "2026-07-27T23:59:59Z",
+            bid=1.0999,
+            ask=1.1001,
+            bid_volume=100.0,
+        )
+    )
+    recorder._observe(
+        _snapshot(
+            "2026-07-28T00:00:01Z",
+            bid=1.0998,
+            ask=1.1000,
+            bid_volume=60.0,
+        )
+    )
+
+    raw = tmp_path / "snapshots" / "2026-07-27" / "EURUSD.jsonl"
+    compressed = raw.with_suffix(".jsonl.gz")
+    assert not raw.exists()
+    assert compressed.is_file()
+    with gzip.open(compressed, "rt", encoding="utf-8") as handle:
+        record = json.loads(handle.readline())
+    assert record["source"] == LIQUIDITY_SOURCE
 
 
 def test_sealed_sidecar_round_trip_and_tamper_detection(tmp_path):

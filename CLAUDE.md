@@ -70,8 +70,9 @@ Non-negotiable implementation rules:
 - keep `FXPRO_DOM_CAPTURE_ENABLED` independent from
   `FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED`; capture may be on while entries
   stay off for shadow/WFO collection;
-- write raw snapshots append-only and publish only finalized closed-M15
-  summaries; never expose the forming accumulator to strategy code;
+- write raw snapshots append-only, atomically gzip completed UTC days, and
+  publish only finalized closed-M15 summaries; never expose the forming
+  accumulator to strategy code;
 - preserve exact source `fxpro_mt5_market_book`, venue `FxPro`, schema version,
   UTC bar identity, `available_at`, quality fields, and event checksum;
 - count depletion and replenishment conservatively at price levels observed in
