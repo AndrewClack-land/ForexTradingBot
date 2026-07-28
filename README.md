@@ -309,7 +309,8 @@ sudo install -d -o root -g root -m 0755 "$release_stage/app"
 git archive --format=tar "$release_commit" \
   backtest \
   core/__init__.py \
-  core/strategy_narrative.py core/absorption.py core/htf_context.py \
+  core/strategy_narrative.py core/absorption.py \
+  core/fxpro_quote_pressure.py core/htf_context.py \
   core/narrative_scoring.py core/pivot_trigger.py core/vol_regime.py \
   deploy/build_backtest_release_manifest.py \
   requirements-backtest.txt | \
