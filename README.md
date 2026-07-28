@@ -875,6 +875,31 @@ See the exporter README for build, Quantower installation, chart-history
 limits, and capture steps. Live Absorption remains off until this evidence is
 reviewed and a causal diagnostic-to-sidecar adapter is approved.
 
+### Executed-trade tape to Absorption sidecar
+
+A production `forexbot.absorption-15m` sidecar can be built only from a spot-FX
+executed-trade tape whose aggressor is reported by the venue or exchange. The
+FxPro/Quantower diagnostic above is reconstructed from Bid/Ask ticks and is
+therefore deliberately refused by this path; do not relabel it as executed
+aggressor flow.
+
+Profile a candidate tape without writing events:
+
+```bash
+python tools/inspect_trade_tape.py --tape /data/eurusd.csv --json /tmp/eurusd-profile.json
+```
+
+If the profile, vendor documentation, identity symbol mapping, true tick size,
+coverage and latency evidence pass review, use
+`tools/build_absorption_sidecar.py`. The converter requires an explicit
+`exchange_reported_aggressor` or `venue_reported_aggressor` attestation and a
+versioned `available_at` rule; reconstructed, inferred and unknown polarity are
+rejected. Input files must remain byte-stable throughout conversion. Shards and
+manifest are sealed in staging and published atomically, while the audit
+receipt remains outside the immutable sidecar root. The full CLI example is in
+the tool's module documentation and the non-negotiable research contract is in
+`CLAUDE.md`.
+
 The report is atomically published and contains `summary.json`,
 `candidates.csv`, one auditable candidate/policy decision in `executions.csv`,
 `setups.csv`, `legs.csv`, `folds.csv`, `config.json` and a SHA-256

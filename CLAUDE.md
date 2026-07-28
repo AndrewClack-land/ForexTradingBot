@@ -23,6 +23,10 @@ procedures; this file defines the non-negotiable rules and research semantics.
 - Train-only constrained replacement weights:
   `backtest/weight_optimizer.py`
 - Sealed footprint sidecar validation: `backtest/orderflow_data.py`
+- Sealed footprint sidecar construction from an executed-trade tape:
+  `backtest/orderflow_ingest.py`, CLI `tools/build_absorption_sidecar.py`
+- Read-only trade-tape preflight profiling: `backtest/orderflow_inspect.py`,
+  CLI `tools/inspect_trade_tape.py`
 - Pure fail-closed Absorption detector: `core/absorption.py`
 - Historical snapshot ingest/audit: `backtest/lse_ingest.py`,
   `backtest/data.py`
@@ -33,6 +37,8 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `tests/test_backtest_weight_optimizer.py`,
   `tests/test_backtest_counterfactual.py`,
   `tests/test_backtest_orderflow_data.py`,
+  `tests/test_backtest_orderflow_ingest.py`,
+  `tests/test_backtest_orderflow_inspect.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
@@ -158,6 +164,48 @@ mapped to EURUSD/GBPUSD/USDCAD. Absorption remains OFF on the live VPS until the
 diagnostic day is reviewed and a validated causal adapter exists. Do not copy
 the downloaded Quantower C# sources or XML layouts into Git: they have no
 repository license, and the XML files contain connection/user state.
+
+`backtest/orderflow_ingest.py` is the only supported producer of a schema-v1
+sidecar. It converts an executed-trade tape into events carrying aggressor
+volume at the bar's highest and lowest traded price level, and it is
+fail-closed: the aggressor must be `exchange_reported_aggressor` or
+`venue_reported_aggressor`, and `tick_rule_reconstructed`, `quote_inferred`,
+`delta_inferred` and `unknown` are permanently refused. The operator must
+attest the closed `[covers_from, covers_through]` interval the tape covers, so
+a truncated tail is never sealed as `finalized`. Prices must lie exactly on the
+declared tick grid, the tape must be sorted, and any unmapped aggressor label,
+non-positive size or unparseable row aborts the build instead of being dropped.
+The symbol must be a six-letter spot pair under identity mapping; a futures or
+cross-market tape such as `6E` is refused pending a separately versioned proxy
+schema. `--volume-measure` selects `executed_size` or `trade_count`; the
+audited `min_edge_volume = 80` threshold is scale-dependent and must be
+re-justified for whichever measure a dataset uses.
+
+`available_at` comes from a named, versioned rule with no default and no
+implicit `available_at = bar_close`:
+
+- `bar_close_plus_measured_vendor_delay.v1` requires a measured `delay_ms` plus
+  a `delay_measurement` evidence text whose SHA-256 is sealed into the manifest
+  `source` descriptor;
+- `max_observed_arrival_plus_margin.v1` requires a per-print arrival timestamp
+  and yields `max(bar_close, max(arrival) + margin_ms)`.
+
+Schema v1 closes both the manifest field set and the sidecar file set, so the
+converter's full audit receipt (input hashes, rule parameters and evidence,
+coverage attestation, quality gates, excluded-bar reasons) is written outside
+the sealed root and the sealed provenance descriptor lives in `source`.
+Input files are hashed before and after conversion and must remain byte-stable.
+Sidecar shards and manifest are built in a sibling staging directory and only
+published by an atomic rename; a failed seal must leave neither the final root
+nor a stale partial directory.
+
+`backtest/orderflow_inspect.py` profiles a candidate tape before any build. It
+is read-only and must never emit sidecar events: it counts and samples bad rows
+and unexpected aggressor labels instead of raising, because a third `unknown`
+bucket is the finding that decides whether a tape is usable. Its derived tick
+size is the greatest common divisor of the observed prices and can overstate
+the instrument tick on a small sample, so declare the vendor's real tick rather
+than the derived one.
 
 `build_factor_vector()` is the canonical arithmetic. A refactor must preserve
 the resulting bias, scores, margins, factor rows, and live narrative text.
