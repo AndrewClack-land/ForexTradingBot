@@ -19,7 +19,7 @@ from backtest.fxpro_quote_pressure_data import (  # noqa: E402
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Seal FxPro MT5 DOM recorder events for causal Liquidity "
+            "Seal FxPro MT5 DOM recorder events for causal Quote Pressure "
             "Rejection walk-forward optimization."
         )
     )

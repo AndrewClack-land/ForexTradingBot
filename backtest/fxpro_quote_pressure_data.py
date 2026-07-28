@@ -154,13 +154,13 @@ class FxProQuotePressureEventDataset:
         manifest_path = directory / "manifest.json"
         if not directory.is_dir() or not manifest_path.is_file():
             raise LiquidityDataValidationError(
-                f"FxPro liquidity manifest is required: {manifest_path}"
+                f"FxPro Quote Pressure manifest is required: {manifest_path}"
             )
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise LiquidityDataValidationError(
-                "FxPro liquidity manifest is invalid"
+                "FxPro Quote Pressure manifest is invalid"
             ) from exc
         expected = {
             "schema": SIDECAR_SCHEMA,
