@@ -9,7 +9,7 @@ execution gates, fitted inside the outer training window only, and replayed
 chronologically with one frozen model in the following OOS window.
 
 Turtle Soup and True Absorption are not part of the trigger manifest. FxPro
-Liquidity Rejection is available only when a sealed, causal broker-DOM event
+Quote Pressure Rejection is available only with a causal broker-DOM event
 is supplied; OHLCV and tick volume are never used as proxies.
 """
 
@@ -29,7 +29,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 import pandas as pd
 
 from .data import HistoricalDataset
-from .liquidity_data import FxProLiquidityEventDataset
+from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
 from .simulator import simulate_split_outcome
 from .strategy_runner import (
     NarrativeBacktestConfig,
@@ -66,7 +66,7 @@ from .weight_optimizer import (
 COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v1"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
-    "fxpro_liquidity_rejection_15m",
+    "fxpro_quote_pressure_rejection_15m",
     "h1_pivot_reclaim_15m",
     "order_block_1h",
 )
@@ -110,7 +110,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "production_bias_ignored_for_generation",
         "factor_vector",
         "fvg_side",
-        "liquidity_status",
+        "quote_pressure_status",
         "technical_triggers",
     ),
     "technical_opportunities.csv": (
@@ -157,6 +157,25 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "net_r_conditional_fill",
         "label_reason",
         "sample_weight",
+    ),
+    "trigger_attribution.csv": (
+        "schema",
+        "dimension",
+        "trigger_kind",
+        "symbol",
+        "side",
+        "period",
+        "opportunities",
+        "labeled_opportunities",
+        "filled_labels",
+        "no_fill_labels",
+        "censored_labels",
+        "invalid_labels",
+        "fill_rate",
+        "mean_opportunity_r",
+        "net_opportunity_r",
+        "filled_expectancy_r",
+        "filled_win_rate",
     ),
     "optimizer_predictions.csv": (
         "schema",
@@ -289,6 +308,7 @@ class CounterfactualBacktestResult:
     decision_events: tuple[Mapping[str, Any], ...]
     opportunities: tuple[Mapping[str, Any], ...]
     labels: tuple[Mapping[str, Any], ...]
+    trigger_attribution: tuple[Mapping[str, Any], ...]
     models: Mapping[str, Any]
     predictions: tuple[Mapping[str, Any], ...]
     coefficients: tuple[Mapping[str, Any], ...]
@@ -349,6 +369,94 @@ def _global_decision_range(
             "train/test windows"
         )
     return min(train_starts), max(period.test_end for period in periods)
+
+
+def _trigger_attribution(
+    labels: Sequence[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Comparable pre-gate trigger outcomes by market, side, and quarter."""
+
+    groups: dict[
+        tuple[str, str, Optional[str], Optional[str], Optional[str]],
+        list[Mapping[str, Any]],
+    ] = defaultdict(list)
+    for row in labels:
+        trigger = str(row.get("trigger_kind") or "unknown")
+        symbol = str(row.get("symbol") or "unknown")
+        side = str(row.get("side") or "unknown")
+        decision_time = pd.Timestamp(row["decision_time"])
+        quarter = f"{decision_time.year}-Q{decision_time.quarter}"
+        keys = (
+            ("trigger", trigger, None, None, None),
+            ("trigger_symbol", trigger, symbol, None, None),
+            ("trigger_side", trigger, None, side, None),
+            ("trigger_quarter", trigger, None, None, quarter),
+            (
+                "trigger_symbol_side_quarter",
+                trigger,
+                symbol,
+                side,
+                quarter,
+            ),
+        )
+        for key in keys:
+            groups[key].append(row)
+
+    output: list[dict[str, Any]] = []
+    for key in sorted(
+        groups,
+        key=lambda item: tuple(value or "" for value in item),
+    ):
+        dimension, trigger, symbol, side, period = key
+        rows = groups[key]
+        statuses = Counter(str(row.get("label_status")) for row in rows)
+        labeled = [
+            float(row["opportunity_r"])
+            for row in rows
+            if row.get("label_status") in {"FILLED", "NO_FILL"}
+            and row.get("opportunity_r") is not None
+        ]
+        filled = [
+            float(row["net_r_conditional_fill"])
+            for row in rows
+            if row.get("label_status") == "FILLED"
+            and row.get("net_r_conditional_fill") is not None
+        ]
+        fill_denominator = statuses["FILLED"] + statuses["NO_FILL"]
+        output.append(
+            {
+                "schema": COUNTERFACTUAL_SCHEMA,
+                "dimension": dimension,
+                "trigger_kind": trigger,
+                "symbol": symbol,
+                "side": side,
+                "period": period,
+                "opportunities": len(rows),
+                "labeled_opportunities": len(labeled),
+                "filled_labels": statuses["FILLED"],
+                "no_fill_labels": statuses["NO_FILL"],
+                "censored_labels": statuses["CENSORED"],
+                "invalid_labels": statuses["INVALID"],
+                "fill_rate": (
+                    statuses["FILLED"] / fill_denominator
+                    if fill_denominator
+                    else None
+                ),
+                "mean_opportunity_r": (
+                    sum(labeled) / len(labeled) if labeled else None
+                ),
+                "net_opportunity_r": sum(labeled) if labeled else None,
+                "filled_expectancy_r": (
+                    sum(filled) / len(filled) if filled else None
+                ),
+                "filled_win_rate": (
+                    sum(value > 0.0 for value in filled) / len(filled)
+                    if filled
+                    else None
+                ),
+            }
+        )
+    return output
 
 
 def _decision_event_id(
@@ -496,7 +604,7 @@ def _detect_entries(
     df_1h = data["1H"]
     df_15m = data["15M"]
     context = getattr(strategy, "_last_htf_context", None)
-    liquidity_event = data.get("FXPRO_LIQUIDITY_15M")
+    quote_pressure_event = data.get("FXPRO_QUOTE_PRESSURE_15M")
     detected: list[tuple[str, Any]] = []
 
     for side in ("LONG", "SHORT"):
@@ -504,14 +612,14 @@ def _detect_entries(
         if entry is not None:
             detected.append(("rejection_block_15m", entry))
 
-        entry = strategy.trigger_15m_liquidity_rejection(
+        entry = strategy.trigger_15m_quote_pressure_rejection(
             df_15m,
             side,
-            liquidity_event,
+            quote_pressure_event,
             symbol=symbol,
         )
         if entry is not None:
-            detected.append(("fxpro_liquidity_rejection_15m", entry))
+            detected.append(("fxpro_quote_pressure_rejection_15m", entry))
 
         entry = strategy.trigger_h1_pivot_reclaim_on_15m(
             df_1h,
@@ -557,7 +665,7 @@ def _generate_symbol_universe(
     prepared: Mapping[str, Any],
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
-    liquidity: Optional[FxProLiquidityEventDataset],
+    quote_pressure: Optional[FxProQuotePressureEventDataset],
     strategy_factory: StrategyFactory,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
 ) -> tuple[
@@ -575,10 +683,10 @@ def _generate_symbol_universe(
     # Operationally disabled families are still labelled, then remain blocked
     # in OOS replay unless the research command explicitly enables them.
     strategy.orderblock_entry_enabled = True
-    if liquidity is not None:
+    if quote_pressure is not None:
         # Research-only activation is tied to a sealed FxPro sidecar.
         # Production remains controlled by its independent live opt-in flag.
-        strategy.liquidity_rejection_15m_entry_enabled = True
+        strategy.quote_pressure_rejection_15m_entry_enabled = True
     decisions: list[dict[str, Any]] = []
     opportunities: list[_Opportunity] = []
     counters: Counter[str] = Counter()
@@ -599,19 +707,19 @@ def _generate_symbol_universe(
             counters["warmup_skipped"] += 1
             continue
 
-        liquidity_status = "DATA_UNAVAILABLE"
+        quote_pressure_status = "DATA_UNAVAILABLE"
         event = None
-        if liquidity is not None:
-            event = liquidity.event_asof(
+        if quote_pressure is not None:
+            event = quote_pressure.event_asof(
                 symbol,
                 data["15M"].index[-1],
                 decision_time,
             )
-            liquidity_status = (
+            quote_pressure_status = (
                 "AVAILABLE" if event is not None else "MISSING_OR_DELAYED"
             )
         data = dict(data)
-        data["FXPRO_LIQUIDITY_15M"] = event
+        data["FXPRO_QUOTE_PRESSURE_15M"] = event
 
         try:
             baseline_bias, narrative = strategy.calc_narrative(
@@ -657,11 +765,13 @@ def _generate_symbol_universe(
             "production_bias_ignored_for_generation": baseline_bias,
             "factor_vector": dict(factor_vector),
             "fvg_side": fvg_side,
-            "liquidity_status": liquidity_status,
+            "quote_pressure_status": quote_pressure_status,
             "technical_triggers": len(detected),
         }
         decisions.append(decision_row)
-        counters[f"liquidity_{liquidity_status.lower()}"] += 1
+        counters[
+            f"quote_pressure_{quote_pressure_status.lower()}"
+        ] += 1
 
         for trigger_kind, entry in detected:
             signal = _materialize_entry(
@@ -1176,7 +1286,7 @@ def run_counterfactual_backtest(
     dataset: HistoricalDataset,
     config: NarrativeBacktestConfig,
     *,
-    liquidity: Optional[FxProLiquidityEventDataset] = None,
+    quote_pressure: Optional[FxProQuotePressureEventDataset] = None,
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     min_train_opportunities: int = DEFAULT_MIN_TRAIN_OPPORTUNITIES,
@@ -1228,7 +1338,7 @@ def run_counterfactual_backtest(
                 prepared=prepared_by_symbol[symbol],
                 periods=periods,
                 config=config,
-                liquidity=liquidity,
+                quote_pressure=quote_pressure,
                 strategy_factory=strategy_factory,
                 progress=progress,
             )
@@ -1328,13 +1438,14 @@ def run_counterfactual_backtest(
         if row.get("forced_exit_reason")
     )
     label_counts = Counter(str(row["label_status"]) for row in labels)
+    trigger_attribution = _trigger_attribution(labels)
     enabled_triggers = ["h1_pivot_reclaim_15m"]
     if config.orderblock_entry_enabled:
         enabled_triggers.append("order_block_1h")
     if config.rejection_block_entry_enabled:
         enabled_triggers.append("rejection_block_15m")
-    if liquidity is not None:
-        enabled_triggers.append("fxpro_liquidity_rejection_15m")
+    if quote_pressure is not None:
+        enabled_triggers.append("fxpro_quote_pressure_rejection_15m")
     enabled_triggers = sorted(
         set(enabled_triggers),
         key=lambda item: _TRIGGER_PRIORITY.get(item, 999),
@@ -1355,8 +1466,10 @@ def run_counterfactual_backtest(
             "score_threshold": None,
             "primary_label_policy": _PRIMARY_POLICY,
         },
-        "liquidity_manifest_sha256": (
-            liquidity.manifest_sha256 if liquidity is not None else None
+        "quote_pressure_manifest_sha256": (
+            quote_pressure.manifest_sha256
+            if quote_pressure is not None
+            else None
         ),
     }
     summary = {
@@ -1367,6 +1480,7 @@ def run_counterfactual_backtest(
         "decision_events": len(decision_rows),
         "technical_opportunities": len(opportunities),
         "label_status_counts": dict(sorted(label_counts.items())),
+        "trigger_attribution_rows": len(trigger_attribution),
         "signal_counters": dict(sorted(signal_counters.items())),
         "optimizer": optimizer["summary"],
         "oos_selected_candidates": len(selected),
@@ -1405,11 +1519,13 @@ def run_counterfactual_backtest(
         "enabled_trigger_manifest": enabled_triggers,
         "generated_trigger_manifest": generated_triggers,
         "turtle_soup_called": False,
-        "fxpro_liquidity_rejection": {
-            "enabled": liquidity is not None,
-            "liquidity_sidecar_loaded": liquidity is not None,
-            "liquidity_manifest_sha256": (
-                liquidity.manifest_sha256 if liquidity is not None else None
+        "fxpro_quote_pressure_rejection": {
+            "enabled": quote_pressure is not None,
+            "quote_pressure_sidecar_loaded": quote_pressure is not None,
+            "quote_pressure_manifest_sha256": (
+                quote_pressure.manifest_sha256
+                if quote_pressure is not None
+                else None
             ),
             "ohlcv_proxy_used": False,
             "tick_volume_proxy_used": False,
@@ -1464,7 +1580,7 @@ def run_counterfactual_backtest(
                 "swap, slippage and historical tick ordering are unavailable."
             ),
             (
-                "FxPro Liquidity Rejection is DATA_UNAVAILABLE unless a "
+                "FxPro Quote Pressure Rejection is DATA_UNAVAILABLE unless a "
                 "sealed broker-DOM sidecar supplies causal quote-depth "
                 "events. Quote removal is not execution proof; LSE OHLCV and "
                 "tick volume are never converted into proxies."
@@ -1494,6 +1610,9 @@ def run_counterfactual_backtest(
             for item in opportunities
         ),
         labels=tuple(_safe_json_value(row) for row in labels),
+        trigger_attribution=tuple(
+            _safe_json_value(row) for row in trigger_attribution
+        ),
         models=_safe_json_value(
             {
                 "summary": optimizer["summary"],
@@ -1602,6 +1721,7 @@ def write_counterfactual_report(
             "decision_events.csv": result.decision_events,
             "technical_opportunities.csv": result.opportunities,
             "opportunity_labels.csv": result.labels,
+            "trigger_attribution.csv": result.trigger_attribution,
             "optimizer_predictions.csv": result.predictions,
             "optimizer_coefficients.csv": result.coefficients,
             "optimizer_metrics.csv": result.optimizer_metrics,

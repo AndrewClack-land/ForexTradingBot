@@ -1,4 +1,4 @@
-"""Seal append-only FxPro DOM M15 events into an immutable WFO sidecar."""
+"""Seal FxPro DOM M15 quote-pressure events into an immutable WFO sidecar."""
 
 from __future__ import annotations
 
@@ -10,8 +10,8 @@ from typing import Optional, Sequence
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backtest.liquidity_data import (  # noqa: E402
-    FxProLiquidityEventDataset,
+from backtest.fxpro_quote_pressure_data import (  # noqa: E402
+    FxProQuotePressureEventDataset,
     seal_recorded_events,
 )
 
@@ -39,7 +39,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     destination = seal_recorded_events(args.recording, args.output)
-    dataset = FxProLiquidityEventDataset.load(destination)
+    dataset = FxProQuotePressureEventDataset.load(destination)
     print(
         json.dumps(
             {

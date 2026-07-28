@@ -1,4 +1,4 @@
-"""Fail-closed FxPro OTC depth-liquidity rejection detection.
+"""Fail-closed FxPro OTC quote-pressure rejection detection.
 
 This module deliberately does *not* call the signal ``Absorption``.  FxPro
 market depth is an aggregated executable-liquidity view supplied by the
@@ -359,7 +359,7 @@ def validate_liquidity_event(event: Any) -> Optional[dict[str, Any]]:
     return {**normalized, "checksum": checksum}
 
 
-def detect_fxpro_liquidity_rejection(
+def detect_fxpro_quote_pressure_rejection(
     *,
     candle: Mapping[str, Any],
     candle_open_time: Any,
@@ -369,7 +369,7 @@ def detect_fxpro_liquidity_rejection(
     decision_time: Any,
     thresholds: LiquidityRejectionThresholds = LiquidityRejectionThresholds(),
 ) -> Optional[LiquidityRejectionSignal]:
-    """Detect a causal FxPro broker-liquidity rejection on one closed M15 bar."""
+    """Detect causal FxPro quote-pressure rejection on one closed M15 bar."""
 
     if side not in {"LONG", "SHORT"} or not isinstance(candle, Mapping):
         return None

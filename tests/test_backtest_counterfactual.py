@@ -127,11 +127,11 @@ class _AllSideAllTriggerStrategy:
         type(self).calls[("rejection_block_15m", side)] += 1
         return self._entry(side, "rejection_block_15m", 0.00)
 
-    def trigger_15m_liquidity_rejection(self, _, side, event, *, symbol):
+    def trigger_15m_quote_pressure_rejection(self, _, side, event, *, symbol):
         assert event is None
         assert symbol == "EURUSD"
-        type(self).calls[("fxpro_liquidity_rejection_15m", side)] += 1
-        return self._entry(side, "fxpro_liquidity_rejection_15m", 0.10)
+        type(self).calls[("fxpro_quote_pressure_rejection_15m", side)] += 1
+        return self._entry(side, "fxpro_quote_pressure_rejection_15m", 0.10)
 
     def trigger_h1_pivot_reclaim_on_15m(self, _h1, _m15, side):
         type(self).calls[("h1_pivot_reclaim_15m", side)] += 1
@@ -407,7 +407,14 @@ def test_train_only_weights_replay_oos_without_threshold_and_keep_one_pct_risk(
     assert (report / "decision_events.csv").is_file()
     assert (report / "technical_opportunities.csv").is_file()
     assert (report / "opportunity_labels.csv").is_file()
+    assert (report / "trigger_attribution.csv").is_file()
     assert (report / "manifest.json").is_file()
+    trigger_rows = list(result.trigger_attribution)
+    assert trigger_rows
+    assert {
+        row["trigger_kind"] for row in trigger_rows
+        if row["dimension"] == "trigger"
+    } == set(TRIGGER_MANIFEST)
 
 
 def test_not_fit_fold_is_audited_but_never_trades_reference_weights(
@@ -642,7 +649,7 @@ def test_ranked_replay_uses_earliest_fill_then_rank_for_timestamp_tie():
             "rank-2-later-fill",
             rank=2,
             entry=100.0,
-            trigger_kind="fxpro_liquidity_rejection_15m",
+            trigger_kind="fxpro_quote_pressure_rejection_15m",
         ),
         candidate(
             "a-rank-4-earliest-fill",

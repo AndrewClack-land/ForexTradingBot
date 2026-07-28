@@ -23,11 +23,11 @@ procedures; this file defines the non-negotiable rules and research semantics.
 - Train-only constrained replacement weights:
   `backtest/weight_optimizer.py`
 - Active FxPro DOM capture and M15 aggregation: `core/fxpro_dom.py`
-- Active fail-closed Liquidity Rejection detector:
-  `core/liquidity_rejection.py`
-- Active immutable Liquidity Rejection WFO sidecar:
-  `backtest/liquidity_data.py`, CLI
-  `tools/seal_fxpro_liquidity_sidecar.py`
+- Active fail-closed FxPro Quote Pressure Rejection detector:
+  `core/fxpro_quote_pressure.py`
+- Active immutable Quote Pressure Rejection WFO sidecar:
+  `backtest/fxpro_quote_pressure_data.py`, CLI
+  `tools/seal_fxpro_quote_pressure_sidecar.py`
 - Archived footprint sidecar validation: `backtest/orderflow_data.py`
 - Sealed footprint sidecar construction from an executed-trade tape:
   `backtest/orderflow_ingest.py`, CLI `tools/build_absorption_sidecar.py`
@@ -45,16 +45,16 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `tests/test_backtest_orderflow_data.py`,
   `tests/test_backtest_orderflow_ingest.py`,
   `tests/test_backtest_orderflow_inspect.py`,
-  `tests/test_fxpro_liquidity_rejection.py`,
+  `tests/test_fxpro_quote_pressure_rejection.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
 Do not reconstruct factor rules by parsing the human-readable narrative text.
 Use the structured `factor_vector`.
 
-## FxPro Liquidity Rejection contract
+## FxPro Quote Pressure Rejection contract
 
-`fxpro_liquidity_rejection_15m` is the active replacement for Turtle Soup.
+`fxpro_quote_pressure_rejection_15m` is the active replacement for Turtle Soup.
 The old Turtle detector may remain only as unreachable historical diagnostic
 code. The executed-tape Absorption and Quantower cluster pipelines are archived
 research and must not be reintroduced into live or `optimize-v2`.
@@ -68,8 +68,8 @@ flow, footprint, or CME MBO.
 Non-negotiable implementation rules:
 
 - keep `FXPRO_DOM_CAPTURE_ENABLED` independent from
-  `FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED`; capture may be on while entries
-  stay off for shadow/WFO collection;
+  `FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED`; capture may be on while
+  entries stay off for shadow/WFO collection;
 - write raw snapshots append-only, atomically gzip completed UTC days, and
   publish only finalized closed-M15 summaries; never expose the forming
   accumulator to strategy code;
@@ -84,7 +84,8 @@ Non-negotiable implementation rules:
 - never synthesize this factor from LSE OHLCV, candle volume, MT5 tick volume,
   Quantower clusters, or the old Absorption sidecar;
 - load historical events in WFO only through a sealed immutable
-  `FxProLiquidityEventDataset`; enforce `available_at <= decision_time`;
+  `FxProQuotePressureEventDataset`; enforce
+  `available_at <= decision_time`;
 - regenerate both LONG and SHORT and every trigger inside every train window;
   do not let production weights preselect the train population;
 - do not enable live entries until the sealed history has representative
@@ -132,7 +133,7 @@ Important distinctions:
 Production trigger priority is:
 
 1. quarantined 15M Rejection Block, only if separately enabled;
-2. FxPro Liquidity Rejection 15M, only if a matching finalized DOM event is
+2. FxPro Quote Pressure Rejection 15M, only if a matching finalized DOM event is
    causally available and the independent live flag is enabled;
 3. H1 Pivot Reclaim on 15M;
 4. 1H Order Block touch.
@@ -141,11 +142,14 @@ Turtle Soup is retired from the production call path. Do not add a re-enable
 flag, fallback call, or implicit compatibility path. The legacy pure detector
 may remain only for reproducing historical reports.
 
-The active second trigger is governed exclusively by the FxPro Liquidity
+The active second trigger is governed exclusively by the FxPro Quote Pressure
 Rejection contract above. Missing DOM is `DATA_UNAVAILABLE`, so the strategy
 falls through to later triggers; it must not reject the complete market entry
 solely because broker depth is absent. `optimize-v2` may generate this trigger
-only from `--liquidity-data` and a sealed `FxProLiquidityEventDataset`.
+only from `--quote-pressure-data` and a sealed
+`FxProQuotePressureEventDataset`. Its pre-gate attribution must be exported in
+`trigger_attribution.csv` beside H1 Order Block and H1 Pivot Reclaim, grouped
+by trigger, market, direction, quarter, and their combined intersection.
 
 The old Quantower cluster diagnostic, executed-trade tape ingest,
 `AbsorptionEventDataset`, and pure Absorption detector remain archived research.
@@ -384,11 +388,12 @@ ties.
 
 The v2 command produces `decision_events.csv`,
 `technical_opportunities.csv`, `opportunity_labels.csv`,
+`trigger_attribution.csv`,
 `frozen_weight_models.json`, optimizer predictions/coefficients/metrics, OOS
 selections, and the chronological replay tables. All files must be covered by
-the report manifest. A run without a sealed FxPro liquidity sidecar must state
-Liquidity Rejection `DATA_UNAVAILABLE`; it is a remaining-trigger challenger,
-not evidence for or against broker liquidity rejection.
+the report manifest. A run without a sealed FxPro Quote Pressure sidecar must
+state Quote Pressure Rejection `DATA_UNAVAILABLE`; it is a remaining-trigger
+challenger, not evidence for or against broker quote-pressure rejection.
 
 The existing `--train` interval does not fit replacement factor weights. It
 defines rolling history/OOS boundaries for the fixed baseline. The current

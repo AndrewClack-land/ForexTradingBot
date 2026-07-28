@@ -12,7 +12,7 @@ causal backtesting, attribution semantics, and VPS release discipline.
 
 - **Python 3.11** + официальный пакет **MetaTrader5** — котировки и исполнение напрямую через терминал;
 - **Smart Money Concepts / ICT**: premium/discount, ордерблоки, rejection-блоки,
-  FVG, FxPro Liquidity Rejection по брокерскому DOM, фракталы Вильямса;
+  FVG, FxPro Quote Pressure Rejection по брокерскому DOM, фракталы Вильямса;
 - **python-telegram-bot** — сигналы и команды (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — журнал сделок и статистика для AI-фильтра;
 - сигналы считаются **только по закрытым свечам** (без перерисовки).
@@ -56,12 +56,12 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 Проверяются по очереди; первый сработавший формирует ENTER:
 
 1. **15M Rejection Block** — только при отдельном разрешении;
-2. **FxPro Liquidity Rejection 15M** — отклонение цены при давлении котировок
+2. **FxPro Quote Pressure Rejection 15M** — отклонение цены при давлении котировок
    и восстановлении защитной стороны брокерского DOM;
 3. **H1 Pivot Reclaim на 15M**;
 4. **Касание Order Block 1H**.
 
-Turtle Soup удалён из production-цепочки. FxPro Liquidity Rejection по
+Turtle Soup удалён из production-цепочки. FxPro Quote Pressure Rejection по
 умолчанию выключен для входов и работает fail-closed. DOM содержит агрегированную
 котируемую ликвидность FxPro, а не доказанные сделки: снятая котировка не
 называется исполнением или True Absorption. При отсутствии качественного
@@ -147,7 +147,7 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 
 - **Python 3.11** + the official **MetaTrader5** package — quotes and execution directly through the terminal;
 - **Smart Money Concepts / ICT**: premium/discount, order blocks, rejection blocks,
-  FVG, FxPro broker-DOM Liquidity Rejection, Williams fractals;
+  FVG, FxPro broker-DOM Quote Pressure Rejection, Williams fractals;
 - **python-telegram-bot** — signals and commands (`/status`, `/open`, `/report`, `/universe`);
 - **SQLite + CSV/Parquet** — trade journal and statistics for the AI filter;
 - signals are computed on **closed candles only** (no repainting).
@@ -191,12 +191,12 @@ votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 Checked in order; the first one that fires produces an ENTER signal:
 
 1. **15M Rejection Block** — only when separately enabled;
-2. **FxPro Liquidity Rejection 15M** — price rejection under quote pressure
+2. **FxPro Quote Pressure Rejection 15M** — price rejection under quote pressure
    with replenishment of the protective side of the broker DOM;
 3. **H1 Pivot Reclaim on 15M**;
 4. **1H Order Block touch**.
 
-Turtle Soup is retired. FxPro Liquidity Rejection defaults OFF for entries and
+Turtle Soup is retired. FxPro Quote Pressure Rejection defaults OFF for entries and
 fails closed. DOM is aggregated FxPro quoted liquidity, not execution proof;
 removed quotes are never called fills or True Absorption. Without a valid
 closed-M15 DOM event, the strategy falls through to the remaining triggers.
@@ -824,9 +824,9 @@ backtest_sandbox forexbot-backtest-optimize-v2-fx \
 sudo journalctl -fu forexbot-backtest-optimize-v2-fx.service
 ```
 
-Add `--liquidity-data /path/to/sealed-fxpro-liquidity` only after the directory
-passes `FxProLiquidityEventDataset` validation. Without it, the run remains
-valid for the other triggers but records Liquidity Rejection as
+Add `--quote-pressure-data /path/to/sealed-fxpro-quote-pressure` only after the
+directory passes `FxProQuotePressureEventDataset` validation. Without it, the
+run remains valid for the other triggers but records Quote Pressure Rejection as
 `DATA_UNAVAILABLE`; it never manufactures an OHLCV or tick-volume proxy.
 
 ### Quantower FxPro tick-cluster diagnostic
@@ -869,13 +869,13 @@ See the exporter README for build, Quantower installation, chart-history
 limits, and capture steps. The Quantower/Absorption branch is archived research
 and is not called by the production strategy or `optimize-v2`.
 
-### FxPro DOM Liquidity Rejection (active Turtle Soup replacement)
+### FxPro Quote Pressure Rejection 15M (active Turtle Soup replacement)
 
 The bot records its own FxPro MT5 Market Depth and names the broker-specific
-factor `fxpro_liquidity_rejection_15m`. It must never be called True Absorption:
-FxPro DOM is OTC aggregated quoted liquidity, and a removed quote may be a
-cancellation, replacement, or execution. It does not prove executed aggressor
-side and does not expose exchange MBO.
+factor `fxpro_quote_pressure_rejection_15m`. It must never be called True
+Absorption: FxPro DOM is OTC aggregated quoted liquidity, and a removed quote
+may be a cancellation, replacement, or execution. It does not prove executed
+aggressor side and does not expose exchange MBO.
 
 Capture and entry activation are intentionally separate. Start with capture
 enabled and entries disabled:
@@ -883,7 +883,7 @@ enabled and entries disabled:
 ```dotenv
 FXPRO_DOM_CAPTURE_ENABLED=1
 FXPRO_DOM_SYMBOLS=EURUSD,GBPUSD,USDCAD
-FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED=0
+FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED=0
 ```
 
 The read-only recorder writes append-only raw snapshots under
@@ -899,22 +899,25 @@ same level; removed volume is never labelled as a trade.
 After a representative capture period, seal a new immutable research sidecar:
 
 ```bash
-python tools/seal_fxpro_liquidity_sidecar.py \
-  ai_data/fxpro_dom /data/fxpro-liquidity-2026q3-v1
+python tools/seal_fxpro_quote_pressure_sidecar.py \
+  ai_data/fxpro_dom /data/fxpro-quote-pressure-2026q3-v1
 ```
 
 Then add it to the existing `optimize-v2` command:
 
 ```bash
 python -m backtest optimize-v2 ... \
-  --liquidity-data /data/fxpro-liquidity-2026q3-v1
+  --quote-pressure-data /data/fxpro-quote-pressure-2026q3-v1
 ```
 
 The sidecar hashes every event shard and normalized event population.
 `available_at` is enforced in live and WFO paths, so an M15 summary cannot be
 used at candle close if it was finalized later. WFO regenerates LONG and SHORT
-plus every trigger inside each train window. Only after OOS and shadow evidence
-should `FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED` be considered for live use.
+plus every trigger inside each train window. The report
+`trigger_attribution.csv` compares Quote Pressure Rejection directly with H1
+Order Block and H1 Pivot Reclaim across symbols, directions, quarters, and
+their intersections. Only after OOS and shadow evidence should
+`FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED` be considered for live use.
 
 ### Archived executed-trade tape to Absorption sidecar
 

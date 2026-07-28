@@ -254,7 +254,7 @@ class Core:
                 self.fxpro_dom_recorder.start()
                 print(
                     "[FxPro DOM] capture started; "
-                    "Liquidity Rejection entry remains independently gated"
+                    "Quote Pressure Rejection entry remains independently gated"
                 )
             except Exception as exc:
                 self.fxpro_dom_recorder = None
@@ -1115,7 +1115,7 @@ class Core:
         if event is None:
             return view
         enriched = dict(view)
-        enriched["FXPRO_LIQUIDITY_15M"] = event
+        enriched["FXPRO_QUOTE_PRESSURE_15M"] = event
         return enriched
 
     def _move_entry_to_breakeven(

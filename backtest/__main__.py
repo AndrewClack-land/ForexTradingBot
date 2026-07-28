@@ -309,10 +309,10 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
     )
     optimize_v2.add_argument(
-        "--liquidity-data",
+        "--quote-pressure-data",
         help=(
-            "optional sealed FxProLiquidityEventDataset directory; when "
-            "omitted Liquidity Rejection remains DATA_UNAVAILABLE and no "
+            "optional sealed FxProQuotePressureEventDataset; when omitted "
+            "Quote Pressure Rejection remains DATA_UNAVAILABLE and no "
             "OHLCV/tick-volume proxy is used"
         ),
     )
@@ -706,7 +706,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     """Run the all-M15 replacement-weight optimizer in an isolated release."""
 
     from .counterfactual import run_counterfactual_backtest
-    from .liquidity_data import FxProLiquidityEventDataset
+    from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
 
     release_commit = _read_release_commit(args.release_commit_file)
     attestation_fields = (
@@ -781,9 +781,9 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
     )
-    liquidity = (
-        FxProLiquidityEventDataset.load(Path(args.liquidity_data))
-        if args.liquidity_data
+    quote_pressure = (
+        FxProQuotePressureEventDataset.load(Path(args.quote_pressure_data))
+        if args.quote_pressure_data
         else None
     )
     progress_stream = sys.stderr if args.json else sys.stdout
@@ -813,7 +813,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     result = run_counterfactual_backtest(
         dataset,
         config,
-        liquidity=liquidity,
+        quote_pressure=quote_pressure,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
         progress=print_progress,
@@ -849,10 +849,10 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         f"PF={pf_text} maxDD={metrics['max_drawdown_r']:.3f}R"
     )
     print(
-        "  FxPro Liquidity Rejection sidecar: "
+        "  FxPro Quote Pressure Rejection sidecar: "
         + (
             "sealed and loaded"
-            if liquidity is not None
+            if quote_pressure is not None
             else "DATA_UNAVAILABLE (no OHLCV/tick-volume proxy)"
         )
     )

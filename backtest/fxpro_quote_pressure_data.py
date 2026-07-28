@@ -1,4 +1,4 @@
-"""Immutable FxPro DOM Liquidity Rejection sidecars for causal WFO."""
+"""Immutable FxPro DOM quote-pressure rejection sidecars for causal WFO."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from typing import Any, Iterable, Mapping, Optional
 
 import pandas as pd
 
-from core.liquidity_rejection import (
+from core.fxpro_quote_pressure import (
     LIQUIDITY_DATA_KIND,
     LIQUIDITY_EVENT_SCHEMA_VERSION,
     LIQUIDITY_MARKET_TYPE,
@@ -24,7 +24,7 @@ from core.liquidity_rejection import (
 )
 
 
-SIDECAR_SCHEMA = "forexbot.fxpro-liquidity-rejection-15m"
+SIDECAR_SCHEMA = "forexbot.fxpro-quote-pressure-rejection-15m"
 SIDECAR_SCHEMA_VERSION = 1
 
 
@@ -125,12 +125,12 @@ def _validate_unique(
         seen.add(identity)
     if not ordered:
         raise LiquidityDataValidationError(
-            "FxPro liquidity sidecar contains no events"
+            "FxPro Quote Pressure sidecar contains no events"
         )
     return ordered
 
 
-class FxProLiquidityEventDataset:
+class FxProQuotePressureEventDataset:
     """Verified immutable events addressable only as-of a decision time."""
 
     def __init__(
@@ -149,7 +149,7 @@ class FxProLiquidityEventDataset:
         }
 
     @classmethod
-    def load(cls, root: str | Path) -> "FxProLiquidityEventDataset":
+    def load(cls, root: str | Path) -> "FxProQuotePressureEventDataset":
         directory = Path(root)
         manifest_path = directory / "manifest.json"
         if not directory.is_dir() or not manifest_path.is_file():
@@ -308,7 +308,7 @@ def seal_recorded_events(
         }
         manifest_path = temporary / "manifest.json"
         manifest_path.write_bytes(_canonical_bytes(manifest) + b"\n")
-        FxProLiquidityEventDataset.load(temporary)
+        FxProQuotePressureEventDataset.load(temporary)
         os.replace(temporary, destination)
     except Exception:
         shutil.rmtree(temporary, ignore_errors=True)
@@ -317,7 +317,7 @@ def seal_recorded_events(
 
 
 __all__ = [
-    "FxProLiquidityEventDataset",
+    "FxProQuotePressureEventDataset",
     "LiquidityDataValidationError",
     "SIDECAR_SCHEMA",
     "seal_recorded_events",

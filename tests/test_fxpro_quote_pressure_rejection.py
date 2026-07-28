@@ -6,8 +6,8 @@ import gzip
 import pandas as pd
 import pytest
 
-from backtest.liquidity_data import (
-    FxProLiquidityEventDataset,
+from backtest.fxpro_quote_pressure_data import (
+    FxProQuotePressureEventDataset,
     LiquidityDataValidationError,
     seal_recorded_events,
 )
@@ -17,13 +17,13 @@ from core.fxpro_dom import (
     FxProDomRecorder,
     M15LiquidityAccumulator,
 )
-from core.liquidity_rejection import (
+from core.fxpro_quote_pressure import (
     LIQUIDITY_DATA_KIND,
     LIQUIDITY_MARKET_TYPE,
     LIQUIDITY_SOURCE,
     LIQUIDITY_VENUE,
     LiquidityRejectionThresholds,
-    detect_fxpro_liquidity_rejection,
+    detect_fxpro_quote_pressure_rejection,
     seal_liquidity_event,
     validate_liquidity_event,
 )
@@ -96,8 +96,8 @@ def _snapshot(
     )
 
 
-def test_long_liquidity_rejection_uses_fxpro_depth_without_execution_claim():
-    result = detect_fxpro_liquidity_rejection(
+def test_long_quote_pressure_rejection_uses_depth_without_execution_claim():
+    result = detect_fxpro_quote_pressure_rejection(
         candle={"high": 1.1010, "low": 1.0990, "close": 1.1005},
         candle_open_time="2026-07-27T10:00:00Z",
         event=_event(),
@@ -115,10 +115,10 @@ def test_long_liquidity_rejection_uses_fxpro_depth_without_execution_claim():
     assert LIQUIDITY_DATA_KIND == "depth_quotes_no_execution_proof"
 
 
-def test_liquidity_event_is_fail_closed_for_delay_tamper_and_wrong_source():
+def test_quote_pressure_event_fails_closed_for_delay_tamper_and_source():
     event = _event()
     assert (
-        detect_fxpro_liquidity_rejection(
+        detect_fxpro_quote_pressure_rejection(
             candle={"high": 1.1010, "low": 1.0990, "close": 1.1005},
             candle_open_time="2026-07-27T10:00:00Z",
             event=event,
@@ -267,7 +267,7 @@ def test_sealed_sidecar_round_trip_and_tamper_detection(tmp_path):
         encoding="utf-8",
     )
     sidecar = seal_recorded_events(recording, tmp_path / "sidecar")
-    dataset = FxProLiquidityEventDataset.load(sidecar)
+    dataset = FxProQuotePressureEventDataset.load(sidecar)
 
     assert dataset.event_asof(
         "EURUSD",
@@ -286,7 +286,7 @@ def test_sealed_sidecar_round_trip_and_tamper_detection(tmp_path):
         encoding="utf-8",
     )
     with pytest.raises(LiquidityDataValidationError, match="size mismatch"):
-        FxProLiquidityEventDataset.load(sidecar)
+        FxProQuotePressureEventDataset.load(sidecar)
 
 
 def test_thresholds_reject_partial_or_gappy_recordings():
@@ -297,7 +297,7 @@ def test_thresholds_reject_partial_or_gappy_recordings():
         {"changed_snapshots": 5},
     ):
         assert (
-            detect_fxpro_liquidity_rejection(
+            detect_fxpro_quote_pressure_rejection(
                 candle={"high": 1.1010, "low": 1.0990, "close": 1.1005},
                 candle_open_time="2026-07-27T10:00:00Z",
                 event=_event(**changes),

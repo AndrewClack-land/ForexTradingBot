@@ -26,7 +26,7 @@ from typing import Any, Iterable, Mapping, Optional, Sequence
 
 import pandas as pd
 
-from core.liquidity_rejection import (
+from core.fxpro_quote_pressure import (
     LIQUIDITY_DATA_KIND,
     LIQUIDITY_EVENT_SCHEMA_VERSION,
     LIQUIDITY_MARKET_TYPE,

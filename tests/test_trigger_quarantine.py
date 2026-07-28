@@ -12,7 +12,7 @@ def _frames():
     return {"D": frame, "4H": frame, "1H": frame, "15M": frame}
 
 
-def test_rejection_block_quarantine_falls_through_to_liquidity_rejection():
+def test_rejection_block_quarantine_falls_through_to_quote_pressure():
     strategy = NarrativeStrategy()
     strategy._last_htf_context = None
     strategy.calc_narrative = lambda *args, **kwargs: ("LONG", "test bias")
@@ -23,14 +23,14 @@ def test_rejection_block_quarantine_falls_through_to_liquidity_rejection():
     strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("retired Turtle Soup must not run")
     )
-    strategy.trigger_15m_liquidity_rejection = lambda *args, **kwargs: CandidateEntry(
+    strategy.trigger_15m_quote_pressure_rejection = lambda *args, **kwargs: CandidateEntry(
         side="LONG",
         entry_price=1.0,
         entry_min=0.999,
         entry_max=1.001,
         tf="15M",
-        reason="FxPro Liquidity Rejection 15M test",
-        trigger_kind="fxpro_liquidity_rejection_15m",
+        reason="FxPro Quote Pressure Rejection 15M test",
+        trigger_kind="fxpro_quote_pressure_rejection_15m",
         lock_entry_range=True,
     )
     strategy.calc_stop_and_tps = lambda *args, **kwargs: (0.99, [1.01, 1.02, 1.03])
@@ -39,8 +39,8 @@ def test_rejection_block_quarantine_falls_through_to_liquidity_rejection():
     signal = strategy.generate_signal(_frames(), symbol="EURUSD")
 
     assert signal["signal"] == "ENTER"
-    assert signal["trigger_reason"] == "FxPro Liquidity Rejection 15M test"
-    assert signal["trigger_kind"] == "fxpro_liquidity_rejection_15m"
+    assert signal["trigger_reason"] == "FxPro Quote Pressure Rejection 15M test"
+    assert signal["trigger_kind"] == "fxpro_quote_pressure_rejection_15m"
 
 
 def test_enabled_rejection_block_keeps_trigger_priority():
@@ -60,7 +60,7 @@ def test_enabled_rejection_block_keeps_trigger_priority():
     strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("retired Turtle Soup must not run")
     )
-    strategy.trigger_15m_liquidity_rejection = lambda *args, **kwargs: (_ for _ in ()).throw(
+    strategy.trigger_15m_quote_pressure_rejection = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("RB must keep priority when enabled")
     )
     strategy.calc_stop_and_tps = lambda *args, **kwargs: (0.99, [1.01, 1.02, 1.03])
@@ -77,7 +77,7 @@ def test_liquidity_miss_falls_through_to_pivot_without_turtle():
     strategy.calc_narrative = lambda *args, **kwargs: ("LONG", "test bias")
     strategy.calc_fvg_regime_1h = lambda *args, **kwargs: ("LONG", "fvg")
     strategy.trigger_15m_rejection_block = lambda *args, **kwargs: None
-    strategy.trigger_15m_liquidity_rejection = lambda *args, **kwargs: None
+    strategy.trigger_15m_quote_pressure_rejection = lambda *args, **kwargs: None
     strategy.trigger_15m_turtle_soup = lambda *args, **kwargs: (_ for _ in ()).throw(
         AssertionError("retired Turtle Soup must not run")
     )

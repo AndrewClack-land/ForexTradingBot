@@ -342,7 +342,7 @@ def test_absorption_remains_archived_outside_production_strategy():
 
     assert not hasattr(strategy, "absorption_15m_entry_enabled")
     assert not hasattr(strategy, "trigger_15m_absorption")
-    assert strategy.liquidity_rejection_15m_entry_enabled is False
+    assert strategy.quote_pressure_rejection_15m_entry_enabled is False
 
 
 def test_checksum_must_match_normalized_event_content():

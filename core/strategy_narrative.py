@@ -8,9 +8,9 @@ import time
 import numpy as np
 import pandas as pd
 
-from core.liquidity_rejection import (
+from core.fxpro_quote_pressure import (
     LiquidityRejectionThresholds,
-    detect_fxpro_liquidity_rejection,
+    detect_fxpro_quote_pressure_rejection,
 )
 from core.htf_context import HtfContext
 from core.narrative_scoring import build_factor_vector
@@ -25,8 +25,8 @@ ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
 REJECTION_BLOCK_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", False)
 )
-FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED = bool(
-    getattr(_cfg, "FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED", False)
+FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = bool(
+    getattr(_cfg, "FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED", False)
 )
 FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE = float(
     getattr(_cfg, "FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE", 0.15)
@@ -202,7 +202,7 @@ class NarrativeStrategy:
          breakouts, 1H Order/Rejection Blocks
       2) Bias strictness: 1H FVG regime
       3) SETUP: 15M Rejection Block
-      4) FALLBACK: FxPro broker Liquidity Rejection on 15M
+      4) FALLBACK: FxPro Quote Pressure Rejection on 15M
       5) FALLBACK2: H1 Pivots levels + 15M reclaim
       6) ENTRY DELIVERY: send ENTRY RANGE
          - всё локализуется вокруг последнего 15M close
@@ -215,8 +215,8 @@ class NarrativeStrategy:
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
         self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
-        self.liquidity_rejection_15m_entry_enabled = (
-            FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED
+        self.quote_pressure_rejection_15m_entry_enabled = (
+            FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED
         )
         self._liquidity_rejection_thresholds: Optional[
             LiquidityRejectionThresholds
@@ -252,7 +252,7 @@ class NarrativeStrategy:
             )
         except (TypeError, ValueError):
             # Invalid runtime calibration disables only this optional trigger.
-            self.liquidity_rejection_15m_entry_enabled = False
+            self.quote_pressure_rejection_15m_entry_enabled = False
 
         # 3 TPs at clean R-multiples. TP1 = 1R keeps the break-even trigger
         # consistently reachable (the old fixed-% TP1 override made it swing
@@ -798,9 +798,9 @@ class NarrativeStrategy:
 
         return None
 
-    # ================== FxPro 15M Liquidity Rejection ==================
+    # ================== FxPro 15M Quote Pressure Rejection ==================
 
-    def trigger_15m_liquidity_rejection(
+    def trigger_15m_quote_pressure_rejection(
         self,
         df_15M: pd.DataFrame,
         side: Side,
@@ -809,7 +809,7 @@ class NarrativeStrategy:
         symbol: str,
     ) -> Optional[CandidateEntry]:
         if (
-            not self.liquidity_rejection_15m_entry_enabled
+            not self.quote_pressure_rejection_15m_entry_enabled
             or self._liquidity_rejection_thresholds is None
             or side not in {"LONG", "SHORT"}
             or event is None
@@ -827,7 +827,7 @@ class NarrativeStrategy:
                 if isinstance(event, dict)
                 else getattr(event, "available_at", None)
             )
-            rejection = detect_fxpro_liquidity_rejection(
+            rejection = detect_fxpro_quote_pressure_rejection(
                 candle=df_15M.iloc[-1].to_dict(),
                 candle_open_time=candle_open_time,
                 event=event,
@@ -849,12 +849,12 @@ class NarrativeStrategy:
             entry_price=close,
             tf="15M",
             reason=(
-                f"FxPro Liquidity Rejection 15M {side}"
+                f"FxPro Quote Pressure Rejection 15M {side}"
                 f" | quote_pressure={rejection.quote_pressure:.3f}"
                 f" replenishment={rejection.replenishment_ratio:.3f}"
                 f" rejection={rejection.rejection_fraction:.3f}"
             ),
-            trigger_kind="fxpro_liquidity_rejection_15m",
+            trigger_kind="fxpro_quote_pressure_rejection_15m",
             trigger_event_id=rejection.source_bar_hash,
             trigger_meta=meta,
         )
@@ -1254,10 +1254,10 @@ class NarrativeStrategy:
             else None
         )
         if entry is None:
-            entry = self.trigger_15m_liquidity_rejection(
+            entry = self.trigger_15m_quote_pressure_rejection(
                 df_15M,
                 side_bias,
-                data.get("FXPRO_LIQUIDITY_15M"),
+                data.get("FXPRO_QUOTE_PRESSURE_15M"),
                 symbol=symbol,
             )
         if entry is None:

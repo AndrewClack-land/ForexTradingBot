@@ -132,10 +132,10 @@ FXPRO_DOM_POLL_MS = _env_int("FXPRO_DOM_POLL_MS") or 500
 FXPRO_DOM_MAX_LEVELS = _env_int("FXPRO_DOM_MAX_LEVELS") or 20
 FXPRO_DOM_HEARTBEAT_SEC = _env_float("FXPRO_DOM_HEARTBEAT_SEC", 1.0)
 
-# FxPro Liquidity Rejection is deliberately opt-in. DOM capture may run while
+# FxPro Quote Pressure Rejection is opt-in. DOM capture may run while
 # entries stay disabled until the broker-specific history passes causal WFO.
-FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED = os.getenv(
-    "FXPRO_LIQUIDITY_REJECTION_ENTRY_ENABLED", "0"
+FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = os.getenv(
+    "FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE = _env_float(
     "FXPRO_LIQUIDITY_MIN_ABS_QUOTE_PRESSURE", 0.15
