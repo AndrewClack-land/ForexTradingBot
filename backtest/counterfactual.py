@@ -730,16 +730,20 @@ def _generate_symbol_universe(
         cluster_proxy_status = "DATA_UNAVAILABLE"
         cluster_event = None
         if cluster_proxy is not None:
-            cluster_event = cluster_proxy.event_asof(
+            cluster_event = cluster_proxy.event_asof_latest(
                 symbol,
                 data["15M"].index[-1],
                 decision_time,
             )
-            cluster_proxy_status = (
-                "AVAILABLE"
-                if cluster_event is not None
-                else "MISSING_OR_DELAYED"
-            )
+            if cluster_event is None:
+                cluster_proxy_status = "MISSING_OR_DELAYED"
+            elif (
+                pd.Timestamp(cluster_event["bar_open"])
+                == pd.Timestamp(data["15M"].index[-1])
+            ):
+                cluster_proxy_status = "AVAILABLE"
+            else:
+                cluster_proxy_status = "AVAILABLE_STALE"
         quote_pressure_status = "DATA_UNAVAILABLE"
         quote_event = None
         if quote_pressure is not None:

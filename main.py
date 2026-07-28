@@ -1155,7 +1155,7 @@ class Core:
         enriched = dict(view)
         cluster_dataset = self._refresh_fxpro_cluster_dataset()
         if cluster_dataset is not None:
-            cluster_event = cluster_dataset.event_asof(
+            cluster_event = cluster_dataset.event_asof_latest(
                 symbol,
                 df_15m.index[-1],
                 decision_time,

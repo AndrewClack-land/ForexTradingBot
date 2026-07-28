@@ -74,6 +74,17 @@ Non-negotiable implementation rules:
 - accept only complete, checksum-valid closed-M15 events with full PriceLevels,
   matching OHLC/tick size/symbol/provenance, and
   `available_at <= decision_time`;
+- a cluster publishes after its own M15 closes, so the event describing the
+  just-closed candle is normally not yet available at that decision. Callers
+  therefore use `FxProClusterEventDataset.event_asof_latest`, which walks back
+  at most `CLUSTER_MAX_STALE_BARS` (currently `1`) closed M15 slots. Every
+  candidate still passes the same strict `bar_close <= decision_time` and
+  `available_at <= decision_time` gate; staleness never rewrites or infers
+  availability. The detector matches an event against its own `bar_open`
+  candle, so a stale event is evaluated on the candle it actually describes,
+  while the entry is priced at the decision candle. Do not make this lookback
+  unbounded and do not apply it to Quote Pressure, which stays fail-closed on
+  delayed availability;
 - load research/live events only through an immutable
   `FxProClusterEventDataset`; never pass raw Quantower files directly to the
   strategy;

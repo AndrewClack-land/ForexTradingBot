@@ -36,6 +36,12 @@ def _validate_diagnostic_export(
 
 SIDECAR_SCHEMA = "forexbot.fxpro-cluster-rejection-15m"
 SIDECAR_SCHEMA_VERSION = 1
+CLUSTER_BAR = pd.Timedelta(minutes=15)
+# A cluster is published a short time after its M15 closes, so the event that
+# describes the just-closed candle is normally not yet available at that same
+# decision.  One closed M15 of staleness keeps the trigger reachable without
+# ever relaxing ``available_at <= decision_time``.
+CLUSTER_MAX_STALE_BARS = 1
 
 
 class ClusterDataValidationError(ValueError):
@@ -287,6 +293,40 @@ class FxProClusterEventDataset:
         ):
             return None
         return dict(event)
+
+    def event_asof_latest(
+        self,
+        symbol: str,
+        candle_open: Any,
+        decision_time: Any,
+        *,
+        max_stale_bars: int = CLUSTER_MAX_STALE_BARS,
+    ) -> Optional[dict[str, Any]]:
+        """Newest causally available event at or before ``candle_open``.
+
+        Walks back a bounded number of closed M15 slots so a positive
+        publication delay does not make the trigger permanently unreachable.
+        Every candidate still passes the same strict
+        ``bar_close <= decision_time`` and ``available_at <= decision_time``
+        gate, so this never invents availability; it only accepts an older
+        cluster that was genuinely published in time.  The caller must pair
+        the returned event with its own ``bar_open`` candle.
+        """
+
+        if isinstance(max_stale_bars, bool) or int(max_stale_bars) < 0:
+            raise ClusterDataValidationError(
+                "max_stale_bars must be a nonnegative integer"
+            )
+        newest = _utc(candle_open, field="candle_open")
+        for step in range(int(max_stale_bars) + 1):
+            event = self.event_asof(
+                symbol,
+                newest - step * CLUSTER_BAR,
+                decision_time,
+            )
+            if event is not None:
+                return event
+        return None
 
 
 def _read_mapping(path: Path, *, label: str) -> Mapping[str, Any]:

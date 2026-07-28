@@ -242,8 +242,28 @@ def test_strategy_trigger_is_structured_and_research_guarded():
     assert "Cluster Rejection" in entry.reason
 
 
-def _write_minimal_diagnostic(root: Path) -> None:
+def _diagnostic_bar(bar_open: pd.Timestamp) -> dict:
     levels = _levels()
+    return {
+        "symbol": "EURUSD",
+        "bar_open": bar_open.isoformat(),
+        "bar_close": (bar_open + pd.Timedelta(minutes=15)).isoformat(),
+        "ohlc": {
+            "open": "1.1000",
+            "high": "1.1010",
+            "low": "1.0990",
+            "close": "1.1005",
+        },
+        "total": _total(levels),
+        "price_levels": levels,
+    }
+
+
+def _write_minimal_diagnostic(
+    root: Path,
+    *,
+    bar_opens: list[pd.Timestamp] | None = None,
+) -> None:
     manifest = {
         "semantics": {
             "classification": (
@@ -252,23 +272,8 @@ def _write_minimal_diagnostic(root: Path) -> None:
         },
         "instrument": {"tick_size": "0.0001"},
     }
-    bars = {
-        "bars": [
-            {
-                "symbol": "EURUSD",
-                "bar_open": BAR_OPEN.isoformat(),
-                "bar_close": BAR_CLOSE.isoformat(),
-                "ohlc": {
-                    "open": "1.1000",
-                    "high": "1.1010",
-                    "low": "1.0990",
-                    "close": "1.1005",
-                },
-                "total": _total(levels),
-                "price_levels": levels,
-            }
-        ]
-    }
+    opens = [BAR_OPEN] if bar_opens is None else bar_opens
+    bars = {"bars": [_diagnostic_bar(bar_open) for bar_open in opens]}
     root.mkdir()
     (root / "manifest.json").write_text(
         json.dumps(manifest),
@@ -325,6 +330,156 @@ def test_diagnostic_conversion_seals_research_delay_and_asof(
     )
     with pytest.raises(cluster_data.ClusterDataValidationError):
         FxProClusterEventDataset.load(sidecar)
+
+
+def _sealed_two_bar_dataset(tmp_path, monkeypatch) -> FxProClusterEventDataset:
+    diagnostic = tmp_path / "diagnostic"
+    _write_minimal_diagnostic(
+        diagnostic,
+        bar_opens=[BAR_OPEN, BAR_OPEN + pd.Timedelta(minutes=15)],
+    )
+    monkeypatch.setattr(
+        cluster_data,
+        "_validate_diagnostic_export",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            export_id="11111111-2222-3333-4444-555555555555",
+            day_utc="2026-07-24",
+            bars=2,
+            price_levels=10,
+            missing_slots=94,
+            content_sha256="c" * 64,
+            exporter_binary_sha256="d" * 64,
+        ),
+    )
+    sidecar = seal_quantower_diagnostics(
+        [diagnostic],
+        tmp_path / "sidecar",
+        availability_delay_ms=1_000,
+        availability_evidence=(
+            "research assumption: live exporter target delay is one second"
+        ),
+    )
+    return FxProClusterEventDataset.load(sidecar)
+
+
+def test_delayed_cluster_falls_back_to_previous_closed_m15(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = _sealed_two_bar_dataset(tmp_path, monkeypatch)
+    second_open = BAR_OPEN + pd.Timedelta(minutes=15)
+    decision = second_open + pd.Timedelta(minutes=15)
+
+    # The just-closed candle is still inside its publication delay.
+    assert dataset.event_asof("EURUSD", second_open, decision) is None
+
+    event = dataset.event_asof_latest("EURUSD", second_open, decision)
+    assert event is not None
+    assert pd.Timestamp(event["bar_open"]) == BAR_OPEN
+    assert pd.Timestamp(event["available_at"]) <= decision
+    assert validate_cluster_event(event) is not None
+
+
+def test_stale_cluster_lookback_is_bounded_and_still_causal(
+    tmp_path,
+    monkeypatch,
+):
+    dataset = _sealed_two_bar_dataset(tmp_path, monkeypatch)
+    second_open = BAR_OPEN + pd.Timedelta(minutes=15)
+    decision = second_open + pd.Timedelta(minutes=15)
+
+    # Opting out of staleness restores the strict same-bar contract.
+    assert (
+        dataset.event_asof_latest(
+            "EURUSD",
+            second_open,
+            decision,
+            max_stale_bars=0,
+        )
+        is None
+    )
+    # Exactly one bar back is allowed ...
+    third_open = second_open + pd.Timedelta(minutes=15)
+    one_back = dataset.event_asof_latest(
+        "EURUSD",
+        third_open,
+        third_open + pd.Timedelta(minutes=15),
+    )
+    assert one_back is not None
+    assert pd.Timestamp(one_back["bar_open"]) == second_open
+    # ... but two bars back is not, even though that event is long published.
+    fourth_open = third_open + pd.Timedelta(minutes=15)
+    assert (
+        dataset.event_asof_latest(
+            "EURUSD",
+            fourth_open,
+            fourth_open + pd.Timedelta(minutes=15),
+        )
+        is None
+    )
+    # An event is never returned before it was published.
+    assert (
+        dataset.event_asof_latest("EURUSD", BAR_OPEN, BAR_CLOSE) is None
+    )
+    with pytest.raises(cluster_data.ClusterDataValidationError):
+        dataset.event_asof_latest(
+            "EURUSD",
+            second_open,
+            decision,
+            max_stale_bars=-1,
+        )
+
+
+def test_strategy_pairs_stale_event_with_its_own_candle():
+    second_open = BAR_OPEN + pd.Timedelta(minutes=15)
+    # Only the first row matches the event; the decision candle is different.
+    decision_candle = {
+        "open": 1.1005,
+        "high": 1.1030,
+        "low": 1.1004,
+        "close": 1.1028,
+    }
+    frame = pd.DataFrame(
+        [_candle(), decision_candle],
+        index=[BAR_OPEN, second_open],
+    )
+    strategy = NarrativeStrategy()
+    strategy.cluster_rejection_15m_entry_enabled = True
+    strategy.cluster_rejection_allow_research_assumption = True
+
+    entry = strategy.trigger_15m_cluster_rejection(
+        frame,
+        "LONG",
+        _event(),
+        symbol="EURUSD",
+    )
+
+    assert entry is not None
+    assert entry.trigger_meta["stale_bars"] == 1
+    assert entry.trigger_meta["bar_open_time"] == BAR_OPEN.isoformat()
+    # Entry is priced at the decision candle, not at the stale rejection close.
+    assert entry.entry_price == pytest.approx(decision_candle["close"])
+    assert "stale_bars=1" in entry.reason
+
+
+def test_strategy_refuses_event_whose_bar_is_absent_from_the_frame():
+    frame = pd.DataFrame(
+        [_candle()],
+        index=[BAR_OPEN + pd.Timedelta(minutes=30)],
+    )
+    strategy = NarrativeStrategy()
+    strategy.cluster_rejection_15m_entry_enabled = True
+    strategy.cluster_rejection_allow_research_assumption = True
+
+    assert (
+        strategy.trigger_15m_cluster_rejection(
+            frame,
+            "LONG",
+            _event(),
+            symbol="EURUSD",
+        )
+        is None
+    )
 
 
 def test_threshold_contract_rejects_non_directional_configuration():

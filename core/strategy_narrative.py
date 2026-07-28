@@ -888,14 +888,24 @@ class NarrativeStrategy:
             return None
 
         try:
-            candle_open_time = pd.Timestamp(df_15M.index[-1])
+            # The cluster is published after its M15 closes, so the newest
+            # causally available event can describe an earlier candle. Pair the
+            # event with its own bar instead of assuming the latest one.
+            candle_open_time = pd.Timestamp(
+                event.get("bar_open")
+                if isinstance(event, dict)
+                else getattr(event, "bar_open", None)
+            )
+            position = int(df_15M.index.get_indexer([candle_open_time])[0])
+            if position < 0:
+                return None
             decision_time = pd.Timestamp(
                 event.get("available_at")
                 if isinstance(event, dict)
                 else getattr(event, "available_at", None)
             )
             rejection = detect_fxpro_cluster_rejection(
-                candle=df_15M.iloc[-1].to_dict(),
+                candle=df_15M.iloc[position].to_dict(),
                 candle_open_time=candle_open_time,
                 event=event,
                 symbol=symbol,
@@ -912,15 +922,20 @@ class NarrativeStrategy:
         if rejection is None:
             return None
 
+        # Entry is priced at the decision candle, not at the possibly older
+        # rejection candle: a stale close is not a price we could still act on.
         close = float(df_15M["close"].iloc[-1])
+        stale_bars = int(len(df_15M) - 1 - position)
         meta = rejection.to_dict()
+        meta["stale_bars"] = stale_bars
         return CandidateEntry(
             side=side,
             entry_price=close,
             tf="15M",
             reason=(
                 f"FxPro Cluster Rejection 15M {side}"
-                f" | score={rejection.cluster_score:.3f}"
+                f" | stale_bars={stale_bars}"
+                f" score={rejection.cluster_score:.3f}"
                 f" edge_imbalance={rejection.edge_imbalance_ratio:.3f}"
                 f" edge_share={rejection.edge_volume_share:.3f}"
                 f" rejection={rejection.rejection_fraction:.3f}"

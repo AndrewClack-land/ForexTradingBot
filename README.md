@@ -901,6 +901,18 @@ the event population, and marks it `research_only=true` with
 assumption because the historical exporter did not observe original
 publication time. Live code rejects these events by default.
 
+A positive delay means the cluster describing the just-closed M15 is not yet
+available at that same decision. Readers therefore call
+`FxProClusterEventDataset.event_asof_latest`, which accepts at most one
+older closed M15 (`CLUSTER_MAX_STALE_BARS`). The strict
+`available_at <= decision_time` gate still applies to every candidate, the
+detector is run against the candle the stale event actually describes, and
+the entry is priced at the decision candle. `decision_events.csv` reports
+`AVAILABLE` for a same-bar cluster and `AVAILABLE_STALE` for a one-bar-old
+one, so the split is auditable. Sealing with
+`--availability-delay-ms 0` is therefore unnecessary and is not a supported
+way to make the trigger fire.
+
 Use the sealed sidecar in the counterfactual run:
 
 ```bash
