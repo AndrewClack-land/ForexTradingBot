@@ -202,6 +202,106 @@ def test_optimize_v2_rejects_cross_decision_pending_overlap():
         )
 
 
+@pytest.mark.parametrize("latency", ["-1s", "15min"])
+def test_optimize_v2_rejects_invalid_decision_latency(latency):
+    with pytest.raises(StrategyBacktestError, match="decision_latency"):
+        run_counterfactual_backtest(
+            _dataset(f"counterfactual-latency-{latency}"),
+            _config(),
+            decision_latency=latency,
+            strategy_factory=_AllSideAllTriggerStrategy,
+            min_train_opportunities=1,
+        )
+
+
+def test_decision_latency_controls_sidecar_availability_and_causal_fill():
+    class _DelayedCluster:
+        manifest_sha256 = "a" * 64
+        research_only = True
+
+        def event_asof_latest(self, symbol, bar_open, decision_time):
+            assert symbol == "EURUSD"
+            available_at = pd.Timestamp(bar_open) + pd.Timedelta(
+                minutes=15,
+                seconds=1,
+            )
+            if pd.Timestamp(decision_time) < available_at:
+                return None
+            return {
+                "bar_open": pd.Timestamp(bar_open).isoformat(),
+                "available_at": available_at.isoformat(),
+            }
+
+    class _LatencyStrategy(_AllSideAllTriggerStrategy):
+        def trigger_15m_cluster_rejection(
+            self,
+            _,
+            side,
+            event,
+            *,
+            symbol,
+        ):
+            assert symbol == "EURUSD"
+            if event is None:
+                return None
+            return self._entry(
+                side,
+                "fxpro_cluster_rejection_15m",
+                0.0,
+            )
+
+    without_latency = run_counterfactual_backtest(
+        _dataset("counterfactual-no-latency"),
+        _config(),
+        cluster_proxy=_DelayedCluster(),
+        decision_latency="0s",
+        strategy_factory=_LatencyStrategy,
+        min_train_opportunities=1,
+    )
+    with_latency = run_counterfactual_backtest(
+        _dataset("counterfactual-one-minute-latency"),
+        _config(),
+        cluster_proxy=_DelayedCluster(),
+        decision_latency="60s",
+        strategy_factory=_LatencyStrategy,
+        min_train_opportunities=1,
+    )
+
+    assert {
+        row["cluster_proxy_status"]
+        for row in without_latency.decision_events
+    } == {"MISSING_OR_DELAYED"}
+    assert {
+        row["cluster_proxy_status"]
+        for row in with_latency.decision_events
+    } == {"AVAILABLE"}
+    assert not {
+        row["trigger_kind"] for row in without_latency.opportunities
+    } & {"fxpro_cluster_rejection_15m"}
+    assert "fxpro_cluster_rejection_15m" in {
+        row["trigger_kind"] for row in with_latency.opportunities
+    }
+    for row in with_latency.decision_events:
+        assert pd.Timestamp(row["decision_time"]) == (
+            pd.Timestamp(row["bar_close_time"])
+            + pd.Timedelta(minutes=1)
+        )
+    assert with_latency.summary["decision_timing"][
+        "decision_latency"
+    ] == "P0DT0H1M0S"
+    filled = [
+        row
+        for row in with_latency.labels
+        if row["label_status"] == "FILLED"
+    ]
+    assert filled
+    assert all(
+        pd.Timestamp(row["fill_time"])
+        > pd.Timestamp(row["decision_time"])
+        for row in filled
+    )
+
+
 def test_private_replay_rejects_overlapping_pending_decisions():
     decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
     signal = {
@@ -404,6 +504,27 @@ def test_train_only_weights_replay_oos_without_threshold_and_keep_one_pct_risk(
     )
     assert result.summary["risk"]["risk_fraction"] == pytest.approx(0.01)
     assert result.summary["risk"]["changed_by_optimizer"] is False
+    assert result.summary["paired_comparison"][
+        "same_selected_candidate_support"
+    ] is True
+    assert result.summary["paired_comparison"][
+        "difference"
+    ] == "factor_weights_only"
+    optimized_support = {
+        (row["fold_index"], row["opportunity_id"])
+        for row in result.selections
+        if row["selection_status"] == "RANKED_FOR_REPLAY"
+    }
+    baseline_support = {
+        (row["fold_index"], row["opportunity_id"])
+        for row in result.baseline_selections
+        if row["selection_status"] == "RANKED_FOR_REPLAY"
+    }
+    assert optimized_support == baseline_support
+    assert all(
+        setup["risk_amount"] == pytest.approx(100.0)
+        for setup in result.baseline_setups
+    )
     assert {
         row["label_status"] for row in result.labels
     } >= {"FILLED", "NO_FILL"}
@@ -414,6 +535,13 @@ def test_train_only_weights_replay_oos_without_threshold_and_keep_one_pct_risk(
     assert (report / "technical_opportunities.csv").is_file()
     assert (report / "opportunity_labels.csv").is_file()
     assert (report / "trigger_attribution.csv").is_file()
+    assert (report / "paired_fixed_weight_models.json").is_file()
+    assert (report / "baseline_predictions.csv").is_file()
+    assert (report / "baseline_oos_selections.csv").is_file()
+    assert (report / "baseline_executions.csv").is_file()
+    assert (report / "baseline_setups.csv").is_file()
+    assert (report / "baseline_legs.csv").is_file()
+    assert (report / "baseline_folds.csv").is_file()
     assert (report / "manifest.json").is_file()
     trigger_rows = list(result.trigger_attribution)
     assert trigger_rows
@@ -435,10 +563,15 @@ def test_not_fit_fold_is_audited_but_never_trades_reference_weights(
 
     assert not result.setups
     assert not result.executions
+    assert not result.baseline_setups
+    assert not result.baseline_executions
     assert not result.selections or {
         row["selection_status"] for row in result.selections
     } == {"SKIPPED_NOT_FIT"}
     assert result.summary["oos_selected_candidates"] == 0
+    assert result.summary["paired_fixed_weight_baseline"][
+        "oos_selected_candidates"
+    ] == 0
     assert result.summary["oos_decisions_skipped_not_fit"] > 0
 
     report = result.write(tmp_path / "not-fit-report")

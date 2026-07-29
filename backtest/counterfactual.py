@@ -61,11 +61,13 @@ from .strategy_runner import (
 from .weight_optimizer import (
     DEFAULT_MIN_TRAIN_OPPORTUNITIES,
     DEFAULT_RIDGE_ALPHA,
+    REFERENCE_WEIGHTS,
+    WEIGHT_SUM,
     build_counterfactual_weight_scores,
 )
 
 
-COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v1"
+COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v2"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
     "fxpro_cluster_rejection_15m",
@@ -109,7 +111,9 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "schema",
         "decision_event_id",
         "symbol",
+        "bar_close_time",
         "decision_time",
+        "decision_latency",
         "production_bias_ignored_for_generation",
         "factor_vector",
         "fvg_side",
@@ -121,6 +125,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "opportunity_id",
         "decision_event_id",
         "symbol",
+        "bar_close_time",
         "decision_time",
         "side",
         "trigger_kind",
@@ -147,6 +152,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "opportunity_id",
         "decision_event_id",
         "symbol",
+        "bar_close_time",
         "decision_time",
         "side",
         "trigger_kind",
@@ -237,6 +243,7 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "test_start",
         "test_end",
         "symbol",
+        "bar_close_time",
         "decision_time",
         "opportunity_id",
         "side",
@@ -262,6 +269,63 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "policy",
         *_METRIC_FIELDS,
     ),
+    "baseline_predictions.csv": (
+        "schema",
+        "opportunity_id",
+        "decision_event_id",
+        "fold_index",
+        "symbol",
+        "decision_time",
+        "side",
+        "trigger_kind",
+        "model_status",
+        "model_id",
+        "train_opportunities",
+        "train_decision_side_clusters",
+        "train_effective_sample_size",
+        "factor_alignment",
+        "weighted_factor_score",
+        "normalized_factor_score",
+        "predicted_opportunity_r",
+        "actual_label_status",
+        "actual_label_known_before_test_end",
+        "actual_opportunity_r",
+        "prediction_error_r",
+        "score_threshold_applied",
+    ),
+    "baseline_oos_selections.csv": (
+        "schema",
+        "replay_id",
+        "fold_index",
+        "test_start",
+        "test_end",
+        "symbol",
+        "bar_close_time",
+        "decision_time",
+        "opportunity_id",
+        "side",
+        "trigger_kind",
+        "model_id",
+        "model_status",
+        "score",
+        "rank",
+        "hard_score_threshold_applied",
+        "eligible_pool",
+        "alternatives",
+        "selection_status",
+    ),
+    "baseline_executions.csv": tuple(_EMPTY_CSV_FIELDS["executions"]),
+    "baseline_setups.csv": tuple(_EMPTY_CSV_FIELDS["setups"]),
+    "baseline_legs.csv": tuple(_EMPTY_CSV_FIELDS["legs"]),
+    "baseline_folds.csv": (
+        "fold_index",
+        "train_start",
+        "train_end",
+        "test_start",
+        "test_end",
+        "policy",
+        *_METRIC_FIELDS,
+    ),
 }
 
 
@@ -270,6 +334,7 @@ class _Opportunity:
     opportunity_id: str
     decision_event_id: str
     symbol: str
+    bar_close_time: pd.Timestamp
     decision_time: pd.Timestamp
     trigger_kind: str
     trigger_tags: tuple[str, ...]
@@ -282,6 +347,7 @@ class _Opportunity:
             "opportunity_id": self.opportunity_id,
             "decision_event_id": self.decision_event_id,
             "symbol": self.symbol,
+            "bar_close_time": self.bar_close_time.isoformat(),
             "decision_time": self.decision_time.isoformat(),
             "side": self.signal.get("side"),
             "trigger_kind": self.trigger_kind,
@@ -322,6 +388,13 @@ class CounterfactualBacktestResult:
     setups: tuple[Mapping[str, Any], ...]
     legs: tuple[Mapping[str, Any], ...]
     folds: tuple[Mapping[str, Any], ...]
+    baseline_models: Mapping[str, Any]
+    baseline_predictions: tuple[Mapping[str, Any], ...]
+    baseline_selections: tuple[Mapping[str, Any], ...]
+    baseline_executions: tuple[Mapping[str, Any], ...]
+    baseline_setups: tuple[Mapping[str, Any], ...]
+    baseline_legs: tuple[Mapping[str, Any], ...]
+    baseline_folds: tuple[Mapping[str, Any], ...]
 
     def write(self, output: str | Path) -> Path:
         return write_counterfactual_report(self, output)
@@ -499,10 +572,30 @@ def _normalized_candle_tolerance(
     return dict(sorted(normalized.items()))
 
 
+def _normalized_decision_latency(value: Any) -> pd.Timedelta:
+    try:
+        latency = pd.Timedelta(value)
+    except Exception as exc:
+        raise StrategyBacktestError(
+            f"decision_latency is invalid: {value!r}"
+        ) from exc
+    if pd.isna(latency) or latency < pd.Timedelta(0):
+        raise StrategyBacktestError(
+            "decision_latency must be a nonnegative duration"
+        )
+    if latency >= _DECISION_CADENCE:
+        raise StrategyBacktestError(
+            "decision_latency must be shorter than the 15-minute decision "
+            "cadence; otherwise this is a stale-signal strategy"
+        )
+    return latency
+
+
 def _decision_event_id(
     *,
     manifest_sha256: str,
     symbol: str,
+    bar_close_time: pd.Timestamp,
     decision_time: pd.Timestamp,
 ) -> str:
     return _canonical_hash(
@@ -510,6 +603,7 @@ def _decision_event_id(
             "schema": COUNTERFACTUAL_SCHEMA,
             "snapshot_manifest": manifest_sha256,
             "symbol": symbol,
+            "bar_close_time": bar_close_time.isoformat(),
             "decision_time": decision_time.isoformat(),
         }
     )[:24]
@@ -715,6 +809,7 @@ def _generate_symbol_universe(
     prepared: Mapping[str, Any],
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
+    decision_latency: pd.Timedelta,
     cluster_proxy: Optional[FxProClusterEventDataset],
     candle_tolerance_ticks: Mapping[str, int],
     quote_pressure: Optional[FxProQuotePressureEventDataset],
@@ -764,9 +859,12 @@ def _generate_symbol_universe(
         decisions=total,
     )
     for completed, raw_time in enumerate(closes[left:right], start=1):
-        decision_time = pd.Timestamp(raw_time)
+        bar_close_time = pd.Timestamp(raw_time)
+        decision_time = bar_close_time + decision_latency
         counters["decisions"] += 1
-        data = _strategy_data(prepared, decision_time, config)
+        # Freeze every factor and trigger candle at the canonical M15 close.
+        # Only event availability and executable actions observe latency.
+        data = _strategy_data(prepared, bar_close_time, config)
         if data is None:
             counters["warmup_skipped"] += 1
             continue
@@ -834,6 +932,7 @@ def _generate_symbol_universe(
         decision_event_id = _decision_event_id(
             manifest_sha256=dataset.manifest_sha256,
             symbol=symbol,
+            bar_close_time=bar_close_time,
             decision_time=decision_time,
         )
         detected = _detect_entries(
@@ -845,7 +944,9 @@ def _generate_symbol_universe(
             "schema": COUNTERFACTUAL_SCHEMA,
             "decision_event_id": decision_event_id,
             "symbol": symbol,
+            "bar_close_time": bar_close_time.isoformat(),
             "decision_time": decision_time.isoformat(),
+            "decision_latency": decision_latency.isoformat(),
             "production_bias_ignored_for_generation": baseline_bias,
             "factor_vector": dict(factor_vector),
             "fvg_side": fvg_side,
@@ -913,6 +1014,7 @@ def _generate_symbol_universe(
                     opportunity_id=opportunity_id,
                     decision_event_id=decision_event_id,
                     symbol=symbol,
+                    bar_close_time=bar_close_time,
                     decision_time=decision_time,
                     trigger_kind=trigger_kind,
                     trigger_tags=(trigger_kind,),
@@ -967,6 +1069,7 @@ def _label_opportunity(
         "opportunity_id": opportunity.opportunity_id,
         "decision_event_id": opportunity.decision_event_id,
         "symbol": opportunity.symbol,
+        "bar_close_time": opportunity.bar_close_time.isoformat(),
         "decision_time": opportunity.decision_time.isoformat(),
         "side": signal.get("side"),
         "trigger_kind": opportunity.trigger_kind,
@@ -1093,11 +1196,103 @@ def _label_opportunity(
     }
 
 
+def _build_paired_baseline_scores(
+    optimizer: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Score the optimizer's exact OOS support with untouched fixed weights.
+
+    The arm intentionally shares fold readiness, opportunity population,
+    operational gates, fill model, and risk with the learned-weight arm.  The
+    only changed variable is the directional weight vector: the fixed
+    production reference ``[2, 2, 1, 1, 1]`` with zero intercept.
+    """
+
+    model_by_fold: dict[int, dict[str, Any]] = {}
+    models: list[dict[str, Any]] = []
+    for optimized_model in optimizer["models"]:
+        fold_index = int(optimized_model["fold_index"])
+        status = str(optimized_model["status"])
+        identity = {
+            "schema": COUNTERFACTUAL_SCHEMA,
+            "arm": "paired_fixed_weight_baseline",
+            "fold_index": fold_index,
+            "status": status,
+            "paired_optimizer_model_id": optimized_model["model_id"],
+            "weights": dict(REFERENCE_WEIGHTS),
+            "intercept": 0.0,
+            "score_threshold": None,
+        }
+        model = {
+            **identity,
+            "model_id": _canonical_hash(identity)[:24],
+            "test_start": optimized_model["test_start"],
+            "test_end": optimized_model["test_end"],
+            "common_support_only": True,
+        }
+        models.append(model)
+        model_by_fold[fold_index] = model
+
+    predictions: list[dict[str, Any]] = []
+    for optimized_row in optimizer["predictions"]:
+        fold_index = int(optimized_row["fold_index"])
+        model = model_by_fold[fold_index]
+        alignment = optimized_row.get("factor_alignment")
+        if not isinstance(alignment, Mapping):
+            raise StrategyBacktestError(
+                "optimizer prediction has no auditable factor alignment"
+            )
+        weighted = sum(
+            float(alignment[key]) * float(weight)
+            for key, weight in REFERENCE_WEIGHTS.items()
+        )
+        normalized = float(weighted / WEIGHT_SUM)
+        predicted = normalized if model["status"] == "FIT" else None
+        actual = optimized_row.get("actual_opportunity_r")
+        predictions.append(
+            {
+                **dict(optimized_row),
+                "schema": COUNTERFACTUAL_SCHEMA,
+                "model_id": model["model_id"],
+                "weighted_factor_score": float(weighted),
+                "normalized_factor_score": normalized,
+                "predicted_opportunity_r": predicted,
+                "prediction_error_r": (
+                    float(predicted) - float(actual)
+                    if predicted is not None and actual is not None
+                    else None
+                ),
+            }
+        )
+    return {
+        "summary": {
+            "schema": COUNTERFACTUAL_SCHEMA,
+            "arm": "paired_fixed_weight_baseline",
+            "reference_weights": dict(REFERENCE_WEIGHTS),
+            "intercept": 0.0,
+            "no_hard_threshold": True,
+            "common_support_only": True,
+            "models_fit": sum(model["status"] == "FIT" for model in models),
+            "models_not_fit": sum(
+                model["status"] != "FIT" for model in models
+            ),
+            "oos_opportunities": len(predictions),
+            "oos_scored": sum(
+                row["predicted_opportunity_r"] is not None
+                for row in predictions
+            ),
+            "paired_difference": "factor_weights_only",
+        },
+        "models": models,
+        "predictions": predictions,
+    }
+
+
 def _select_oos_candidates(
     *,
     predictions: Sequence[Mapping[str, Any]],
     opportunity_by_id: Mapping[str, _Opportunity],
     periods: Sequence[_Period],
+    arm: str = "optimized_weights",
 ) -> tuple[list[_Candidate], list[dict[str, Any]]]:
     by_decision: dict[
         tuple[int, str, str],
@@ -1143,6 +1338,9 @@ def _select_oos_candidates(
                     "test_start": period.test_start.isoformat(),
                     "test_end": period.test_end.isoformat(),
                     "symbol": symbol,
+                    "bar_close_time": candidates[0][
+                        1
+                    ].bar_close_time.isoformat(),
                     "decision_time": candidates[0][
                         1
                     ].decision_time.isoformat(),
@@ -1190,12 +1388,13 @@ def _select_oos_candidates(
                 "predicted_opportunity_r"
             )
             signal["optimizer_rank"] = rank_index
+            signal["replay_arm"] = arm
             selection_status = "SKIPPED_PRE_GATE"
             if opportunity.gate == "ENTER":
                 replay_id = _canonical_hash(
                     {
                         "schema": COUNTERFACTUAL_SCHEMA,
-                        "arm": "optimized_weights",
+                        "arm": arm,
                         "fold_index": fold_index,
                         "opportunity_id": opportunity.opportunity_id,
                         "model_id": prediction.get("model_id"),
@@ -1221,6 +1420,7 @@ def _select_oos_candidates(
                     "test_start": period.test_start.isoformat(),
                     "test_end": period.test_end.isoformat(),
                     "symbol": symbol,
+                    "bar_close_time": opportunity.bar_close_time.isoformat(),
                     "decision_time": opportunity.decision_time.isoformat(),
                     "opportunity_id": opportunity.opportunity_id,
                     "side": signal.get("side"),
@@ -1318,6 +1518,7 @@ def _run_selected_replay(
     periods: Sequence[_Period],
     config: NarrativeBacktestConfig,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
+    arm: str = "optimized_weights",
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1330,6 +1531,10 @@ def _run_selected_replay(
     by_symbol: dict[str, list[_Candidate]] = defaultdict(list)
     for candidate in selected:
         by_symbol[candidate.symbol].append(candidate)
+
+    def arm_progress(event: Mapping[str, Any]) -> None:
+        if progress is not None:
+            progress({**dict(event), "arm": arm})
 
     for symbol in config.symbols:
         candidates = _causal_ranked_replay_order(
@@ -1344,7 +1549,7 @@ def _run_selected_replay(
                 periods=periods,
                 config=config,
                 policy=policy,
-                progress=progress,
+                progress=arm_progress,
                 carry_positions_across_folds=True,
             )
             all_setups.extend(setups)
@@ -1370,6 +1575,44 @@ def _run_selected_replay(
     return all_setups, all_legs, all_executions, fold_rows
 
 
+def _paired_metric_deltas(
+    optimized: Mapping[str, Any],
+    baseline: Mapping[str, Any],
+) -> dict[str, Any]:
+    output: dict[str, Any] = {}
+    for name in (
+        "setups_total",
+        "setups_closed",
+        "win_rate",
+        "net_r",
+        "expectancy_r",
+        "profit_factor",
+        "max_drawdown_r",
+        "longest_loss_streak",
+    ):
+        optimized_value = optimized.get(name)
+        baseline_value = baseline.get(name)
+        if optimized_value is None or baseline_value is None:
+            output[name] = None
+            continue
+        try:
+            left = float(optimized_value)
+            right = float(baseline_value)
+        except (TypeError, ValueError):
+            output[name] = None
+            continue
+        output[name] = left - right if math.isfinite(left - right) else None
+    baseline_drawdown = baseline.get("max_drawdown_r")
+    optimized_drawdown = optimized.get("max_drawdown_r")
+    output["drawdown_reduction_r"] = (
+        float(baseline_drawdown) - float(optimized_drawdown)
+        if baseline_drawdown is not None
+        and optimized_drawdown is not None
+        else None
+    )
+    return output
+
+
 def run_counterfactual_backtest(
     dataset: HistoricalDataset,
     config: NarrativeBacktestConfig,
@@ -1377,6 +1620,7 @@ def run_counterfactual_backtest(
     cluster_proxy: Optional[FxProClusterEventDataset] = None,
     quote_pressure: Optional[FxProQuotePressureEventDataset] = None,
     cluster_candle_tolerance_ticks: Optional[Mapping[str, int]] = None,
+    decision_latency: Any = "0s",
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     min_train_opportunities: int = DEFAULT_MIN_TRAIN_OPPORTUNITIES,
@@ -1416,6 +1660,7 @@ def run_counterfactual_backtest(
         cluster_candle_tolerance_ticks,
         config.symbols,
     )
+    latency = _normalized_decision_latency(decision_latency)
     if tolerance_overrides and cluster_proxy is None:
         raise StrategyBacktestError(
             "cluster candle tolerance overrides require --cluster-proxy-data"
@@ -1436,6 +1681,7 @@ def run_counterfactual_backtest(
                 prepared=prepared_by_symbol[symbol],
                 periods=periods,
                 config=config,
+                decision_latency=latency,
                 cluster_proxy=cluster_proxy,
                 quote_pressure=quote_pressure,
                 candle_tolerance_ticks=tolerance_overrides,
@@ -1520,6 +1766,7 @@ def run_counterfactual_backtest(
         predictions=optimizer["predictions"],
         opportunity_by_id=opportunity_by_id,
         periods=periods,
+        arm="optimized_weights",
     )
     setups, legs, executions, fold_rows = _run_selected_replay(
         selected=selected,
@@ -1527,11 +1774,53 @@ def run_counterfactual_backtest(
         periods=periods,
         config=config,
         progress=progress,
+        arm="optimized_weights",
+    )
+    baseline = _build_paired_baseline_scores(optimizer)
+    baseline_selected, baseline_selection_rows = _select_oos_candidates(
+        predictions=baseline["predictions"],
+        opportunity_by_id=opportunity_by_id,
+        periods=periods,
+        arm="paired_fixed_weight_baseline",
+    )
+    optimized_support = {
+        (row["fold_index"], row["opportunity_id"])
+        for row in selection_rows
+        if row.get("selection_status") == "RANKED_FOR_REPLAY"
+    }
+    baseline_support = {
+        (row["fold_index"], row["opportunity_id"])
+        for row in baseline_selection_rows
+        if row.get("selection_status") == "RANKED_FOR_REPLAY"
+    }
+    if optimized_support != baseline_support:
+        raise StrategyBacktestError(
+            "paired baseline does not share the optimizer replay support"
+        )
+    (
+        baseline_setups,
+        baseline_legs,
+        baseline_executions,
+        baseline_fold_rows,
+    ) = _run_selected_replay(
+        selected=baseline_selected,
+        prepared_by_symbol=prepared_by_symbol,
+        periods=periods,
+        config=config,
+        progress=progress,
+        arm="paired_fixed_weight_baseline",
     )
 
     primary_setups = [
         row for row in setups if row["policy"] == _PRIMARY_POLICY
     ]
+    baseline_primary_setups = [
+        row
+        for row in baseline_setups
+        if row["policy"] == _PRIMARY_POLICY
+    ]
+    optimized_metrics = _metrics_for(primary_setups)
+    baseline_metrics = _metrics_for(baseline_primary_setups)
     force_exit_counts = Counter(
         str(row.get("forced_exit_reason"))
         for row in primary_setups
@@ -1567,6 +1856,17 @@ def run_counterfactual_backtest(
             "turtle_soup_enabled": False,
             "score_threshold": None,
             "primary_label_policy": _PRIMARY_POLICY,
+            "decision_latency": latency.isoformat(),
+            "decision_time_semantics": (
+                "bar_close_time_plus_decision_latency"
+            ),
+            "paired_baseline": {
+                "arm": "paired_fixed_weight_baseline",
+                "weights": dict(REFERENCE_WEIGHTS),
+                "intercept": 0.0,
+                "common_oos_support_only": True,
+                "same_execution_simulator": True,
+            },
         },
         "cluster_proxy_manifest_sha256": (
             cluster_proxy.manifest_sha256
@@ -1590,6 +1890,14 @@ def run_counterfactual_backtest(
         "label_status_counts": dict(sorted(label_counts.items())),
         "trigger_attribution_rows": len(trigger_attribution),
         "signal_counters": dict(sorted(signal_counters.items())),
+        "decision_timing": {
+            "bar_close_time": "canonical completed M15 candle close",
+            "decision_latency": latency.isoformat(),
+            "decision_time": "bar_close_time + decision_latency",
+            "factor_snapshot_at": "bar_close_time",
+            "sidecar_availability_checked_at": "decision_time",
+            "fills_strictly_after": "decision_time",
+        },
         "optimizer": optimizer["summary"],
         "oos_selected_candidates": len(selected),
         "oos_ranked_candidates": len(selected),
@@ -1608,7 +1916,23 @@ def run_counterfactual_backtest(
             row.get("selection_status") == "SKIPPED_NOT_FIT"
             for row in selection_rows
         ),
-        "oos_primary_metrics": _metrics_for(primary_setups),
+        "oos_primary_metrics": optimized_metrics,
+        "paired_fixed_weight_baseline": {
+            **baseline["summary"],
+            "oos_selected_candidates": len(baseline_selected),
+            "oos_primary_metrics": baseline_metrics,
+        },
+        "paired_comparison": {
+            "support": "same FIT folds and gate-eligible opportunities",
+            "difference": "factor_weights_only",
+            "same_execution_simulator": True,
+            "same_risk_model": True,
+            "same_selected_candidate_support": True,
+            "optimized_minus_baseline": _paired_metric_deltas(
+                optimized_metrics,
+                baseline_metrics,
+            ),
+        },
         "oos_primary_force_exit_counts": dict(
             sorted(force_exit_counts.items())
         ),
@@ -1621,6 +1945,7 @@ def run_counterfactual_backtest(
             ),
             "maximum_fraction": 0.01,
             "changed_by_optimizer": False,
+            "changed_by_baseline": False,
         },
         "trigger_manifest": list(TRIGGER_MANIFEST),
         "supported_trigger_manifest": list(TRIGGER_MANIFEST),
@@ -1668,10 +1993,16 @@ def run_counterfactual_backtest(
         },
         "assumptions": {
             "generation": (
-                "every completed M15 decision across every outer train/test "
+                "every completed M15 bar across every outer train/test "
                 "window; LONG and SHORT detectors called independently of "
                 "the production bias and live trigger switches; operationally "
                 "disabled triggers remain blocked only in OOS replay"
+            ),
+            "decision_latency": (
+                "factor vectors and trigger geometry are frozen at the "
+                "canonical M15 bar_close_time; sidecar availability, gates, "
+                "TTL and fills use decision_time=bar_close_time+latency; no "
+                "M1 open at or before decision_time is executable"
             ),
             "labels": (
                 "independent technical opportunities before active-setup, "
@@ -1696,6 +2027,12 @@ def run_counterfactual_backtest(
                 "factor weights optimize direction alignment only; trigger "
                 "families remain separate observations and trigger "
                 "arbitration is fixed, not fitted"
+            ),
+            "paired_baseline": (
+                "the untouched [2,2,1,1,1] reference vector and zero "
+                "intercept score the exact same FIT-fold OOS opportunities; "
+                "both arms then use identical gates, chronological fill "
+                "simulation, position state and fixed-starting-capital risk"
             ),
             "oos_metrics": (
                 "integrated replay is authoritative; optimizer label metrics "
@@ -1793,6 +2130,46 @@ def run_counterfactual_backtest(
         ),
         legs=tuple(_safe_json_value(row) for row in legs),
         folds=tuple(_safe_json_value(row) for row in fold_rows),
+        baseline_models=_safe_json_value(
+            {
+                "summary": baseline["summary"],
+                "models": baseline["models"],
+            }
+        ),
+        baseline_predictions=tuple(
+            _safe_json_value(row) for row in baseline["predictions"]
+        ),
+        baseline_selections=tuple(
+            _safe_json_value(row) for row in baseline_selection_rows
+        ),
+        baseline_executions=tuple(
+            _safe_json_value(row)
+            for row in sorted(
+                baseline_executions,
+                key=lambda item: (
+                    item["policy"],
+                    item["decision_time"],
+                    item["symbol"],
+                ),
+            )
+        ),
+        baseline_setups=tuple(
+            _safe_json_value(row)
+            for row in sorted(
+                baseline_setups,
+                key=lambda item: (
+                    item["policy"],
+                    item["decision_time"],
+                    item["symbol"],
+                ),
+            )
+        ),
+        baseline_legs=tuple(
+            _safe_json_value(row) for row in baseline_legs
+        ),
+        baseline_folds=tuple(
+            _safe_json_value(row) for row in baseline_fold_rows
+        ),
     )
 
 
@@ -1857,6 +2234,9 @@ def write_counterfactual_report(
         (staging / "frozen_weight_models.json").write_bytes(
             _json_bytes(result.models)
         )
+        (staging / "paired_fixed_weight_models.json").write_bytes(
+            _json_bytes(result.baseline_models)
+        )
         tables = {
             "decision_events.csv": result.decision_events,
             "technical_opportunities.csv": result.opportunities,
@@ -1870,6 +2250,12 @@ def write_counterfactual_report(
             "setups.csv": result.setups,
             "legs.csv": result.legs,
             "folds.csv": result.folds,
+            "baseline_predictions.csv": result.baseline_predictions,
+            "baseline_oos_selections.csv": result.baseline_selections,
+            "baseline_executions.csv": result.baseline_executions,
+            "baseline_setups.csv": result.baseline_setups,
+            "baseline_legs.csv": result.baseline_legs,
+            "baseline_folds.csv": result.baseline_folds,
         }
         for filename, rows in tables.items():
             _write_csv(

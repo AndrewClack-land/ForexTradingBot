@@ -825,6 +825,7 @@ backtest_sandbox forexbot-backtest-optimize-v2-fx \
   --profile production-deterministic \
   --train 730D --test 180D --step 180D \
   --intrabar-policy stop-first \
+  --decision-latency 60s \
   --ridge-alpha 1.0 \
   --min-train-opportunities 400 \
   --release-commit-file "$release_root/RELEASE_COMMIT" \
@@ -901,15 +902,21 @@ the event population, and marks it `research_only=true` with
 assumption because the historical exporter did not observe original
 publication time. Live code rejects these events by default.
 
-A positive delay means the cluster describing the just-closed M15 is not yet
-available at that same decision. Readers therefore call
-`FxProClusterEventDataset.event_asof_latest`, which accepts at most one
-older closed M15 (`CLUSTER_MAX_STALE_BARS`). The strict
+A cluster sidecar delay is compared with the explicit effective decision time.
+`bar_close_time` is the immutable factor/trigger cutoff;
+`decision_time = bar_close_time + --decision-latency` controls sidecar
+availability, gates, TTL, and execution. Candles closing during that latency
+remain hidden. If the just-closed event is still delayed, readers call
+`FxProClusterEventDataset.event_asof_latest`, which accepts at most one older
+closed M15 (`CLUSTER_MAX_STALE_BARS`). The strict
 `available_at <= decision_time` gate still applies to every candidate, the
 detector is run against the candle the stale event actually describes, and
 the entry is priced at the decision candle. `decision_events.csv` reports
 `AVAILABLE` for a same-bar cluster and `AVAILABLE_STALE` for a one-bar-old
-one, so the split is auditable. Sealing with
+one, while both timestamps and the configured latency remain auditable.
+Use measured forward latency where possible; `60s` is a conservative replay
+choice matching the current polling cadence, not proof of exact live latency.
+Sealing with
 `--availability-delay-ms 0` is therefore unnecessary and is not a supported
 way to make the trigger fire.
 
@@ -1045,7 +1052,12 @@ report contains `decision_events.csv`, `technical_opportunities.csv`,
 `opportunity_labels.csv`, `frozen_weight_models.json`,
 `optimizer_predictions.csv`, `optimizer_coefficients.csv`,
 `optimizer_metrics.csv`, `oos_selections.csv`, and the replay
-`executions/setups/legs/folds` tables. `NO_FILL` is an explicit 0R opportunity;
+`executions/setups/legs/folds` tables. It additionally runs the untouched
+`[2,2,1,1,1]` reference vector over the exact same FIT-fold OOS support and
+writes `paired_fixed_weight_models.json` plus the
+`baseline_predictions/oos_selections/executions/setups/legs/folds` tables.
+Both arms use the same gates, chronological M1 simulator, and fixed risk;
+`summary.json` reports challenger-minus-baseline deltas. `NO_FILL` is an explicit 0R opportunity;
 invalid or censored outcomes do not enter fitting. Weight constraints are
 `0 ≤ wi ≤ 3`, `sum(w)=7`, regularized toward `[2,2,1,1,1]`. Each model is
 frozen before its OOS interval, and the optimizer cannot change the fixed
@@ -1069,6 +1081,12 @@ boundaries; Friday close, max holding, stop/target or final dataset end still
 closes them. This v2 fits direction-factor weights only; trigger-family
 coefficients are not fitted, and fixed trigger priority resolves equal-score
 ties.
+
+`--decision-latency` defaults to `0s` for backward-compatible research runs
+without delayed sidecars. For causal cluster/DOM experiments, pass the measured
+or explicitly conservative delay. Factors and trigger geometry stay frozen at
+`bar_close_time`; no M1 open at or before the resulting `decision_time` can
+fill.
 
 The report is a gross strategy diagnostic, not a broker-accurate PnL
 statement. LSE OHLCV does not contain historical Bid/Ask spread, FxPro

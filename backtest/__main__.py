@@ -261,6 +261,15 @@ def _build_parser() -> argparse.ArgumentParser:
         default="stop-first",
     )
     optimize_v2.add_argument("--entry-ttl", default="15min")
+    optimize_v2.add_argument(
+        "--decision-latency",
+        default="0s",
+        help=(
+            "nonnegative delay from canonical M15 close to the actionable "
+            "decision time; factors stay frozen at the close while sidecar "
+            "availability and fills use close+latency (for example 60s)"
+        ),
+    )
     optimize_v2.add_argument("--max-holding", default="30D")
     optimize_v2.add_argument("--train", required=True)
     optimize_v2.add_argument("--test", required=True)
@@ -841,6 +850,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
             f"state={event['state']}",
         ]
         for name in (
+            "arm",
             "symbol",
             "policy",
             "completed",
@@ -863,6 +873,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         cluster_proxy=cluster_proxy,
         quote_pressure=quote_pressure,
         cluster_candle_tolerance_ticks=candle_tolerance,
+        decision_latency=args.decision_latency,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
         progress=print_progress,
@@ -896,6 +907,26 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         f"net={metrics['net_r']:.3f}R "
         f"expectancy={metrics['expectancy_r']:.3f}R "
         f"PF={pf_text} maxDD={metrics['max_drawdown_r']:.3f}R"
+    )
+    baseline_metrics = result.summary[
+        "paired_fixed_weight_baseline"
+    ]["oos_primary_metrics"]
+    baseline_pf = baseline_metrics.get("profit_factor")
+    baseline_pf_text = (
+        "n/a" if baseline_pf is None else f"{baseline_pf:.3f}"
+    )
+    delta = result.summary["paired_comparison"][
+        "optimized_minus_baseline"
+    ]
+    print(
+        "  paired [2,2,1,1,1] baseline: "
+        f"setups={baseline_metrics['setups_closed']}/"
+        f"{baseline_metrics['setups_total']} "
+        f"net={baseline_metrics['net_r']:.3f}R "
+        f"expectancy={baseline_metrics['expectancy_r']:.3f}R "
+        f"PF={baseline_pf_text} "
+        f"maxDD={baseline_metrics['max_drawdown_r']:.3f}R; "
+        f"challenger delta={delta['net_r']:.3f}R"
     )
     print(
         "  FxPro Cluster Rejection sidecar: "

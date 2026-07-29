@@ -74,10 +74,15 @@ Non-negotiable implementation rules:
 - accept only complete, checksum-valid closed-M15 events with full PriceLevels,
   matching OHLC/tick size/symbol/provenance, and
   `available_at <= decision_time`;
-- a cluster publishes after its own M15 closes, so the event describing the
-  just-closed candle is normally not yet available at that decision. Callers
-  therefore use `FxProClusterEventDataset.event_asof_latest`, which walks back
-  at most `CLUSTER_MAX_STALE_BARS` (currently `1`) closed M15 slots. Every
+- distinguish the canonical completed candle time (`bar_close_time`) from the
+  actionable evaluation time (`decision_time = bar_close_time +
+  decision_latency`). Factor votes, trigger candles, and geometry freeze at
+  `bar_close_time`; sidecar availability, operational gates, TTL, and fills
+  use `decision_time`. Never expose candles that close during the latency;
+- a cluster publishes after its own M15 closes. It may be same-bar available
+  when its recorded `available_at <= decision_time`; otherwise callers use
+  `FxProClusterEventDataset.event_asof_latest`, which walks back at most
+  `CLUSTER_MAX_STALE_BARS` (currently `1`) closed M15 slots. Every
   candidate still passes the same strict `bar_close <= decision_time` and
   `available_at <= decision_time` gate; staleness never rewrites or infers
   availability. The detector matches an event against its own `bar_open`
@@ -252,12 +257,15 @@ must never enter the executed-trade Absorption path or live trading directly.
 
 Never weaken these rules:
 
-1. Evaluate the strategy only at a completed M15 decision candle.
-2. Supply only D/4H/1H/15M candles closed by that decision time, with the
-   configured live-parity history limit.
+1. Freeze strategy data only at a completed M15 `bar_close_time`. Apply the
+   explicit `decision_latency` only after the factor/trigger snapshot exists.
+2. Supply only D/4H/1H/15M candles closed by `bar_close_time`, with the
+   configured live-parity history limit. Candles closing during latency are
+   future information for that decision and must remain hidden.
 3. Do not call `Core._closed_bars_view` inside the offline runner; the snapshot
    view has already removed forming candles.
-4. A signal may fill only from a later M1 open within its entry range and TTL.
+4. A signal may fill only from an M1 open strictly after `decision_time`
+   (`bar_close_time + decision_latency`) and within its entry range and TTL.
 5. Use `stop-first` as the primary conservative label. `tp-first` is
    sensitivity analysis; never combine both policies as independent trades.
 6. There are exactly three targets at 1R/2R/3R with weights 50/30/20. TP1
@@ -416,6 +424,12 @@ A valid replacement-weight optimizer requires a new v2 research population:
 - every completed M15 decision in the union of outer train/test windows gets a
   stable decision event and frozen raw factor vector, including production
   `NEUTRAL`;
+- `--decision-latency` records a nonnegative delay shorter than 15 minutes.
+  `bar_close_time` remains the only factor/trigger data cutoff, while
+  `decision_time=bar_close_time+latency` controls sidecar availability, gates,
+  TTL, and fills. Use a measured forward latency where available; a chosen
+  conservative latency is an explicit research assumption, not measured
+  evidence;
 - each technically available detector is called separately for LONG and
   SHORT, independently of production trigger switches; Turtle is absent from
   the versioned trigger manifest;
@@ -458,6 +472,12 @@ A valid replacement-weight optimizer requires a new v2 research population:
 - the replay uses the existing simulator and operational gates, and every
   setup keeps fixed non-compounding risk
   `initial_capital * risk_fraction <= 1%`.
+- every FIT-fold OOS population is also scored with the untouched reference
+  weights `[2,2,1,1,1]`, zero intercept, and no hard threshold. Challenger and
+  paired baseline must have identical gate-eligible support and then pass
+  through the same chronological simulator, state gates, and fixed risk. This
+  pair isolates the weight change; it is not a separate production-policy
+  backtest.
 
 The v2 model optimizes the five direction-factor weights only. Trigger rows are
 preserved for attribution. Trigger-family coefficients are not fitted in this
@@ -468,8 +488,11 @@ The v2 command produces `decision_events.csv`,
 `technical_opportunities.csv`, `opportunity_labels.csv`,
 `trigger_attribution.csv`,
 `frozen_weight_models.json`, optimizer predictions/coefficients/metrics, OOS
-selections, and the chronological replay tables. All files must be covered by
-the report manifest. A run without a sealed Cluster Rejection sidecar must
+selections, and the chronological replay tables. It also produces
+`paired_fixed_weight_models.json` plus
+`baseline_predictions/oos_selections/executions/setups/legs/folds` artifacts.
+`summary.json` reports both arms and explicit challenger-minus-baseline deltas.
+All files must be covered by the report manifest. A run without a sealed Cluster Rejection sidecar must
 state Cluster Rejection `DATA_UNAVAILABLE`; a run without a sealed FxPro Quote
 Pressure sidecar must state Quote Pressure Rejection `DATA_UNAVAILABLE`.
 Neither missing optional feed is evidence for or against its trigger family.
