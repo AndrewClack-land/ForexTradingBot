@@ -436,6 +436,48 @@ def test_recorder_reloads_its_window_after_a_restart(tmp_path, frozen_now):
     assert len(revived._window) == 1
 
 
+def test_sidecar_with_many_symbols_and_bars_stays_hash_valid(
+    tmp_path, frozen_now
+):
+    """Regression: a single-event sidecar hides checksum-ordering bugs.
+
+    The dataset hashes checksums in (symbol, bar_open) event order. Any other
+    ordering in the publisher passes with one event and fails the moment a
+    second symbol or bar appears.
+    """
+
+    recorder = _recorder(tmp_path, _FakeMt5(_long_rejection_ticks()))
+    for symbol in ("EURUSD", "GBPUSD", "USDCAD"):
+        for bar in (BAR_OPEN - pd.Timedelta(minutes=15), BAR_OPEN):
+            result = aggregate_bid_tick_cluster(
+                symbol=symbol,
+                source_symbol=symbol,
+                ticks=[
+                    {
+                        "time_msc": tick["time_msc"]
+                        - (0 if bar == BAR_OPEN else 15 * 60_000),
+                        "bid": tick["bid"],
+                        "ask": tick["ask"],
+                    }
+                    for tick in _long_rejection_ticks()
+                ],
+                bar_open=bar,
+                tick_size=TICK_SIZE,
+                available_at=frozen_now,
+            )
+            assert result.ok, f"{symbol} {bar}: {result.reason}"
+            recorder._window[(symbol, str(result.event["bar_open"]))] = (
+                result.event
+            )
+
+    recorder._republish_sidecar()
+
+    dataset = FxProClusterEventDataset.load(tmp_path / "sidecar")
+    assert len(dataset.events) == 6
+    assert dataset.manifest["symbols"] == ["EURUSD", "GBPUSD", "USDCAD"]
+    assert dataset.event_asof("GBPUSD", BAR_OPEN, frozen_now) is not None
+
+
 def test_sidecar_publication_leaves_no_unsealed_jsonl(tmp_path, frozen_now):
     recorder = _recorder(tmp_path, _FakeMt5(_long_rejection_ticks()))
     recorder.poll_once()

@@ -807,7 +807,12 @@ class FxProTickClusterRecorder:
                 os.fsync(handle.fileno())
             os.replace(events_tmp, events_path)
 
-            checksums = sorted(str(event["checksum"]) for event in events)
+            # FxProClusterEventDataset hashes the checksums in (symbol,
+            # bar_open) event order, not in lexicographic checksum order.
+            # `events` is already sorted on exactly that key, so preserve it;
+            # re-sorting here silently breaks content_sha256 for every sidecar
+            # holding more than one event.
+            checksums = [str(event["checksum"]) for event in events]
             manifest = {
                 "schema": SIDECAR_SCHEMA,
                 "schema_version": SIDECAR_SCHEMA_VERSION,
