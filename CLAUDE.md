@@ -24,6 +24,8 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `backtest/weight_optimizer.py`
 - Active FxPro Cluster Rejection detector:
   `core/fxpro_cluster_rejection.py`
+- In-process forward cluster capture from MT5 bid ticks:
+  `core/fxpro_tick_cluster.py`
 - Immutable FxPro Cluster Rejection sidecar and diagnostic sealer:
   `backtest/fxpro_cluster_data.py`, CLI
   `tools/seal_quantower_cluster_proxy_sidecar.py`
@@ -52,6 +54,7 @@ procedures; this file defines the non-negotiable rules and research semantics.
   `tests/test_backtest_orderflow_inspect.py`,
   `tests/test_fxpro_quote_pressure_rejection.py`,
   `tests/test_fxpro_cluster_rejection.py`,
+  `tests/test_fxpro_tick_cluster.py`,
   `tests/test_backtest_strategy_runner.py`, and
   `tests/test_htf_context_fixes.py`.
 
@@ -61,13 +64,35 @@ Use the structured `factor_vector`.
 ## FxPro Cluster Rejection contract
 
 `fxpro_cluster_rejection_15m` is the current technical replacement for Turtle
-Soup. It is a broker-specific cluster proxy, not True Absorption. Quantower
-classifies FxPro ticks by TickDirection into reconstructed Buy/Sell values at
-PriceLevels; this does not prove exchange executions, aggressor side, order
-identity, or CME MBO. Preserve source `quantower_fxpro_tick_cluster`, venue
-`FxPro`, market type `otc_reconstructed_bidask_ticks`, data kind
-`tick_direction_cluster_proxy_no_execution_proof`, and classification
-`quantower_tickdirection_buy_sell`.
+Soup. It is a broker-specific cluster proxy, not True Absorption. The FxPro
+feed carries no exchange tape, so a reconstructed Buy/Sell value never proves
+an exchange execution, aggressor side, order identity, or CME MBO.
+
+Exactly two reconstructions are accepted, and each source fixes exactly one
+classification rule. `CLUSTER_SOURCE_CLASSIFICATION` in
+`core/fxpro_cluster_rejection.py` is the single authority for the pairing;
+`validate_cluster_event` refuses any other combination:
+
+| Source | Classification | Producer |
+| --- | --- | --- |
+| `quantower_fxpro_tick_cluster` | `quantower_tickdirection_buy_sell` | Quantower C# diagnostic export |
+| `mt5_fxpro_bidask_tick_cluster` | `mt5_bid_tickdirection_up_down` | in-process `core/fxpro_tick_cluster.py` |
+
+Preserve venue `FxPro`, market type `otc_reconstructed_bidask_ticks`, data kind
+`tick_direction_cluster_proxy_no_execution_proof`, `execution_proof=false`, and
+`aggressor_polarity_proven=false` for both. One sealed sidecar carries exactly
+one source: the manifest declares it and every event must match, so a Quantower
+export and an MT5 capture can never be blended behind a single provenance
+claim.
+
+The MT5 reconstruction exists because it removes the cross-venue candle
+identity defect. MT5 builds FX candles from bid quotes, so a cluster derived
+from the same terminal's bid ticks agrees with the execution candle by
+construction rather than by luck, and the production
+`candle_match_tolerance_ticks` of `2` is met without relaxation. Its `volume`
+is a **bid-tick count**, not traded volume; the measure is sealed into every
+event as `volume_measure=bid_tick_count_no_traded_volume` and must never be
+read, reported, or aggregated as lots.
 
 Non-negotiable implementation rules:
 
@@ -100,8 +125,28 @@ Non-negotiable implementation rules:
 - live detection must reject `research_assumption`. It may accept only
   forward-observed, finalized events whose publication time was recorded after
   collection; do not infer or rewrite `available_at`;
-- never synthesize the proxy from LSE OHLCV, candle volume, MT5 tick volume,
-  broker DOM, the Quote Pressure sidecar, or the archived Absorption sidecar;
+- never synthesize the proxy from LSE OHLCV, candle `tick_volume`, broker DOM,
+  the Quote Pressure sidecar, or the archived Absorption sidecar. The raw MT5
+  bid/ask tick stream is the one permitted reconstruction input, and only
+  through `core/fxpro_tick_cluster.py` under its own source constant;
+- the MT5 capture classifies strictly by bid tick direction against the
+  previous observed bid. A tick that leaves the bid unchanged stays
+  unclassified and still counts toward `volume`/`trades`, so
+  `classification_ratio` remains a real measurement instead of being inflated
+  to `1.0` by definition. Ticks before `bar_open` seed the direction reference
+  only and contribute no volume; ticks at or after `bar_close` are discarded;
+- `FXPRO_TICK_CLUSTER_CAPTURE_ENABLED` is independent of
+  `FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED`, exactly as DOM capture is
+  independent of Quote Pressure entries. Capture may run for weeks of forward
+  shadow collection while entries stay off;
+- the rolling live sidecar is published by replacing `events.jsonl` before
+  `manifest.json`, because the live reader keys its reload on the manifest
+  mtime and must never observe a manifest whose events are not yet on disk;
+- capture catch-up after an outage is bounded by
+  `FXPRO_TICK_CLUSTER_MAX_CATCHUP_BARS`. A backfilled bar keeps its truthful
+  late `available_at` and records `capture_lag_ms`, so it is auditable and
+  causally harmless but not usable for the decision at its own close. Never
+  backdate `available_at` to make old bars look prompt;
 - missing, late, incomplete, low-quality, mismatched, or tampered data is
   `DATA_UNAVAILABLE`; it falls through to later triggers and never blocks the
   entire market entry;
@@ -111,11 +156,23 @@ Non-negotiable implementation rules:
 - regenerate both LONG and SHORT plus every trigger inside every train window;
   production weights must never preselect the learning population.
 
-The current Quantower C# exporter is diagnostic-only: it exports a completed
-historical UTC day, but it does not yet publish forward-observed live events.
-The Python live reader is ready, but this does not authorize configuring
-`FXPRO_CLUSTER_LIVE_SIDECAR_DIR` or enabling entries until a reviewed
-forward writer/uploader exists.
+The Quantower C# exporter stays diagnostic-only: it exports a completed
+historical UTC day and never publishes forward-observed live events.
+
+`core/fxpro_tick_cluster.py` is the forward writer. It pulls each closed M15
+with `MetaTrader5.copy_ticks_range` from the terminal the bot already trades
+through, measures `available_at` as the instant it finished sealing the bar,
+and republishes a bounded rolling sidecar. Capture being available does not
+authorize entries: `FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED` stays off until a
+representative captured population, frozen OOS results, and reviewed forward
+shadow evidence exist.
+
+This path fixes live candle identity only. The research snapshot still holds
+LSE candles while a captured event holds FxPro candles, so historical
+`optimize-v2` runs against the sealed LSE snapshot remain subject to the
+cross-venue disagreement documented under "Causal backtest invariants".
+Trustworthy OOS evidence for this factor comes from the forward captured
+population, not from replaying the LSE snapshot.
 
 ## FxPro Quote Pressure Rejection contract
 

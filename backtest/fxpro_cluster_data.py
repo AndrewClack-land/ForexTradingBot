@@ -19,6 +19,7 @@ from core.fxpro_cluster_rejection import (
     CLUSTER_EVENT_SCHEMA_VERSION,
     CLUSTER_MARKET_TYPE,
     CLUSTER_SOURCE,
+    CLUSTER_SOURCE_CLASSIFICATION,
     CLUSTER_TIMEFRAME,
     CLUSTER_VENUE,
     canonical_hash,
@@ -186,11 +187,9 @@ class FxProClusterEventDataset:
             "schema_version": SIDECAR_SCHEMA_VERSION,
             "event_schema_version": CLUSTER_EVENT_SCHEMA_VERSION,
             "timeframe": CLUSTER_TIMEFRAME,
-            "source": CLUSTER_SOURCE,
             "venue": CLUSTER_VENUE,
             "market_type": CLUSTER_MARKET_TYPE,
             "data_kind": CLUSTER_DATA_KIND,
-            "classification": CLUSTER_CLASSIFICATION,
             "execution_proof": False,
             "aggressor_polarity_proven": False,
         }
@@ -201,6 +200,20 @@ class FxProClusterEventDataset:
                 raise ClusterDataValidationError(
                     f"manifest {field} does not match cluster-proxy contract"
                 )
+        # One sidecar carries exactly one reconstruction. Mixing a Quantower
+        # export with an MT5 bid-tick capture would blend two different
+        # classification rules behind a single provenance claim.
+        manifest_source = manifest.get("source")
+        if (
+            not isinstance(manifest_source, str)
+            or manifest_source not in CLUSTER_SOURCE_CLASSIFICATION
+            or manifest.get("classification")
+            != CLUSTER_SOURCE_CLASSIFICATION[manifest_source]
+        ):
+            raise ClusterDataValidationError(
+                "manifest source/classification pair is not an accepted "
+                "cluster-proxy reconstruction"
+            )
         if not isinstance(manifest.get("research_only"), bool):
             raise ClusterDataValidationError(
                 "manifest research_only must be boolean"
@@ -245,6 +258,12 @@ class FxProClusterEventDataset:
                 "sidecar contains JSONL files not sealed by the manifest"
             )
         ordered = _validate_unique(events)
+        sources = {str(event["source"]) for event in ordered}
+        if sources != {manifest_source}:
+            raise ClusterDataValidationError(
+                "sidecar events do not all carry the manifest source "
+                f"{manifest_source!r}"
+            )
         if len(ordered) != manifest.get("event_count"):
             raise ClusterDataValidationError("manifest event_count mismatch")
         if _content_hash(ordered) != manifest.get("content_sha256"):

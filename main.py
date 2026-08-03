@@ -63,6 +63,15 @@ from config import (
     FXPRO_DOM_MAX_LEVELS,
     FXPRO_DOM_HEARTBEAT_SEC,
     FXPRO_CLUSTER_LIVE_SIDECAR_DIR,
+    FXPRO_TICK_CLUSTER_CAPTURE_ENABLED,
+    FXPRO_TICK_CLUSTER_SYMBOLS,
+    FXPRO_TICK_CLUSTER_DATA_DIR,
+    FXPRO_TICK_CLUSTER_SIDECAR_DIR,
+    FXPRO_TICK_CLUSTER_RETENTION_DAYS,
+    FXPRO_TICK_CLUSTER_SETTLE_SEC,
+    FXPRO_TICK_CLUSTER_POLL_SEC,
+    FXPRO_TICK_CLUSTER_MAX_CATCHUP_BARS,
+    FXPRO_TICK_CLUSTER_ARCHIVE_RAW,
 )
 from core.mt5_guard import install as _install_mt5_guard
 
@@ -74,6 +83,10 @@ from backtest.fxpro_cluster_data import FxProClusterEventDataset
 from core.data_cache import DataCache
 from core.data_feed import DataFeed
 from core.fxpro_dom import FxProDomRecorder
+from core.fxpro_tick_cluster import (
+    FxProTickClusterRecorder,
+    TickClusterSymbol,
+)
 from core.market_scanner import MarketScanner
 from core.strategy_narrative import NarrativeStrategy, ActiveTrade
 from bot.telegram_bot import TelegramBot
@@ -262,6 +275,41 @@ class Core:
                 self.fxpro_dom_recorder = None
                 print(f"[FxPro DOM] capture unavailable: {exc}")
 
+        self.fxpro_tick_cluster_recorder: Optional[
+            FxProTickClusterRecorder
+        ] = None
+        if FXPRO_TICK_CLUSTER_CAPTURE_ENABLED:
+            try:
+                import MetaTrader5 as _mt5
+
+                capture_symbols = [
+                    TickClusterSymbol(
+                        symbol=symbol,
+                        source_symbol=self.universe.get(symbol, symbol),
+                    )
+                    for symbol in FXPRO_TICK_CLUSTER_SYMBOLS
+                ]
+                self.fxpro_tick_cluster_recorder = FxProTickClusterRecorder(
+                    mt5_module=_mt5,
+                    symbols=capture_symbols,
+                    output_dir=FXPRO_TICK_CLUSTER_DATA_DIR,
+                    sidecar_dir=FXPRO_TICK_CLUSTER_SIDECAR_DIR,
+                    retention_days=FXPRO_TICK_CLUSTER_RETENTION_DAYS,
+                    settle_seconds=FXPRO_TICK_CLUSTER_SETTLE_SEC,
+                    poll_seconds=FXPRO_TICK_CLUSTER_POLL_SEC,
+                    max_catchup_bars=FXPRO_TICK_CLUSTER_MAX_CATCHUP_BARS,
+                    archive_raw_ticks=FXPRO_TICK_CLUSTER_ARCHIVE_RAW,
+                )
+                self.fxpro_tick_cluster_recorder.start()
+                print(
+                    "[FxPro Cluster] MT5 bid-tick capture started -> "
+                    f"{FXPRO_TICK_CLUSTER_SIDECAR_DIR}; Cluster Rejection "
+                    "entry remains independently gated"
+                )
+            except Exception as exc:
+                self.fxpro_tick_cluster_recorder = None
+                print(f"[FxPro Cluster] tick capture unavailable: {exc}")
+
         self.fxpro_cluster_dataset: Optional[
             FxProClusterEventDataset
         ] = None
@@ -309,9 +357,13 @@ class Core:
         return self.fxpro_cluster_dataset
 
     def close(self) -> None:
-        recorder = getattr(self, "fxpro_dom_recorder", None)
-        if recorder is not None:
-            recorder.stop()
+        for attribute in (
+            "fxpro_dom_recorder",
+            "fxpro_tick_cluster_recorder",
+        ):
+            recorder = getattr(self, attribute, None)
+            if recorder is not None:
+                recorder.stop()
 
     def _try_create_executor(self) -> bool:
         """Create the MT5 executor. Safe to call repeatedly — used both at startup

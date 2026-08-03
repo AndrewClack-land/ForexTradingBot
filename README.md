@@ -933,19 +933,42 @@ does not call the signal True Absorption and never substitutes OHLCV or MT5 tick
 volume. WFO regenerates LONG and SHORT plus all trigger families inside every
 train window before fitting the five directional weights.
 
-Live support is intentionally incomplete: the Python consumer accepts only a
-sealed forward-observed sidecar configured through
-`FXPRO_CLUSTER_LIVE_SIDECAR_DIR`, but the current Quantower C# exporter writes
-historical daily diagnostics and is not yet a forward publisher/uploader.
-Therefore keep:
+#### Forward capture from MT5 bid ticks
+
+The Quantower C# exporter writes historical daily diagnostics only and is not a
+forward publisher. `core/fxpro_tick_cluster.py` is the forward writer: it pulls
+every closed M15 with `MetaTrader5.copy_ticks_range` from the terminal the bot
+already trades through, reconstructs the cluster from bid tick direction, and
+atomically republishes a bounded rolling sidecar.
+
+Because MT5 builds FX candles from bid quotes, a captured event and the
+execution candle come from one feed, so the strict production
+`candle_match_tolerance_ticks=2` is met without any research relaxation. The
+capture seals `source=mt5_fxpro_bidask_tick_cluster` with
+`classification=mt5_bid_tickdirection_up_down`; its `volume` is a bid-tick
+count, sealed as `volume_measure=bid_tick_count_no_traded_volume`, and is never
+traded volume.
+
+Enable capture, and point the live consumer at it, with:
+
+```dotenv
+FXPRO_TICK_CLUSTER_CAPTURE_ENABLED=1
+FXPRO_TICK_CLUSTER_SYMBOLS=EURUSD,GBPUSD,USDCAD
+FXPRO_CLUSTER_LIVE_SIDECAR_DIR=/home/ubuntu/forexbot/ai_data/fxpro_tick_cluster/sidecar
+```
+
+Capture is independent of entries, exactly as DOM capture is independent of
+Quote Pressure. Keep:
 
 ```dotenv
 FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED=0
 FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION=0
 ```
 
-until a forward writer, representative capture, frozen OOS run, and shadow
-review are complete.
+until a representative captured population, a frozen OOS run, and a shadow
+review are complete. Note that this path repairs live candle identity only: the
+research snapshot still holds LSE candles, so historical replays stay subject
+to the documented cross-venue disagreement.
 
 ### FxPro Quote Pressure Rejection 15M (separate broker-DOM challenger)
 

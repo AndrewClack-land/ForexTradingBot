@@ -18,6 +18,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Any, Literal, Mapping, Optional, Sequence
 
 import pandas as pd
@@ -25,11 +26,33 @@ import pandas as pd
 
 CLUSTER_EVENT_SCHEMA_VERSION = 1
 CLUSTER_TIMEFRAME = "15m"
-CLUSTER_SOURCE = "quantower_fxpro_tick_cluster"
+
+#: Quantower reconstructs FxPro Bid/Ask ticks into PriceLevels off-terminal.
+CLUSTER_SOURCE_QUANTOWER = "quantower_fxpro_tick_cluster"
+#: The bot reconstructs the same broker feed in-process from MT5 bid ticks.
+CLUSTER_SOURCE_MT5_BIDASK = "mt5_fxpro_bidask_tick_cluster"
+#: Backwards-compatible default for the originally sealed Quantower sidecars.
+CLUSTER_SOURCE = CLUSTER_SOURCE_QUANTOWER
+
+CLUSTER_CLASSIFICATION_QUANTOWER = "quantower_tickdirection_buy_sell"
+CLUSTER_CLASSIFICATION_MT5_BIDASK = "mt5_bid_tickdirection_up_down"
+CLUSTER_CLASSIFICATION = CLUSTER_CLASSIFICATION_QUANTOWER
+
+#: A cluster source fixes exactly one classification rule.  The pair is
+#: validated together so a sidecar can never advertise one reconstruction
+#: while carrying another.  Both entries stay broker-reconstructed proxies:
+#: neither proves an execution or an aggressor.
+CLUSTER_SOURCE_CLASSIFICATION: Mapping[str, str] = MappingProxyType(
+    {
+        CLUSTER_SOURCE_QUANTOWER: CLUSTER_CLASSIFICATION_QUANTOWER,
+        CLUSTER_SOURCE_MT5_BIDASK: CLUSTER_CLASSIFICATION_MT5_BIDASK,
+    }
+)
+CLUSTER_SOURCES = frozenset(CLUSTER_SOURCE_CLASSIFICATION)
+
 CLUSTER_VENUE = "FxPro"
 CLUSTER_MARKET_TYPE = "otc_reconstructed_bidask_ticks"
 CLUSTER_DATA_KIND = "tick_direction_cluster_proxy_no_execution_proof"
-CLUSTER_CLASSIFICATION = "quantower_tickdirection_buy_sell"
 CLUSTER_AVAILABILITY_MODES = frozenset(
     {"forward_observed", "research_assumption"}
 )
@@ -252,11 +275,9 @@ def validate_cluster_event(event: Any) -> Optional[dict[str, Any]]:
     expected = {
         "schema_version": CLUSTER_EVENT_SCHEMA_VERSION,
         "timeframe": CLUSTER_TIMEFRAME,
-        "source": CLUSTER_SOURCE,
         "venue": CLUSTER_VENUE,
         "market_type": CLUSTER_MARKET_TYPE,
         "data_kind": CLUSTER_DATA_KIND,
-        "classification": CLUSTER_CLASSIFICATION,
         "execution_proof": False,
         "aggressor_polarity_proven": False,
         "finalized": True,
@@ -264,6 +285,16 @@ def validate_cluster_event(event: Any) -> Optional[dict[str, Any]]:
     for field, value in expected.items():
         if raw.get(field) != value:
             return None
+    # The reconstruction rule is not free-form: each accepted source declares
+    # exactly one classification, so a Quantower sidecar can never claim the
+    # MT5 bid-tick rule and vice versa.
+    source = raw.get("source")
+    if (
+        not isinstance(source, str)
+        or source not in CLUSTER_SOURCE_CLASSIFICATION
+        or raw.get("classification") != CLUSTER_SOURCE_CLASSIFICATION[source]
+    ):
+        return None
 
     symbol = str(raw.get("symbol") or "").strip().upper()
     if not re.fullmatch(r"[A-Z0-9._-]{3,32}", symbol):
@@ -538,10 +569,16 @@ def detect_fxpro_cluster_rejection(
 __all__ = [
     "CLUSTER_AVAILABILITY_MODES",
     "CLUSTER_CLASSIFICATION",
+    "CLUSTER_CLASSIFICATION_MT5_BIDASK",
+    "CLUSTER_CLASSIFICATION_QUANTOWER",
     "CLUSTER_DATA_KIND",
     "CLUSTER_EVENT_SCHEMA_VERSION",
     "CLUSTER_MARKET_TYPE",
     "CLUSTER_SOURCE",
+    "CLUSTER_SOURCES",
+    "CLUSTER_SOURCE_CLASSIFICATION",
+    "CLUSTER_SOURCE_MT5_BIDASK",
+    "CLUSTER_SOURCE_QUANTOWER",
     "CLUSTER_TIMEFRAME",
     "CLUSTER_VENUE",
     "ClusterRejectionSignal",

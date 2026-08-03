@@ -179,6 +179,50 @@ FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS = (
 if FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS is None:
     FXPRO_CLUSTER_CANDLE_TOLERANCE_TICKS = 2
 
+# In-process forward capture of the FxPro cluster proxy from MT5 bid ticks.
+# Capture is deliberately independent of
+# FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED: it may run for weeks of shadow
+# collection while entries stay disabled. Point
+# FXPRO_CLUSTER_LIVE_SIDECAR_DIR at FXPRO_TICK_CLUSTER_SIDECAR_DIR only after
+# the captured population has been reviewed.
+FXPRO_TICK_CLUSTER_CAPTURE_ENABLED = os.getenv(
+    "FXPRO_TICK_CLUSTER_CAPTURE_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+FXPRO_TICK_CLUSTER_SYMBOLS = [
+    item.strip().upper()
+    for item in os.getenv(
+        "FXPRO_TICK_CLUSTER_SYMBOLS", "EURUSD,GBPUSD,USDCAD"
+    ).split(",")
+    if item.strip()
+]
+FXPRO_TICK_CLUSTER_DATA_DIR = Path(
+    os.getenv("FXPRO_TICK_CLUSTER_DATA_DIR", "").strip()
+    or str(AI_DATA_DIR / "fxpro_tick_cluster")
+)
+_FXPRO_TICK_CLUSTER_SIDECAR_DIR = os.getenv(
+    "FXPRO_TICK_CLUSTER_SIDECAR_DIR", ""
+).strip()
+FXPRO_TICK_CLUSTER_SIDECAR_DIR = (
+    Path(_FXPRO_TICK_CLUSTER_SIDECAR_DIR)
+    if _FXPRO_TICK_CLUSTER_SIDECAR_DIR
+    else FXPRO_TICK_CLUSTER_DATA_DIR / "sidecar"
+)
+FXPRO_TICK_CLUSTER_RETENTION_DAYS = (
+    _env_int("FXPRO_TICK_CLUSTER_RETENTION_DAYS") or 2
+)
+FXPRO_TICK_CLUSTER_SETTLE_SEC = _env_float(
+    "FXPRO_TICK_CLUSTER_SETTLE_SEC", 2.0
+)
+FXPRO_TICK_CLUSTER_POLL_SEC = _env_float(
+    "FXPRO_TICK_CLUSTER_POLL_SEC", 20.0
+)
+FXPRO_TICK_CLUSTER_MAX_CATCHUP_BARS = (
+    _env_int("FXPRO_TICK_CLUSTER_MAX_CATCHUP_BARS") or 4
+)
+FXPRO_TICK_CLUSTER_ARCHIVE_RAW = os.getenv(
+    "FXPRO_TICK_CLUSTER_ARCHIVE_RAW", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+
 # FxPro Quote Pressure Rejection is opt-in. DOM capture may run while
 # entries stay disabled until the broker-specific history passes causal WFO.
 FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = os.getenv(
