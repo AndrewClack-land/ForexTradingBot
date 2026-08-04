@@ -238,7 +238,7 @@ class NarrativeStrategy:
       1) Narrative / BIAS: H1 Premium/Discount, 4H/15M fractal
          breakouts, 1H Order/Rejection Blocks
       2) Bias strictness: 1H FVG regime
-      3) SETUP: 15M Rejection Block
+      3) SETUP: completed H1 Rejection Block (RB M15 is retired)
       4) FALLBACK: FxPro/Quantower Cluster Rejection proxy on 15M
       5) FALLBACK2: FxPro Quote Pressure Rejection on 15M
       6) FALLBACK3: H1 Pivots levels + 15M reclaim

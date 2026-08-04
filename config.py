@@ -114,8 +114,10 @@ ORDERBLOCK_ENTRY_ENABLED = os.getenv("ORDERBLOCK_ENTRY", "1").strip().lower() in
 # RB M15 is retired. Keep the legacy symbol hard-false so stale environments
 # cannot put it back into live entry arbitration.
 REJECTION_BLOCK_ENTRY_ENABLED = False
+# RB H1 is the primary live rejection-block trigger. Keep the environment
+# switch as an emergency rollback, but enable it by default for new releases.
 REJECTION_BLOCK_H1_ENTRY_ENABLED = os.getenv(
-    "REJECTION_BLOCK_H1_ENTRY_ENABLED", "0"
+    "REJECTION_BLOCK_H1_ENTRY_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
 FXPRO_DOM_CAPTURE_ENABLED = os.getenv(
     "FXPRO_DOM_CAPTURE_ENABLED", "0"

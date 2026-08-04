@@ -167,6 +167,10 @@ class Core:
         self.data_cache = DataCache(self.feed)
         self.data_cache.start()
         self.strategy = NarrativeStrategy()
+        print(
+            "[RB] M15 entry hard-disabled; H1 entry "
+            f"{'enabled' if self.strategy.rejection_block_h1_entry_enabled else 'disabled'}"
+        )
         self.scanner = MarketScanner(self.universe)
 
         self.session_tz = ZoneInfo(SESSION_TIMEZONE)
