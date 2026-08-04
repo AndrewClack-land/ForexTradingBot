@@ -26,8 +26,8 @@ except Exception:
     _cfg = None
 
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
-REJECTION_BLOCK_ENTRY_ENABLED = bool(
-    getattr(_cfg, "REJECTION_BLOCK_ENTRY_ENABLED", False)
+REJECTION_BLOCK_H1_ENTRY_ENABLED = bool(
+    getattr(_cfg, "REJECTION_BLOCK_H1_ENTRY_ENABLED", False)
 )
 FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = bool(
     getattr(_cfg, "FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED", False)
@@ -252,7 +252,12 @@ class NarrativeStrategy:
     def __init__(self):
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
-        self.rejection_block_entry_enabled = REJECTION_BLOCK_ENTRY_ENABLED
+        # RB M15 is retired and cannot be re-enabled by legacy configuration.
+        # The attribute remains as an explicit compatibility/audit marker.
+        self.rejection_block_entry_enabled = False
+        self.rejection_block_h1_entry_enabled = (
+            REJECTION_BLOCK_H1_ENTRY_ENABLED
+        )
         self.cluster_rejection_15m_entry_enabled = (
             FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED
         )
@@ -715,7 +720,51 @@ class NarrativeStrategy:
     def _lower_wick_size(cls, low: float, open_: float, close_: float) -> float:
         return float(cls._body_bottom(open_, close_) - low)
 
-    def trigger_15m_rejection_block(self, df_15m: pd.DataFrame, side: Side) -> Optional[CandidateEntry]:
+    def trigger_15m_rejection_block(
+        self,
+        df_15m: pd.DataFrame,
+        side: Side,
+    ) -> Optional[CandidateEntry]:
+        """Research-only detector retained for historical RB M15 comparison."""
+        entry = self._trigger_rejection_block(df_15m, side, timeframe="15M")
+        return self._tag_rejection_block_event(entry, df_15m, side, "15M")
+
+    def trigger_h1_rejection_block(
+        self,
+        df_1h: pd.DataFrame,
+        side: Side,
+    ) -> Optional[CandidateEntry]:
+        """Detect a completed H1 rejection-block confirmation."""
+        entry = self._trigger_rejection_block(df_1h, side, timeframe="1H")
+        return self._tag_rejection_block_event(entry, df_1h, side, "1H")
+
+    @staticmethod
+    def _tag_rejection_block_event(
+        entry: Optional[CandidateEntry],
+        frame: pd.DataFrame,
+        side: Side,
+        timeframe: str,
+    ) -> Optional[CandidateEntry]:
+        if entry is None:
+            return None
+        pivot_index = frame.index[-2] if len(frame) >= 2 else "unknown"
+        event_id = f"rb:{timeframe.lower()}:{side.lower()}:{pivot_index}"
+        return replace(
+            entry,
+            trigger_event_id=event_id,
+            trigger_meta={
+                "setup_timeframe": timeframe,
+                "pivot_index": str(pivot_index),
+            },
+        )
+
+    def _trigger_rejection_block(
+        self,
+        df_15m: pd.DataFrame,
+        side: Side,
+        *,
+        timeframe: str,
+    ) -> Optional[CandidateEntry]:
         if df_15m is None or df_15m.empty:
             return None
 
@@ -813,10 +862,11 @@ class NarrativeStrategy:
             return CandidateEntry(
                 side="SHORT",
                 entry_price=float(cl0),
-                tf="15M",
-                reason=f"RejectionBlock 15M BEAR | intrusion={intrusion_pct:.1f}% (min={float(self.rb_min_wick_intrusion_pct):.1f}%) | rule={rule}",
+                tf=timeframe,
+                reason=f"RejectionBlock {timeframe} BEAR | intrusion={intrusion_pct:.1f}% (min={float(self.rb_min_wick_intrusion_pct):.1f}%) | rule={rule}",
                 zone_low=float(body_top_1),
                 zone_high=float(h1),
+                trigger_kind=f"rejection_block_{timeframe.lower()}",
             )
 
         # ---- BULLISH RB ----
@@ -863,10 +913,11 @@ class NarrativeStrategy:
             return CandidateEntry(
                 side="LONG",
                 entry_price=float(cl0),
-                tf="15M",
-                reason=f"RejectionBlock 15M BULL | intrusion={intrusion_pct2:.1f}% (min={float(self.rb_min_wick_intrusion_pct):.1f}%) | rule={rule}",
+                tf=timeframe,
+                reason=f"RejectionBlock {timeframe} BULL | intrusion={intrusion_pct2:.1f}% (min={float(self.rb_min_wick_intrusion_pct):.1f}%) | rule={rule}",
                 zone_low=float(l1),
                 zone_high=float(body_bot_1),
+                trigger_kind=f"rejection_block_{timeframe.lower()}",
             )
 
         return None
@@ -1409,8 +1460,8 @@ class NarrativeStrategy:
         fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
 
         entry = (
-            self.trigger_15m_rejection_block(df_15M, side_bias)
-            if self.rejection_block_entry_enabled
+            self.trigger_h1_rejection_block(df_1H, side_bias)
+            if self.rejection_block_h1_entry_enabled
             else None
         )
         if entry is None:
@@ -1492,7 +1543,7 @@ class NarrativeStrategy:
 
             # IMPORTANT: show what timeframe we localized on
             "tf": "15M",
-            "setup_tf": "15M",
+            "setup_tf": entry.tf,
 
             "narrative": narrative_text,
             "factor_vector": factor_vector,

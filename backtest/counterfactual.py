@@ -67,9 +67,10 @@ from .weight_optimizer import (
 )
 
 
-COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v2"
+COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v3"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
+    "rejection_block_1h",
     "fxpro_cluster_rejection_15m",
     "fxpro_quote_pressure_rejection_15m",
     "h1_pivot_reclaim_15m",
@@ -703,7 +704,7 @@ def _materialize_entry(
         "tp_prices": [round(float(value), 6) for value in targets],
         "risk_percent": f"{float(strategy.risk_per_trade) * 100:.2f}%",
         "tf": "15M",
-        "setup_tf": "15M",
+        "setup_tf": str(getattr(entry, "tf", "15M")),
         "narrative": narrative,
         "factor_vector": dict(factor_vector),
         "vc": fvg_text,
@@ -746,6 +747,11 @@ def _detect_entries(
         entry = strategy.trigger_15m_rejection_block(df_15m, side)
         if entry is not None:
             detected.append(("rejection_block_15m", entry))
+
+        h1_detector = getattr(strategy, "trigger_h1_rejection_block", None)
+        entry = h1_detector(df_1h, side) if callable(h1_detector) else None
+        if entry is not None:
+            detected.append(("rejection_block_1h", entry))
 
         entry = strategy.trigger_15m_cluster_rejection(
             df_15m,
@@ -848,6 +854,7 @@ def _generate_symbol_universe(
         strategy.quote_pressure_rejection_15m_entry_enabled = True
     decisions: list[dict[str, Any]] = []
     opportunities: list[_Opportunity] = []
+    seen_trigger_events: set[tuple[str, str]] = set()
     counters: Counter[str] = Counter()
     next_progress = 0
 
@@ -963,6 +970,15 @@ def _generate_symbol_universe(
         ] += 1
 
         for trigger_kind, entry in detected:
+            trigger_event_id = str(
+                getattr(entry, "trigger_event_id", "") or ""
+            )
+            event_identity = (trigger_kind, trigger_event_id)
+            if trigger_event_id and event_identity in seen_trigger_events:
+                counters[f"duplicate_event_{trigger_kind}"] += 1
+                continue
+            if trigger_event_id:
+                seen_trigger_events.add(event_identity)
             signal = _materialize_entry(
                 strategy=strategy,
                 entry=entry,
@@ -994,6 +1010,12 @@ def _generate_symbol_universe(
                 reason = (
                     "rejection_block_15m is included in counterfactual "
                     "training but disabled for OOS execution"
+                )
+            elif trigger_kind == "rejection_block_1h":
+                gate = "BLOCK_TRIGGER_DISABLED"
+                reason = (
+                    "rejection_block_1h is included for paired attribution "
+                    "but disabled for OOS execution until its gate is passed"
                 )
             elif (
                 trigger_kind == "order_block_1h"

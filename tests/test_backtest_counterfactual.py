@@ -127,6 +127,12 @@ class _AllSideAllTriggerStrategy:
         type(self).calls[("rejection_block_15m", side)] += 1
         return self._entry(side, "rejection_block_15m", 0.00)
 
+    def trigger_h1_rejection_block(self, _, side):
+        type(self).calls[("rejection_block_1h", side)] += 1
+        entry = self._entry(side, "rejection_block_1h", 0.00)
+        entry.tf = "1H"
+        return entry
+
     def trigger_15m_cluster_rejection(self, _, side, event, *, symbol):
         assert event is None
         assert symbol == "EURUSD"

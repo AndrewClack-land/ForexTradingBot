@@ -111,8 +111,11 @@ SYMBOL_DECIMALS = {
 
 # ================== ORDERBLOCK / FXPRO LIQUIDITY SETTINGS ==================
 ORDERBLOCK_ENTRY_ENABLED = os.getenv("ORDERBLOCK_ENTRY", "1").strip().lower() in {"1", "true", "yes", "on"}
-REJECTION_BLOCK_ENTRY_ENABLED = os.getenv(
-    "REJECTION_BLOCK_ENTRY_ENABLED", "0"
+# RB M15 is retired. Keep the legacy symbol hard-false so stale environments
+# cannot put it back into live entry arbitration.
+REJECTION_BLOCK_ENTRY_ENABLED = False
+REJECTION_BLOCK_H1_ENTRY_ENABLED = os.getenv(
+    "REJECTION_BLOCK_H1_ENTRY_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
 FXPRO_DOM_CAPTURE_ENABLED = os.getenv(
     "FXPRO_DOM_CAPTURE_ENABLED", "0"

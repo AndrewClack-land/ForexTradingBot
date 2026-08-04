@@ -1092,6 +1092,7 @@ def _default_strategy_factory() -> Any:
             shim = types.ModuleType("config")
             shim.ORDERBLOCK_ENTRY_ENABLED = True
             shim.REJECTION_BLOCK_ENTRY_ENABLED = False
+            shim.REJECTION_BLOCK_H1_ENTRY_ENABLED = False
             shim.FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = False
             shim.FXPRO_CLUSTER_ALLOW_RESEARCH_ASSUMPTION = False
             shim.FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED = False
@@ -1549,6 +1550,7 @@ def _trigger_kind(signal: Mapping[str, Any]) -> str:
     structured = str(signal.get("trigger_kind") or "").strip().lower()
     if structured in {
         "rejection_block_15m",
+        "rejection_block_1h",
         "absorption_15m",
         "fxpro_cluster_rejection_15m",
         "fxpro_quote_pressure_rejection_15m",
@@ -1560,6 +1562,8 @@ def _trigger_kind(signal: Mapping[str, Any]) -> str:
     reason = str(signal.get("trigger_reason") or "").strip().lower()
     if reason.startswith("rejectionblock 15m"):
         return "rejection_block_15m"
+    if reason.startswith(("rejectionblock 1h", "rejectionblock h1")):
+        return "rejection_block_1h"
     if reason.startswith("absorption 15m"):
         return "absorption_15m"
     if reason.startswith("fxpro cluster rejection 15m"):
