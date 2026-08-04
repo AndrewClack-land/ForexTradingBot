@@ -54,6 +54,7 @@ from config import (
     VOL_REGIME_MAX_R,
     EM_TP_MAX_RATIO,
     VOL_REGIME_REFRESH_MIN,
+    SHADOW_SCORE_MODEL_PATH,
     POSITION_ADDING_ENABLED,
     IDEA_MAX_ENTRIES,
     FXPRO_DOM_CAPTURE_ENABLED,
@@ -88,6 +89,7 @@ from core.fxpro_tick_cluster import (
     TickClusterSymbol,
 )
 from core.market_scanner import MarketScanner
+from core.shadow_score import LiveShadowScorer, tp1_em_ratio
 from core.strategy_narrative import NarrativeStrategy, ActiveTrade
 from bot.telegram_bot import TelegramBot
 from core.m1.config import AIConfig
@@ -309,6 +311,21 @@ class Core:
             except Exception as exc:
                 self.fxpro_tick_cluster_recorder = None
                 print(f"[FxPro Cluster] tick capture unavailable: {exc}")
+
+        # Diagnostic only. A frozen WFO shadow model annotates live ENTER
+        # signals with a predicted expected R; it never gates or resizes them.
+        self.shadow_scorer = LiveShadowScorer.load(SHADOW_SCORE_MODEL_PATH)
+        if self.shadow_scorer is not None:
+            print(
+                "[Shadow] diagnostic model loaded: "
+                f"id={self.shadow_scorer.model_id} "
+                f"fold={self.shadow_scorer.fold_index} (non-executing)"
+            )
+        elif SHADOW_SCORE_MODEL_PATH is not None:
+            print(
+                "[Shadow] no fitted model at "
+                f"{SHADOW_SCORE_MODEL_PATH} — annotation disabled"
+            )
 
         self.fxpro_cluster_dataset: Optional[
             FxProClusterEventDataset
@@ -1620,6 +1637,12 @@ class Core:
             tp_prices = [float(x) for x in tp_prices if x is not None]
         except (TypeError, ValueError):
             tp_prices = []
+        # Same definition as the offline ``vol_tp1_em_ratio`` so a live signal
+        # and a fitted row describe the feature identically. Journalling only.
+        ratio = tp1_em_ratio(sig.get("entry_price"), tp_prices, ctx.em_1d)
+        if ratio is not None:
+            sig["vol_tp1_em_ratio"] = ratio
+
         ok, reason = entry_gate(
             ctx,
             sig.get("entry_price"),
@@ -1633,6 +1656,37 @@ class Core:
         sig["info"] = reason
         print(f"[VolRegime] {symbol} entry blocked: {reason}")
         return sig
+
+    def _attach_shadow_score(
+        self, symbol: str, sig: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """Annotate an ENTER signal with the frozen shadow model's expected R.
+
+        Diagnostic only. Only ``shadow_*`` keys are ever written, so this can
+        not reach direction, entry, stop, targets, disposition, or risk even if
+        the model file changes. Any failure is swallowed: a broken annotation
+        must never stop a trade.
+        """
+        scorer = getattr(self, "shadow_scorer", None)
+        if scorer is None:
+            return sig
+        if not isinstance(sig, dict) or sig.get("signal") != "ENTER":
+            return sig
+        try:
+            annotation = scorer.score(sig, symbol=symbol)
+        except Exception as exc:
+            print(f"[Shadow] {symbol} scoring failed: {exc}")
+            return sig
+        safe = {
+            key: value
+            for key, value in (annotation or {}).items()
+            if str(key).startswith("shadow_")
+        }
+        if not safe:
+            return sig
+        annotated = dict(sig)
+        annotated.update(safe)
+        return annotated
 
     def _try_position_add(
         self,
@@ -1676,6 +1730,7 @@ class Core:
         sig = self._apply_global_filters(symbol, sig)
         sig = self._apply_session_filter(symbol, sig)
         sig = self._apply_vol_regime_filter(symbol, sig, strategy_data)
+        sig = self._attach_shadow_score(symbol, sig)
         if sig.get("signal") != "ENTER" or not sig.get("side"):
             return None
         # An add-on must open as broker-managed split legs like the entries it
@@ -2545,6 +2600,7 @@ class Core:
                 sig = self._apply_global_filters(symbol, sig)
                 sig = self._apply_session_filter(symbol, sig)
                 sig = self._apply_vol_regime_filter(symbol, sig, strategy_data)
+                sig = self._attach_shadow_score(symbol, sig)
 
                 if sig.get("signal") == "ENTER":
                     side = sig.get("side")

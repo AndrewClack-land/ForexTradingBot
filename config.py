@@ -265,6 +265,19 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
+# ================== SHADOW SCORE (DIAGNOSTIC ONLY) ==================
+# Path to a frozen ``shadow_models.json`` produced by an offline WFO run. When
+# set, the newest fitted fold is replayed against live ENTER signals and its
+# predicted expected R is journalled beside the trade.
+#
+# The shadow score must remain non-executing: it never rejects an entry, never
+# changes direction, entry, stop, targets, disposition, setup count, or risk.
+# Leave unset to disable the annotation entirely.
+_SHADOW_SCORE_MODEL_PATH = os.getenv("SHADOW_SCORE_MODEL_PATH", "").strip()
+SHADOW_SCORE_MODEL_PATH = (
+    Path(_SHADOW_SCORE_MODEL_PATH) if _SHADOW_SCORE_MODEL_PATH else None
+)
+
 # ================== ENTRY FREQUENCY / RISK BRAKES ==================
 # Cooldown (minutes) per symbol after a position is closed by stop-loss.
 # Blocks the 2-3 minute revenge re-entries seen on 2026-07-10.

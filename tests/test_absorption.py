@@ -12,7 +12,10 @@ from core.absorption import (
     AbsorptionThresholds,
     detect_footprint_absorption,
 )
-from core.strategy_narrative import NarrativeStrategy
+from core.strategy_narrative import (
+    FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED,
+    NarrativeStrategy,
+)
 
 
 OPEN_TIME = pd.Timestamp("2026-07-25T10:00:00Z")
@@ -342,7 +345,16 @@ def test_absorption_remains_archived_outside_production_strategy():
 
     assert not hasattr(strategy, "absorption_15m_entry_enabled")
     assert not hasattr(strategy, "trigger_15m_absorption")
-    assert strategy.quote_pressure_rejection_15m_entry_enabled is False
+
+    # Quote Pressure is a separate broker-DOM challenger, never an Absorption
+    # alias or fallback. Whether its entries are live is an operator decision,
+    # so pin the wiring — the flag is its own and nothing else drives it —
+    # instead of asserting the ambient deployment's value.
+    assert (
+        strategy.quote_pressure_rejection_15m_entry_enabled
+        is FXPRO_QUOTE_PRESSURE_REJECTION_ENTRY_ENABLED
+    )
+    assert not hasattr(strategy, "absorption_event_dataset")
 
 
 def test_checksum_must_match_normalized_event_content():
