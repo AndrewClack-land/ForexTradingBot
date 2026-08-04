@@ -127,6 +127,22 @@ class LiveShadowScorer:
         self.ratio_mean = float(ratio_mean)
         self.ratio_scale = float(ratio_scale)
         self.source_path = source_path
+        # ``_feature_names`` emits one ``trigger:`` column per family except the
+        # first, which stays the dropped reference level. Reconstruct the
+        # vocabulary this model was actually fitted with from its own columns
+        # plus that baseline, rather than trusting the current ``_TRIGGERS``:
+        # the two already differ, because models fitted before Absorption was
+        # archived carry a different column set.
+        trigger_columns = {
+            name.split(":", 1)[1]
+            for name in self.feature_names
+            if name.startswith("trigger:")
+        }
+        self.trigger_vocab = (
+            frozenset(trigger_columns | {_TRIGGERS[0]})
+            if trigger_columns
+            else frozenset(_TRIGGERS)
+        )
 
     @classmethod
     def load(cls, path: Optional[Path]) -> Optional["LiveShadowScorer"]:
@@ -237,17 +253,16 @@ class LiveShadowScorer:
         if not np.isfinite(predicted):
             return {}
 
-        # ``_TRIGGERS`` is the vocabulary the model was fitted with, including
-        # its dropped baseline level.  It predates the FxPro proxies, so a live
+        # Every fitted vocabulary so far predates the FxPro proxies, so a live
         # cluster or quote-pressure entry has no representation at all and is
-        # scored as the baseline trigger.  Flag that rather than let the number
-        # read as if the family had been learned.
+        # scored as the baseline trigger family. Flag that rather than let the
+        # number read as if the family had been learned.
         return {
             "shadow_score": round(predicted, 4),
             "shadow_model_id": self.model_id,
             "shadow_fold_index": self.fold_index,
             "shadow_trigger_kind": trigger_kind,
-            "shadow_trigger_in_vocab": bool(trigger_kind in _TRIGGERS),
+            "shadow_trigger_in_vocab": bool(trigger_kind in self.trigger_vocab),
             "shadow_executing": False,
         }
 

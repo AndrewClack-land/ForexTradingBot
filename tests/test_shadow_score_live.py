@@ -193,6 +193,36 @@ def test_fxpro_triggers_are_flagged_out_of_vocabulary(tmp_path):
     assert order_block["shadow_trigger_in_vocab"] is True
 
 
+def test_vocabulary_follows_the_model_not_the_current_code(tmp_path):
+    """A model fitted before Absorption was archived has no column for it.
+
+    Mirrors the real fx-wfo-factor-2020-2026 model, whose trigger columns are
+    order_block_1h / rejection_block_15m / turtle_soup_15m / unknown.
+    """
+
+    path, names, model = _write_models(tmp_path)
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    kept = [name for name in names if name != "trigger:absorption_15m"]
+    payload["models"][0]["feature_names"] = kept
+    payload["models"][0]["coefficients"] = {
+        name: model["coefficients"][name] for name in kept
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    scorer = LiveShadowScorer.load(path)
+    assert scorer is not None
+
+    archived = scorer.score(
+        _signal(trigger_reason="Absorption 15M something"),
+        symbol="EURUSD",
+    )
+    assert archived["shadow_trigger_kind"] == "absorption_15m"
+    assert archived["shadow_trigger_in_vocab"] is False
+
+    # The families this model really was fitted on stay in vocabulary.
+    assert scorer.score(_signal(), symbol="EURUSD")["shadow_trigger_in_vocab"] is True
+
+
 def test_baseline_trigger_level_counts_as_in_vocabulary(tmp_path):
     """The dropped reference level has no column but was still trained on."""
 
