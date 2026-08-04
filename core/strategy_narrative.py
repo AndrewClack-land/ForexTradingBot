@@ -737,6 +737,14 @@ class NarrativeStrategy:
         """Detect a completed H1 rejection-block confirmation."""
         entry = self._trigger_rejection_block(df_1h, side, timeframe="1H")
         return self._tag_rejection_block_event(entry, df_1h, side, "1H")
+    def trigger_h4_rejection_block(
+        self,
+        df_4h: pd.DataFrame,
+        side: Side,
+    ) -> Optional[CandidateEntry]:
+        """Research-only detector for a completed H4 rejection block."""
+        entry = self._trigger_rejection_block(df_4h, side, timeframe="4H")
+        return self._tag_rejection_block_event(entry, df_4h, side, "4H")
 
     @staticmethod
     def _tag_rejection_block_event(

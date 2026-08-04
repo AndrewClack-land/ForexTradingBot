@@ -143,3 +143,30 @@ def test_h1_detector_tags_timeframe_and_stable_event():
         "setup_timeframe": "1H",
         "pivot_index": str(index[-2]),
     }
+
+def test_h4_detector_tags_timeframe_and_stable_event():
+    index = pd.date_range("2026-01-01", periods=9, freq="4h", tz="UTC")
+    rows = [
+        {"open": 1.10, "high": 1.12, "low": 1.04, "close": 1.08, "volume": 1.0}
+        for _ in range(6)
+    ]
+    rows.extend(
+        [
+            {"open": 1.05, "high": 1.08, "low": 1.00, "close": 1.06, "volume": 1.0},
+            {"open": 1.02, "high": 1.04, "low": 0.90, "close": 1.03, "volume": 1.0},
+            {"open": 1.025, "high": 1.05, "low": 0.95, "close": 1.04, "volume": 1.0},
+        ]
+    )
+    frame = pd.DataFrame(rows, index=index)
+    strategy = NarrativeStrategy()
+
+    entry = strategy.trigger_h4_rejection_block(frame, "LONG")
+
+    assert entry is not None
+    assert entry.tf == "4H"
+    assert entry.trigger_kind == "rejection_block_4h"
+    assert entry.trigger_event_id == f"rb:4h:long:{index[-2]}"
+    assert entry.trigger_meta == {
+        "setup_timeframe": "4H",
+        "pivot_index": str(index[-2]),
+    }

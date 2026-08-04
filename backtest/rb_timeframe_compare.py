@@ -1,4 +1,4 @@
-"""Fast causal RB M15-vs-H1 comparison on a sealed broker snapshot."""
+"""Fast causal RB M15-vs-H1-vs-H4 comparison on a sealed broker snapshot."""
 from __future__ import annotations
 import argparse
 import csv
@@ -14,10 +14,11 @@ from .data import HistoricalDataset
 from .strategy_runner import NarrativeBacktestConfig, _default_strategy_factory, _prepare_symbol, infer_common_strategy_range
 from .walkforward import split_walk_forward
 
-SCHEMA = "rb-timeframe-comparison/v1"
+SCHEMA = "rb-timeframe-comparison/v2"
 TFS = {
     "rejection_block_15m": ("15m", "15M", "trigger_15m_rejection_block"),
     "rejection_block_1h": ("1h", "1H", "trigger_h1_rejection_block"),
+    "rejection_block_4h": ("4h", "4H", "trigger_h4_rejection_block"),
 }
 
 def _candidate_positions(frame: pd.DataFrame, strategy: Any) -> list[tuple[int, str]]:
@@ -92,7 +93,7 @@ def _metrics(rows: list[dict[str, Any]], name: str) -> dict[str, Any]:
         "net_opportunity_r": float(sum(opp)),
         "mean_opportunity_r": float(np.mean(opp)) if opp else None,
         "mean_filled_r": float(np.mean(fr)) if fr else None,
-        "profit_factor": float(gp / gl) if gl > 0 else (float("inf") if gp > 0 else None),
+        "profit_factor": float(gp / gl) if gl > 0 else None,
         "max_drawdown_r": dd, "opportunity_expectancy_bootstrap_95": _bootstrap(opp, name),
     }
 
@@ -138,6 +139,37 @@ def _gate(metrics: Mapping[str, Any]) -> dict[str, Any]:
             "positive_folds": positive, "decision": "ENABLE_RB_H1" if enabled else "KEEP_RB_H1_DISABLED",
             "rb_m15_decision": "HARD_DISABLED_REGARDLESS_OF_COMPARISON"}
 
+def _gate_h4(metrics: Mapping[str, Any]) -> dict[str, Any]:
+    aligned = metrics["bias_aligned"]
+    h4 = aligned["rejection_block_4h"]["overall"]
+    h1 = aligned["rejection_block_1h"]["overall"]
+    m15 = aligned["rejection_block_15m"]["overall"]
+    eligible = [
+        row
+        for row in aligned["rejection_block_4h"]["folds"].values()
+        if row["labeled_opportunities"] >= 10
+    ]
+    positive = sum(
+        row["mean_opportunity_r"] is not None
+        and row["mean_opportunity_r"] > 0
+        for row in eligible
+    )
+    low = h4["opportunity_expectancy_bootstrap_95"][0]
+    checks = {
+        "at_least_100_labeled": h4["labeled_opportunities"] >= 100,
+        "at_least_30_fills": h4["filled"] >= 30,
+        "positive_opportunity_expectancy": h4["mean_opportunity_r"] is not None and h4["mean_opportunity_r"] > 0,
+        "positive_filled_expectancy": h4["mean_filled_r"] is not None and h4["mean_filled_r"] > 0,
+        "profit_factor_above_one": h4["profit_factor"] is not None and h4["profit_factor"] > 1,
+        "better_than_m15": h4["mean_opportunity_r"] is not None and m15["mean_opportunity_r"] is not None and h4["mean_opportunity_r"] > m15["mean_opportunity_r"],
+        "better_than_h1": h4["mean_opportunity_r"] is not None and h1["mean_opportunity_r"] is not None and h4["mean_opportunity_r"] > h1["mean_opportunity_r"],
+        "bootstrap_lower_bound_nonnegative": low is not None and low >= 0,
+        "positive_in_60pct_eligible_folds": bool(eligible) and positive / len(eligible) >= .60,
+    }
+    enabled = all(checks.values())
+    return {"enable_h4": enabled, "checks": checks, "eligible_folds": len(eligible),
+            "positive_folds": positive, "decision": "ENABLE_RB_H4" if enabled else "KEEP_RB_H4_DISABLED",
+            "rb_m15_decision": "HARD_DISABLED_REGARDLESS_OF_COMPARISON"}
 def compare(snapshot: str, output: str, symbols: Sequence[str], latency: int = 60) -> dict[str, Any]:
     dataset = HistoricalDataset.load(snapshot)
     symbols = tuple(s.upper() for s in symbols)
@@ -189,7 +221,9 @@ def compare(snapshot: str, output: str, symbols: Sequence[str], latency: int = 6
                 })
     rows.sort(key=lambda r: (r["bar_close_time"], r["symbol"], r["trigger_kind"]))
     metrics, output_path = _group(rows), Path(output)
-    gate = _gate(metrics)
+    h1_gate = _gate(metrics)
+    h4_gate = _gate_h4(metrics)
+    gates = {"rejection_block_1h": h1_gate, "rejection_block_4h": h4_gate}
     output_path.mkdir(parents=True, exist_ok=True)
     with (output_path / "events.csv").open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
@@ -205,9 +239,9 @@ def compare(snapshot: str, output: str, symbols: Sequence[str], latency: int = 6
             "rb_pivot_lookback_left", "rb_box_length", "rb_min_wick_intrusion_pct", "rb_body_rule",
             "rb_use_wick_to_body_filter", "rb_wick_to_body_ratio",
             "rb_require_confirm_bearish_body", "rb_require_confirm_bullish_body")},
-        "metrics": metrics, "deployment_gate": gate, "events_csv": "events.csv"}
+        "metrics": metrics, "deployment_gates": gates, "deployment_gate": h4_gate, "events_csv": "events.csv"}
     (output_path / "report.json").write_text(json.dumps(report, indent=2, allow_nan=False) + "\n", encoding="utf-8")
-    print(json.dumps(gate, indent=2), flush=True)
+    print(json.dumps(gates, indent=2), flush=True)
     return report
 
 def main() -> int:
