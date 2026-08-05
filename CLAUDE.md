@@ -349,11 +349,30 @@ broker/live parity or authorize a live rollout from gross results alone.
 The profile name `production-deterministic` does not by itself guarantee
 parity: the CLI still permits overrides such as `--disable-vol-filter`,
 `--sessions ALL`, `--enable-rejection-block-entry`,
-`--disable-orderblock-entry`, and a different `--htf-score-margin`. Any run
+`--disable-orderblock-entry`, `--entry-range-min-width SYMBOL=WIDTH`, and a
+different `--htf-score-margin`. Any run
 using such an override is a non-parity sensitivity experiment and must be
 labelled and reported as such. The canonical baseline keeps volatility/EM
 enabled, the configured production sessions, RB15 entry disabled, OB1H entry
-enabled, and score margin `2`.
+enabled, score margin `2`, and no entry-window floor.
+
+`--entry-range-min-width SYMBOL=WIDTH` (and its live twin
+`ENTRY_RANGE_MIN_WIDTH`) sets a per-symbol floor, in price units, on the width
+of the delivered entry window. It exists because a trigger declares a setup
+using its own tolerance — OB1H touch accepts `max(0.15*ATR(H1), 0.0005)`,
+five pips or more, measured against a *closed* H1 bar — while the executor
+demands the live tick inside a window of roughly `0.15*ATR(M15)` with a
+`max(spread, point)` tolerance. The live 2026-07/08 journal shows the first
+execution attempt landing outside the window for about `85%` of the setups
+that die there, almost all within two minutes of the M15 close, with the miss
+three to six times the window width. The floor is empty by default and must
+stay empty in production until walk-forward evidence justifies a value.
+Widening moves the risk edge, so stop, targets and lot size all change: a
+widened run is a different strategy, never a fill-rate correction to the same
+one. Roughly half of the historical misses are price retreating toward the
+stop rather than running with the trade, so a floor also admits setups whose
+premise had already broken; judge it on paired expectancy, not on recovered
+fill count. Every widened fill is flagged `entry_range_widened`.
 
 `--cluster-candle-tolerance-ticks SYMBOL=TICKS` is another such override and
 needs its own warning. The cluster detector requires the sealed event and the

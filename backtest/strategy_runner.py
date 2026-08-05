@@ -574,6 +574,10 @@ class NarrativeBacktestConfig:
     orderblock_touch_min_abs: float = 0.0005
     orderblock_max_age_bars: int = 80
     htf_score_margin: int = 2
+    # Per-symbol entry-window floor in price units, as sorted pairs so the
+    # frozen config stays hashable and the report hash stays permutation
+    # independent. Empty = production geometry.
+    entry_range_min_width: tuple[tuple[str, float], ...] = ()
     release_commit: Optional[str] = None
     release_manifest_sha256: Optional[str] = None
     environment_lock_sha256: Optional[str] = None
@@ -611,6 +615,7 @@ class NarrativeBacktestConfig:
         orderblock_touch_min_abs: float = 0.0005,
         orderblock_max_age_bars: int = 80,
         htf_score_margin: int = 2,
+        entry_range_min_width: Optional[Mapping[str, float]] = None,
         release_commit: Optional[str] = None,
         release_manifest_sha256: Optional[str] = None,
         environment_lock_sha256: Optional[str] = None,
@@ -758,6 +763,29 @@ class NarrativeBacktestConfig:
                 "environment_lock_sha256 must be a 64-hex SHA-256"
             )
 
+        normalized_entry_width: list[tuple[str, float]] = []
+        for raw_symbol, raw_width in dict(entry_range_min_width or {}).items():
+            key = str(raw_symbol).strip().upper()
+            if not key:
+                raise StrategyBacktestError(
+                    "entry_range_min_width has an empty symbol"
+                )
+            width = float(raw_width)
+            if not math.isfinite(width) or width < 0.0:
+                raise StrategyBacktestError(
+                    f"entry_range_min_width[{key}] must be finite and >= 0"
+                )
+            if width > 0.0:
+                normalized_entry_width.append((key, width))
+        unknown = {
+            key for key, _ in normalized_entry_width
+        } - set(normalized_symbols)
+        if unknown:
+            raise StrategyBacktestError(
+                "entry_range_min_width names symbols outside the run: "
+                f"{sorted(unknown)}"
+            )
+
         return cls(
             symbols=normalized_symbols,
             start=range_start,
@@ -797,6 +825,7 @@ class NarrativeBacktestConfig:
             ],
             orderblock_max_age_bars=int(orderblock_max_age_bars),
             htf_score_margin=max(1, int(htf_score_margin)),
+            entry_range_min_width=tuple(sorted(normalized_entry_width)),
             release_commit=str(release_commit).strip() if release_commit else None,
             release_manifest_sha256=normalized_release_manifest,
             environment_lock_sha256=normalized_environment_lock,
@@ -839,6 +868,9 @@ class NarrativeBacktestConfig:
                 "orderblock_touch_min_abs": self.orderblock_touch_min_abs,
                 "orderblock_max_age_bars": self.orderblock_max_age_bars,
                 "htf_score_margin": self.htf_score_margin,
+                "entry_range_min_width": {
+                    symbol: width for symbol, width in self.entry_range_min_width
+                },
             },
             "release_commit": self.release_commit,
             "release_manifest_sha256": self.release_manifest_sha256,
@@ -1131,6 +1163,9 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.orderblock_touch_min_abs = config.orderblock_touch_min_abs
     strategy.orderblock_max_age_bars = config.orderblock_max_age_bars
     strategy.htf_score_margin = config.htf_score_margin
+    strategy.entry_range_min_width = {
+        symbol: width for symbol, width in config.entry_range_min_width
+    }
     expected = {
         "risk_per_trade": config.risk_fraction,
         "rejection_block_entry_enabled": (
@@ -1141,6 +1176,9 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
         "orderblock_touch_min_abs": config.orderblock_touch_min_abs,
         "orderblock_max_age_bars": config.orderblock_max_age_bars,
         "htf_score_margin": config.htf_score_margin,
+        "entry_range_min_width": {
+            symbol: width for symbol, width in config.entry_range_min_width
+        },
     }
     mismatches = {
         name: (getattr(strategy, name, None), value)

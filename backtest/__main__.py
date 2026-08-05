@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -202,6 +203,21 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
     )
     strategy_run.add_argument(
+        "--entry-range-min-width",
+        action="append",
+        metavar="SYMBOL=WIDTH",
+        help=(
+            "research-only per-symbol floor on the delivered entry-window "
+            "width, in price units, e.g. EURUSD=0.0006. The trigger accepts a "
+            "setup with a tolerance an order of magnitude wider than the "
+            "window the executor enforces, so narrow windows are missed by a "
+            "normal move inside the trigger bar. Widening moves the risk edge "
+            "and therefore the stop, targets and lot size: any run using this "
+            "is a non-parity sensitivity experiment and is marked "
+            "entry_window_widened in the report"
+        ),
+    )
+    strategy_run.add_argument(
         "--release-commit-file",
         help=(
             "file containing the exact strategy Git commit "
@@ -316,6 +332,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--htf-score-margin",
         type=int,
         default=2,
+    )
+    optimize_v2.add_argument(
+        "--entry-range-min-width",
+        action="append",
+        metavar="SYMBOL=WIDTH",
+        help=(
+            "research-only per-symbol floor on the delivered entry-window "
+            "width, in price units, e.g. EURUSD=0.0006. The trigger accepts a "
+            "setup with a tolerance an order of magnitude wider than the "
+            "window the executor enforces, so narrow windows are missed by a "
+            "normal move inside the trigger bar. Widening moves the risk edge "
+            "and therefore the stop, targets and lot size: any run using this "
+            "is a non-parity sensitivity experiment and is marked "
+            "entry_window_widened in the report"
+        ),
     )
     optimize_v2.add_argument(
         "--cluster-proxy-data",
@@ -574,6 +605,35 @@ def _read_release_commit(path: Optional[str]) -> Optional[str]:
     return value.lower()
 
 
+def _parse_entry_range_min_width(items) -> dict[str, float]:
+    """Parse repeated ``--entry-range-min-width SYMBOL=WIDTH`` options."""
+    parsed: dict[str, float] = {}
+    for item in items or ():
+        symbol, separator, width = str(item).partition("=")
+        if not separator or not symbol.strip() or not width.strip():
+            raise SystemExit(
+                "--entry-range-min-width expects SYMBOL=WIDTH, "
+                f"got: {item}"
+            )
+        try:
+            value = float(width)
+        except ValueError:
+            raise SystemExit(
+                f"--entry-range-min-width needs a number: {item}"
+            ) from None
+        if not math.isfinite(value) or value < 0.0:
+            raise SystemExit(
+                f"--entry-range-min-width needs a finite width >= 0: {item}"
+            )
+        key = symbol.strip().upper()
+        if key in parsed:
+            raise SystemExit(
+                f"--entry-range-min-width repeats symbol: {key}"
+            )
+        parsed[key] = value
+    return parsed
+
+
 def _hash_environment_lock(path: Optional[str]) -> Optional[str]:
     if not path:
         return None
@@ -659,6 +719,9 @@ def _strategy_run(args: argparse.Namespace) -> int:
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
+        entry_range_min_width=_parse_entry_range_min_width(
+            args.entry_range_min_width
+        ),
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
@@ -808,6 +871,9 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
+        entry_range_min_width=_parse_entry_range_min_width(
+            args.entry_range_min_width
+        ),
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
@@ -266,6 +267,55 @@ FXPRO_LIQUIDITY_MAX_MEAN_SPREAD_BPS = _env_float(
 ORDERBLOCK_TOUCH_ATR_K = _env_float("ORDERBLOCK_TOUCH_ATR_K", 0.15)
 ORDERBLOCK_TOUCH_MIN_ABS = _env_float("ORDERBLOCK_TOUCH_MIN_ABS", 0.0005)
 ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
+
+# ================== ENTRY WINDOW FLOOR (RESEARCH) ==================
+# Per-symbol minimum width of the entry range, in absolute price units.
+#
+# A trigger declares a setup using its own tolerance (OB touch accepts
+# max(0.15*ATR(H1), 0.0005) — five pips or more — measured against a *closed*
+# H1 bar), while the executor demands the live tick inside an entry window that
+# is only ~0.15*ATR(M15) wide with a max(spread, point) tolerance. The two
+# linewidths disagree by roughly an order of magnitude, so a setup can be born
+# already unexecutable: the live 2026-07/08 journal shows the very first
+# execution attempt landing outside the window in ~85% of the setups that die
+# there, overwhelmingly within two minutes of the M15 close.
+#
+# This floor widens a too-narrow window symmetrically about its midpoint. It is
+# OFF by default: an empty mapping preserves the current production geometry
+# exactly. Widening changes which fills happen and therefore the R geometry
+# (the risk edge moves, so the stop, targets and lot size all move with it), so
+# it must be measured in walk-forward before any live rollout.
+#
+# Format: "SYMBOL=WIDTH,SYMBOL=WIDTH" in price units, e.g.
+#   ENTRY_RANGE_MIN_WIDTH="EURUSD=0.0006,GBPUSD=0.0007,USDCAD=0.0012"
+def _env_price_map(name: str) -> dict:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return {}
+    parsed: dict[str, float] = {}
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        symbol, sep, width = item.partition("=")
+        if not sep:
+            raise ValueError(f"{name} expects SYMBOL=WIDTH, got: {item!r}")
+        try:
+            value = float(width)
+        except ValueError:
+            raise ValueError(f"{name} needs a number: {item!r}") from None
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"{name} needs a finite width >= 0: {item!r}")
+        key = symbol.strip().upper()
+        if not key:
+            raise ValueError(f"{name} has an empty symbol: {item!r}")
+        if key in parsed:
+            raise ValueError(f"{name} repeats symbol: {key}")
+        parsed[key] = value
+    return parsed
+
+
+ENTRY_RANGE_MIN_WIDTH = _env_price_map("ENTRY_RANGE_MIN_WIDTH")
 
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))

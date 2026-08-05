@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from typing import Dict, Optional, Literal, Tuple, Any, List
 
+import math
 import time
 import numpy as np
 import pandas as pd
@@ -26,6 +27,11 @@ except Exception:
     _cfg = None
 
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
+# Per-symbol minimum entry-window width in price units; empty = production
+# geometry unchanged. See config.ENTRY_RANGE_MIN_WIDTH for the rationale.
+ENTRY_RANGE_MIN_WIDTH: Dict[str, float] = dict(
+    getattr(_cfg, "ENTRY_RANGE_MIN_WIDTH", {}) or {}
+)
 REJECTION_BLOCK_H1_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_H1_ENTRY_ENABLED", False)
 )
@@ -157,6 +163,10 @@ class CandidateEntry:
     used_m1: bool = False
     stop_override: Optional[float] = None
     lock_entry_range: bool = False
+    # True once the per-symbol entry-window floor widened this range, so the
+    # journal and the backtest report can separate widened fills from ordinary
+    # ones instead of silently mixing two geometries.
+    entry_range_widened: bool = False
     trigger_kind: Optional[str] = None
     trigger_event_id: Optional[str] = None
     trigger_meta: Optional[Dict[str, Any]] = None
@@ -377,6 +387,12 @@ class NarrativeStrategy:
         # Entry range delivery
         self.entry_range_pad_atr_k = 0.10          # pad inside RB zone
         self.entry_range_fallback_atr_k = 0.15     # fallback range around price
+        # Per-symbol floor on the delivered window width (price units). Empty
+        # by default: production geometry is unchanged until a walk-forward
+        # result justifies a value.
+        self.entry_range_min_width: Dict[str, float] = dict(
+            ENTRY_RANGE_MIN_WIDTH
+        )
         self.entry_range_m1_atr_k = 0.25           # NEW: tighter localization around 1M close
 
         # Stop logic — raised min_risk to avoid micro-stops on noise/spread
@@ -1323,6 +1339,74 @@ class NarrativeStrategy:
         entry.entry_max = float(anchor + fb15)
         return entry
 
+    # ================== ENTRY WINDOW FLOOR ==================
+
+    def _entry_range_floor(self, symbol: str) -> float:
+        """Configured minimum entry-window width for ``symbol`` (price units)."""
+        mapping = getattr(self, "entry_range_min_width", None) or {}
+        try:
+            width = float(mapping.get(str(symbol).strip().upper(), 0.0))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(width) or width <= 0.0:
+            return 0.0
+        return width
+
+    def _apply_entry_range_floor(
+        self, entry: CandidateEntry, symbol: str
+    ) -> CandidateEntry:
+        """Widen a window narrower than the symbol's floor, symmetrically.
+
+        The trigger and the executor currently disagree on how far price may
+        sit from the planned entry, so a window of ~1-2 pips can be missed by
+        a normal move inside the very bar that produced the trigger. Growing
+        both edges by the same amount keeps the window centred on the geometry
+        the trigger chose; the risk edge (``entry_max`` for LONG,
+        ``entry_min`` for SHORT) moves outward, so the stop, targets and lot
+        size are all recomputed from the widened edge downstream.
+        """
+        floor = self._entry_range_floor(symbol)
+        if floor <= 0.0:
+            return entry
+        if entry.entry_min is None or entry.entry_max is None:
+            return entry
+
+        low = float(min(entry.entry_min, entry.entry_max))
+        high = float(max(entry.entry_min, entry.entry_max))
+        if not (math.isfinite(low) and math.isfinite(high)):
+            return entry
+        if high - low >= floor:
+            return entry
+
+        grow = (floor - (high - low)) / 2.0
+        entry.entry_min = low - grow
+        entry.entry_max = high + grow
+        entry.entry_range_widened = True
+        return entry
+
+    @staticmethod
+    def _clamp_entry_range_to_stop(
+        entry: CandidateEntry, side: Side, stop: float
+    ) -> CandidateEntry:
+        """Keep the favourable edge of a widened window clear of the stop.
+
+        Only the risk edge feeds ``calc_stop_and_tps``; the opposite edge is
+        pure upside. A window wide enough to reach past the stop would let a
+        fill open already beyond its own invalidation, so that edge is pulled
+        back the same way ``calc_stop_and_tps`` separates entry from stop.
+        """
+        if entry.entry_min is None or entry.entry_max is None:
+            return entry
+        if not math.isfinite(stop):
+            return entry
+        if side == "LONG":
+            if entry.entry_min <= stop:
+                entry.entry_min = min(float(entry.entry_max), stop + 1e-6)
+        elif side == "SHORT":
+            if entry.entry_max >= stop:
+                entry.entry_max = max(float(entry.entry_min), stop - 1e-6)
+        return entry
+
     # ================== STOP / TP ==================
 
     @staticmethod
@@ -1503,6 +1587,10 @@ class NarrativeStrategy:
         if not getattr(entry, "lock_entry_range", False):
             entry = self._build_entry_range(entry, df_15M, side_bias)
 
+        # Applies to both the locked trigger ranges (OB touch) and the built
+        # ones, so a single floor governs every delivered window.
+        entry = self._apply_entry_range_floor(entry, symbol)
+
         # risk entry: LONG uses entry_max, SHORT uses entry_min
         if side_bias == "LONG":
             entry_for_risk = float(entry.entry_max if entry.entry_max is not None else entry.entry_price)
@@ -1517,6 +1605,9 @@ class NarrativeStrategy:
             custom_stop=getattr(entry, "stop_override", None),
             symbol=symbol,
         )
+
+        if entry.entry_range_widened:
+            entry = self._clamp_entry_range_to_stop(entry, side_bias, stop)
         weighted_rr = sum(
             ratio * rr
             for ratio, rr in zip((0.50, 0.30, 0.20), self.tp_rr_levels)
@@ -1552,6 +1643,9 @@ class NarrativeStrategy:
             # IMPORTANT: show what timeframe we localized on
             "tf": "15M",
             "setup_tf": entry.tf,
+            # Audit flag: this fill came from a widened window, not the
+            # production geometry.
+            "entry_range_widened": bool(entry.entry_range_widened),
 
             "narrative": narrative_text,
             "factor_vector": factor_vector,
