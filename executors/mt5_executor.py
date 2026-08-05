@@ -190,6 +190,7 @@ class MT5Executor:
         if tick is None:
             raise RuntimeError(f"No tick data for {symbol} before entry")
         actual_entry = float(tick.ask if side.upper() == "LONG" else tick.bid)
+        self._assert_setup_not_invalidated(symbol, side, actual_entry, stop_price)
         volume = self._calc_volume(symbol, actual_entry, stop_price, side=side)
 
         order_result = self._send_order(
@@ -264,6 +265,7 @@ class MT5Executor:
         if tick is None:
             raise RuntimeError(f"No tick data for {symbol} before split entry")
         actual_entry = float(tick.ask if side.upper() == "LONG" else tick.bid)
+        self._assert_setup_not_invalidated(symbol, side, actual_entry, stop_price)
         risk_limit = self._risk_limit()
 
         # Convert the requested allocation to broker-step units and, if price
@@ -1331,6 +1333,50 @@ class MT5Executor:
             sizing.limit.fraction * 100.0,
         )
         return sizing.volume
+
+    @staticmethod
+    def _assert_setup_not_invalidated(
+        symbol: str,
+        side: str,
+        price: float,
+        stop_price: Optional[float],
+    ) -> None:
+        """Refuse a setup whose stop the live price has already crossed.
+
+        Sizing runs against the *live* tick while the stop stays at its planned
+        level, so once price crosses the stop the sizing invariant "stop is on
+        the correct side of entry" fails and reports a generic risk error.  That
+        message reads like a malformed signal; the real condition is an
+        invalidated setup, which ``_send_order`` already names precisely.  The
+        check therefore has to run *before* any sizing call, not only inside
+        ``_send_order``, or the accurate diagnosis is never reached.
+
+        This mirrors the backtest, where the same condition is
+        ``REJECT_INVALID_GEOMETRY`` and is deliberately counted apart from an
+        expired entry range.
+        """
+
+        if stop_price is None:
+            return
+        try:
+            live = float(price)
+            stop = float(stop_price)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(live) or not math.isfinite(stop):
+            return
+        if str(side).upper() == "LONG":
+            if live <= stop:
+                raise RuntimeError(
+                    f"Stale signal rejected for {symbol}: price {live:.5f} "
+                    f"already at/below signal SL {stop:.5f} — setup invalidated"
+                )
+        else:
+            if live >= stop:
+                raise RuntimeError(
+                    f"Stale signal rejected for {symbol}: price {live:.5f} "
+                    f"already at/above signal SL {stop:.5f} — setup invalidated"
+                )
 
     def _send_order(self, symbol: str, side: str, volume: float,
                     planned_entry: float,
