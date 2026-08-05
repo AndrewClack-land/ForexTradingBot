@@ -420,7 +420,7 @@ def _addon_core(executor, idea, monkeypatch, *, addon_entry=1.0060):
     )
     monkeypatch.setattr(
         main.Core, "_apply_entry_guards",
-        lambda self, symbol, sig, side, trig_sig: False,
+        lambda self, symbol, sig, side, trig_sig, is_addon=False: False,
     )
     return core
 
@@ -525,3 +525,110 @@ def test_break_even_uses_each_entry_own_fill_price():
     assert events[1]["entry_index"] == 2
     assert first.stop == 1.0000
     assert second.stop == 1.0030
+
+
+# ---------------- duplicate-trigger brake vs add-ons ----------------
+
+
+def _guard_core(monkeypatch, *, signatures=None, entries_today=0):
+    """A Core carrying only the state ``_apply_entry_guards`` reads."""
+    core = main.Core.__new__(main.Core)
+    core.mt5_executor = None
+    core.active_trades = {}
+    core._entry_cooldowns = {}
+    core._entries_today = {"EURUSD": entries_today}
+    core._trigger_signatures = {"EURUSD": set(signatures or ())}
+    monkeypatch.setattr(main, "CORRELATED_GROUPS", [])
+    return core
+
+
+def test_first_entry_still_obeys_the_daily_duplicate_trigger_brake(monkeypatch):
+    """The revenge-re-entry brake is untouched for ordinary entries."""
+    core = _guard_core(monkeypatch, signatures={"LONG|orderblock|z1"})
+    sig = _sig()
+
+    blocked = core._apply_entry_guards(
+        "EURUSD", sig, side="LONG", trig_sig="LONG|orderblock|z1"
+    )
+
+    assert blocked is True
+    assert sig["signal"] == "SKIP_DUP_TRIGGER"
+
+
+def test_addon_is_exempt_from_the_daily_duplicate_trigger_brake(monkeypatch):
+    """An add-on joins a winning idea; the brake exists for stopped-out ones."""
+    core = _guard_core(monkeypatch, signatures={"LONG|orderblock|z1"})
+    sig = _sig()
+
+    blocked = core._apply_entry_guards(
+        "EURUSD", sig, side="LONG", trig_sig="LONG|orderblock|z1", is_addon=True
+    )
+
+    assert blocked is False
+    assert sig["signal"] == "ENTER"
+
+
+def test_addon_still_obeys_the_per_symbol_daily_setup_cap(monkeypatch):
+    core = _guard_core(
+        monkeypatch,
+        signatures={"LONG|orderblock|z1"},
+        entries_today=main.MAX_SETUPS_PER_SYMBOL_PER_DAY,
+    )
+    sig = _sig()
+
+    blocked = core._apply_entry_guards(
+        "EURUSD", sig, side="LONG", trig_sig="LONG|orderblock|z1", is_addon=True
+    )
+
+    assert blocked is True
+    assert sig["signal"] == "SKIP_DAILY_LIMIT"
+
+
+def test_addon_still_obeys_the_entry_cooldown(monkeypatch):
+    core = _guard_core(monkeypatch, signatures={"LONG|orderblock|z1"})
+    core._entry_cooldowns = {"EURUSD": main.time.time() + 300.0}
+    sig = _sig()
+
+    blocked = core._apply_entry_guards(
+        "EURUSD", sig, side="LONG", trig_sig="LONG|orderblock|z1", is_addon=True
+    )
+
+    assert blocked is True
+    assert sig["signal"] == "WAIT_COOLDOWN"
+
+
+def test_addon_still_obeys_the_correlation_guard(monkeypatch):
+    core = _guard_core(monkeypatch, signatures={"LONG|orderblock|z1"})
+    partner = _entry(1, entry=1.3000, stop=1.2950, tickets=[201])
+    partner.symbol = "GBPUSD"
+    core.active_trades = {"GBPUSD": partner}
+    monkeypatch.setattr(main, "CORRELATED_GROUPS", [["EURUSD", "GBPUSD"]])
+    sig = _sig()
+
+    blocked = core._apply_entry_guards(
+        "EURUSD", sig, side="LONG", trig_sig="LONG|orderblock|z1", is_addon=True
+    )
+
+    assert blocked is True
+    assert sig["signal"] == "SKIP_CORRELATED"
+
+
+def test_per_idea_signature_rule_still_blocks_a_repeat_of_entry_one(monkeypatch):
+    """The exemption removes the *daily* brake only.
+
+    ``PyramidManager`` keeps its own per-idea rule, so an add-on carrying the
+    signature that opened entry 1 — which is what every blocked live attempt
+    carried — remains rejected.
+    """
+    idea = _idea(_entry(1, entry=1.0000, stop=0.9950, tickets=[101]))
+
+    decision = _manager().evaluate(
+        idea,
+        _sig(),
+        executor=FakeRiskExecutor(),
+        last_price=1.0060,
+        trigger_signature="LONG|trig1|z1",
+    )
+
+    assert decision.allowed is False
+    assert "повторяет триггер" in decision.reason

@@ -1745,7 +1745,9 @@ class Core:
 
         side = sig.get("side")
         trig_sig = self._trigger_signature(sig)
-        if self._apply_entry_guards(symbol, sig, side=side, trig_sig=trig_sig):
+        if self._apply_entry_guards(
+            symbol, sig, side=side, trig_sig=trig_sig, is_addon=True
+        ):
             print(f"[Pyramid] {symbol} add-on blocked: {sig.get('signal')} {sig.get('info', '')}")
             return None
 
@@ -1818,14 +1820,25 @@ class Core:
         return sig
 
     def _apply_entry_guards(
-        self, symbol: str, sig: Dict[str, Any], *, side: str, trig_sig: str
+        self, symbol: str, sig: Dict[str, Any], *, side: str, trig_sig: str,
+        is_addon: bool = False,
     ) -> bool:
         """Per-symbol entry brakes. Rewrites ``sig`` in place and returns True
         when the entry must not be opened.
 
         Shared by first entries and position-adding add-ons: an add-on is new
-        risk in the market and passes exactly the same frequency, hedging and
-        correlation checks as any other entry.
+        risk in the market and passes the same cooldown, daily-frequency,
+        hedging and correlation checks as any other entry.
+
+        The one exception is the daily duplicate-trigger brake. That brake
+        exists to stop a still-valid M15 trigger from re-entering a zone right
+        after it stopped out (EURUSD 2026-07-10). An add-on is the opposite
+        case: it may only join an idea that is already at least
+        ``ADDON_MIN_PROGRESS_R`` in profit, and it is separately capped by the
+        idea's own risk budget and by the per-idea signature rule in
+        ``core/position_adding.py``. Applying a revenge-re-entry brake to a
+        winning idea blocked every add-on the bot ever attempted, so add-ons
+        are exempt from this brake and from it only.
         """
         # Skip if this symbol is in cooldown (failed execution or stop-out)
         cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
@@ -1840,7 +1853,7 @@ class Core:
             sig["info"] = f"Достигнут лимит {MAX_SETUPS_PER_SYMBOL_PER_DAY} сетапов/день"
             return True
 
-        if trig_sig in self._trigger_signatures.get(symbol, set()):
+        if not is_addon and trig_sig in self._trigger_signatures.get(symbol, set()):
             sig["signal"] = "SKIP_DUP_TRIGGER"
             sig["info"] = f"Зона/бар триггера уже отторгована сегодня ({trig_sig})"
             return True
