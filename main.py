@@ -34,6 +34,7 @@ from config import (
     MT5_INITIAL_CAPITAL,
     MT5_SLIPPAGE,
     PERSISTENT_LIMIT_ENABLED,
+    PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED,
     PERSISTENT_LIMIT_SYMBOLS,
     PERSISTENT_LIMIT_TTL_MIN,
     PERSISTENT_LIMIT_STATE_PATH,
@@ -135,6 +136,18 @@ from mt5_bridge.mt5_native_bridge import MT5NativeBridge, parse_symbol_spec, par
 
 _PENDING_CONFLICT_REASON = (
     "incompatible active/broker position on symbol"
+)
+_PENDING_CONFLICT_CLOSE_REQUESTED_REASON = (
+    _PENDING_CONFLICT_REASON
+    + "; emergency auto-close requested"
+)
+_PENDING_CONFLICT_CLOSE_FAILED_REASON = (
+    _PENDING_CONFLICT_REASON
+    + "; emergency auto-close failed; retry pending"
+)
+_PENDING_CONFLICT_CLOSE_RESOLVED_REASON = (
+    _PENDING_CONFLICT_REASON
+    + "; emergency auto-close exposure absent; manual recovery required"
 )
 _PENDING_CONFLICT_ABSENCE_GRACE_SEC = 30.0
 
@@ -298,8 +311,12 @@ class Core:
 
         self.mt5_executor: MT5Executor | None = None
         self._executor_retry_ts: float = 0.0
+        self._pending_limit_capability_cache: Dict[
+            str, Dict[str, Any]
+        ] = {}
         if MT5_EXECUTION_ENABLED:
-            self._try_create_executor()
+            if self._try_create_executor():
+                self._refresh_pending_limit_capabilities()
 
         self.shadow_tick_watcher: Optional[ShadowTickWatcher] = None
         if SHADOW_TICK_WATCHER_ENABLED:
@@ -517,6 +534,97 @@ class Core:
             self.pending_limits,
             PERSISTENT_LIMIT_STATE_PATH,
         )
+
+    def _get_pending_limit_capabilities(
+        self,
+        symbol: str,
+        *,
+        refresh: bool = False,
+    ) -> Dict[str, Any]:
+        """Cache the executor's strictly read-only LIMIT capability probe."""
+
+        key = str(symbol).upper()
+        cache = getattr(
+            self,
+            "_pending_limit_capability_cache",
+            None,
+        )
+        if cache is None:
+            cache = {}
+            self._pending_limit_capability_cache = cache
+        if not refresh and key in cache:
+            return dict(cache[key])
+
+        executor = self.mt5_executor
+        if executor is None:
+            result: Dict[str, Any] = {
+                "limit_allowed": False,
+                "specified_expiration": False,
+                "account_hedging": False,
+                "ready": False,
+                "error": "executor unavailable",
+            }
+        else:
+            source_symbol = self.universe.get(key, key)
+            try:
+                raw = executor.pending_limit_capabilities(
+                    source_symbol
+                )
+                if not isinstance(raw, dict):
+                    raise RuntimeError(
+                        "capability probe returned a non-mapping"
+                    )
+                limit_allowed = raw.get("limit_allowed") is True
+                specified_expiration = (
+                    raw.get("specified_expiration") is True
+                )
+                account_hedging = (
+                    raw.get("account_hedging") is True
+                )
+                result = {
+                    "limit_allowed": limit_allowed,
+                    "specified_expiration": specified_expiration,
+                    "account_hedging": account_hedging,
+                    "ready": bool(
+                        raw.get("ready") is True
+                        and limit_allowed
+                        and specified_expiration
+                        and account_hedging
+                    ),
+                }
+            except Exception as exc:
+                result = {
+                    "limit_allowed": False,
+                    "specified_expiration": False,
+                    "account_hedging": False,
+                    "ready": False,
+                    "error": str(exc),
+                }
+        cache[key] = dict(result)
+        print(
+            f"[Persistent LIMIT] capabilities {key}: "
+            f"ready={result['ready']} "
+            f"limit={result['limit_allowed']} "
+            f"expiry={result['specified_expiration']} "
+            f"hedging={result['account_hedging']}"
+            + (
+                f" error={result['error']}"
+                if result.get("error")
+                else ""
+            )
+        )
+        return dict(result)
+
+    def _refresh_pending_limit_capabilities(self) -> None:
+        """Probe at startup/reconnect even if persistent LIMITs are off."""
+
+        symbols = set(PERSISTENT_LIMIT_SYMBOLS)
+        symbols.add("EURUSD")
+        for symbol in sorted(symbols):
+            self._get_pending_limit_capabilities(
+                symbol,
+                refresh=True,
+            )
 
     def _capture_quote(self, symbol: str) -> Optional[QuoteTick]:
         """Read one broker quote for pending/shadow instrumentation."""
@@ -1175,17 +1283,38 @@ class Core:
         )
 
     @staticmethod
+    def _is_pending_conflict_plan(plan: PendingLimitPlan) -> bool:
+        return str(plan.reason or "").startswith(
+            _PENDING_CONFLICT_REASON
+        )
+
+    @staticmethod
+    def _with_pending_conflict_reason(
+        plan: PendingLimitPlan,
+        reason: str,
+        *,
+        now: Optional[float] = None,
+    ) -> PendingLimitPlan:
+        if plan.reason == reason:
+            return plan
+        moment = time.time() if now is None else float(now)
+        return dataclass_replace(
+            plan,
+            reason=reason,
+            updated_at=max(moment, float(plan.updated_at)),
+        )
+
+    @staticmethod
     def _mark_pending_conflict(
         plan: PendingLimitPlan,
     ) -> PendingLimitPlan:
         """Persist that this plan must never merge into an active idea."""
 
-        if plan.reason == _PENDING_CONFLICT_REASON:
+        if Core._is_pending_conflict_plan(plan):
             return plan
-        return dataclass_replace(
+        return Core._with_pending_conflict_reason(
             plan,
-            reason=_PENDING_CONFLICT_REASON,
-            updated_at=max(time.time(), float(plan.updated_at)),
+            _PENDING_CONFLICT_REASON,
         )
 
     @staticmethod
@@ -1256,6 +1385,135 @@ class Core:
                 else:
                     owned.add(ticket)
         return tuple(sorted(owned)), tuple(ambiguous)
+
+    @staticmethod
+    def _pending_plan_close_targets(
+        plan: PendingLimitPlan,
+        positions: List[Dict[str, Any]],
+        *,
+        executor_magic: Any,
+    ) -> Tuple[Tuple[Tuple[int, int, str], ...], Tuple[str, ...]]:
+        """Return only positions whose durable ownership is fully proven.
+
+        A close target requires a positive position id captured from the
+        opening deal plus the exact symbol and full per-leg broker comment.
+        ``list_positions`` is already executor-magic filtered; matching the
+        plan's magic to that executor closes the remaining provenance gap.
+        """
+
+        errors: List[str] = []
+        try:
+            normalized_magic = int(executor_magic)
+        except (TypeError, ValueError):
+            normalized_magic = -1
+        if normalized_magic != int(plan.magic):
+            errors.append(
+                f"plan magic {plan.magic} != executor magic "
+                f"{normalized_magic}"
+            )
+
+        rows_by_ticket: Dict[int, List[Dict[str, Any]]] = {}
+        for row in positions:
+            ticket = int(row.get("ticket") or 0)
+            if ticket > 0:
+                rows_by_ticket.setdefault(ticket, []).append(row)
+
+        leg_by_comment = {
+            plan.broker_comment_for_leg(leg.index): leg
+            for leg in plan.legs
+        }
+        recorded_ids: Dict[int, int] = {}
+        targets: List[Tuple[int, int, str]] = []
+        for leg in plan.legs:
+            if leg.filled_volume <= 1e-9:
+                continue
+            position_id = int(leg.broker_position_id or 0)
+            if position_id <= 0:
+                errors.append(
+                    f"filled leg {leg.index} has no recorded "
+                    "broker_position_id"
+                )
+                continue
+            other_leg = recorded_ids.get(position_id)
+            if other_leg is not None and other_leg != leg.index:
+                errors.append(
+                    f"position {position_id} is recorded for legs "
+                    f"{other_leg} and {leg.index}"
+                )
+                continue
+            recorded_ids[position_id] = leg.index
+            matches = rows_by_ticket.get(position_id, [])
+            if len(matches) > 1:
+                errors.append(
+                    f"position {position_id} appears multiple times"
+                )
+                continue
+            if not matches:
+                continue
+            row = matches[0]
+            expected_comment = plan.broker_comment_for_leg(leg.index)
+            actual_symbol = str(row.get("symbol") or "").upper()
+            actual_comment = str(row.get("comment") or "")
+            if actual_symbol != plan.symbol.upper():
+                errors.append(
+                    f"position {position_id} symbol {actual_symbol!r} "
+                    f"!= {plan.symbol.upper()!r}"
+                )
+            if actual_comment != expected_comment:
+                errors.append(
+                    f"position {position_id} comment "
+                    f"{actual_comment!r} != {expected_comment!r}"
+                )
+            row_magic = row.get("magic")
+            row_magic_matches = True
+            if row_magic is not None:
+                try:
+                    row_magic_matches = (
+                        int(row_magic) == int(plan.magic)
+                    )
+                except (TypeError, ValueError):
+                    row_magic_matches = False
+                if not row_magic_matches:
+                    errors.append(
+                        f"position {position_id} magic "
+                        f"{row_magic!r} != {plan.magic}"
+                    )
+            if (
+                actual_symbol == plan.symbol.upper()
+                and actual_comment == expected_comment
+                and row_magic_matches
+            ):
+                targets.append(
+                    (leg.index, position_id, expected_comment)
+                )
+
+        # A plan-looking comment on any other id/symbol is evidence of a race
+        # or corrupt identity, never a comment-only fallback close target.
+        for row in positions:
+            comment = str(row.get("comment") or "")
+            leg = leg_by_comment.get(comment)
+            if leg is None:
+                continue
+            ticket = int(row.get("ticket") or 0)
+            expected_id = int(leg.broker_position_id or 0)
+            if expected_id <= 0:
+                errors.append(
+                    f"leg {leg.index} live position lacks a recorded id"
+                )
+            elif ticket != expected_id:
+                errors.append(
+                    f"leg {leg.index} maps to unexpected position "
+                    f"{ticket} instead of {expected_id}"
+                )
+            if str(row.get("symbol") or "").upper() != plan.symbol.upper():
+                errors.append(
+                    f"leg {leg.index} exact comment appears on wrong symbol"
+                )
+
+        return (
+            tuple(sorted(targets)),
+            tuple(dict.fromkeys(errors)),
+        )
 
     def _pending_cancel_reason(
         self,
@@ -1630,9 +1888,7 @@ class Core:
                     incompatible_active
                     or incompatible_broker_position
                 )
-                conflict_plan = bool(
-                    plan.reason == _PENDING_CONFLICT_REASON
-                )
+                conflict_plan = self._is_pending_conflict_plan(plan)
                 if incompatible_exposure and not conflict_plan:
                     plan = self._mark_pending_conflict(plan)
                     self.pending_limits[symbol] = plan
@@ -1666,7 +1922,9 @@ class Core:
 
                 quote = self._capture_quote(symbol)
                 if conflict_plan:
-                    cancel_reason = _PENDING_CONFLICT_REASON
+                    cancel_reason = str(
+                        plan.reason or _PENDING_CONFLICT_REASON
+                    )
                 elif (
                     startup
                     and plan.state == PendingLimitState.PLACING
@@ -1850,6 +2108,178 @@ class Core:
 
                 watcher = getattr(self, "shadow_tick_watcher", None)
                 if conflict_plan:
+                    if PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED:
+                        try:
+                            capabilities = (
+                                executor.pending_limit_capabilities(
+                                    self.universe.get(
+                                        plan.symbol,
+                                        plan.symbol,
+                                    )
+                                )
+                            )
+                        except Exception as exc:
+                            self._pending_state_safe = False
+                            print(
+                                f"[Persistent LIMIT] {symbol} emergency "
+                                "close capability probe failed; durable "
+                                f"plan retained: {exc}"
+                            )
+                            continue
+                        if not bool(
+                            isinstance(capabilities, dict)
+                            and capabilities.get("ready") is True
+                            and capabilities.get("account_hedging") is True
+                        ):
+                            self._pending_state_safe = False
+                            print(
+                                f"[Persistent LIMIT] {symbol} emergency "
+                                "close disabled by broker/account "
+                                "capabilities; durable plan retained: "
+                                f"{capabilities!r}"
+                            )
+                            continue
+                        close_targets, ownership_errors = (
+                            self._pending_plan_close_targets(
+                                plan,
+                                positions,
+                                executor_magic=getattr(
+                                    getattr(executor, "settings", None),
+                                    "magic",
+                                    None,
+                                ),
+                            )
+                        )
+                        if ownership_errors:
+                            self._pending_state_safe = False
+                            print(
+                                f"[Persistent LIMIT] {symbol} emergency "
+                                "close ownership ambiguous; durable plan "
+                                "retained: "
+                                + "; ".join(ownership_errors)
+                            )
+                            continue
+
+                        if close_targets:
+                            retry_deferred = bool(
+                                plan.reason
+                                == _PENDING_CONFLICT_CLOSE_REQUESTED_REASON
+                                and time.time() - float(plan.updated_at)
+                                < _PENDING_CONFLICT_ABSENCE_GRACE_SEC
+                            )
+                            if retry_deferred:
+                                print(
+                                    f"[Persistent LIMIT] {symbol} emergency "
+                                    "close awaiting broker publication; "
+                                    "durable plan retained"
+                                )
+                                continue
+
+                            close_failures: List[str] = []
+                            for (
+                                leg_index,
+                                position_id,
+                                expected_comment,
+                            ) in close_targets:
+                                try:
+                                    closed = executor.close_trade(
+                                        plan.symbol,
+                                        position_id=position_id,
+                                        volume=None,
+                                        expected_comment=expected_comment,
+                                    )
+                                except Exception as exc:
+                                    close_failures.append(
+                                        f"leg {leg_index} position "
+                                        f"{position_id}: {exc}"
+                                    )
+                                    continue
+                                if not closed:
+                                    close_failures.append(
+                                        f"leg {leg_index} position "
+                                        f"{position_id}: broker close "
+                                        "not confirmed"
+                                    )
+
+                            outcome = (
+                                _PENDING_CONFLICT_CLOSE_FAILED_REASON
+                                if close_failures
+                                else _PENDING_CONFLICT_CLOSE_REQUESTED_REASON
+                            )
+                            updated_plan = (
+                                self._with_pending_conflict_reason(
+                                    plan,
+                                    outcome,
+                                    now=time.time(),
+                                )
+                            )
+                            if updated_plan is not plan:
+                                plan = updated_plan
+                                self.pending_limits[symbol] = plan
+                                self._save_pending_limit_state()
+                                book_dirty = True
+                            if close_failures:
+                                print(
+                                    f"[Persistent LIMIT] {symbol} emergency "
+                                    "close deferred; durable plan retained: "
+                                    + "; ".join(close_failures)
+                                )
+                            else:
+                                print(
+                                    f"[Persistent LIMIT] {symbol} emergency "
+                                    "close requested for exact owned "
+                                    "positions; awaiting absence: "
+                                    f"{[row[1] for row in close_targets]}"
+                                )
+                            continue
+
+                        if plan.reason in {
+                            _PENDING_CONFLICT_CLOSE_REQUESTED_REASON,
+                            _PENDING_CONFLICT_CLOSE_FAILED_REASON,
+                        }:
+                            resolved = self._with_pending_conflict_reason(
+                                plan,
+                                _PENDING_CONFLICT_CLOSE_RESOLVED_REASON,
+                                now=time.time(),
+                            )
+                            if resolved is not plan:
+                                plan = resolved
+                                self.pending_limits[symbol] = plan
+                                self._save_pending_limit_state()
+                                book_dirty = True
+                            print(
+                                f"[Persistent LIMIT] {symbol} emergency "
+                                "close exposure absent; durable plan retained "
+                                "for explicit/manual recovery"
+                            )
+                            continue
+
+                        if (
+                            plan.reason
+                            == _PENDING_CONFLICT_CLOSE_RESOLVED_REASON
+                        ):
+                            print(
+                                f"[Persistent LIMIT] {symbol} resolved "
+                                "emergency-close audit retained for "
+                                "explicit/manual recovery"
+                            )
+                            continue
+
+                        if (
+                            time.time() - float(plan.updated_at)
+                            < _PENDING_CONFLICT_ABSENCE_GRACE_SEC
+                        ):
+                            # A conflict can be detected from an active idea
+                            # before the new position publishes. Never claim a
+                            # resolved emergency close that was not requested.
+                            continue
+                        print(
+                            f"[Persistent LIMIT] {symbol} conflicting fill "
+                            "exposure absent without an emergency close "
+                            "request; durable plan retained"
+                        )
+                        continue
+
                     owned_position_ids, ownership_errors = (
                         self._pending_plan_owned_position_ids(
                             plan,
@@ -3873,6 +4303,8 @@ class Core:
                 self._last_reconnect_ts = now
                 ok = self.mt5_executor.reconnect()
                 print(f"[MT5] connection lost — reconnect {'ok' if ok else 'failed'}")
+                if ok:
+                    self._refresh_pending_limit_capabilities()
         elif self.mt5_executor is None and MT5_EXECUTION_ENABLED:
             # Executor never came up (e.g. terminal was still cold-starting when the
             # bot launched) — keep retrying until the terminal is reachable.
@@ -3880,6 +4312,7 @@ class Core:
             if now - self._executor_retry_ts >= 60.0:
                 self._executor_retry_ts = now
                 if self._try_create_executor():
+                    self._refresh_pending_limit_capabilities()
                     self._manage_pending_limits(startup=True)
                     self._hydrate_active_trades_from_mt5()
 
@@ -4378,6 +4811,29 @@ class Core:
                         )
 
                         if awaiting_retest:
+                            capabilities = (
+                                self._get_pending_limit_capabilities(
+                                    symbol
+                                )
+                            )
+                            if capabilities.get("ready") is not True:
+                                sig["signal"] = "WAIT_LIMIT_UNSUPPORTED"
+                                sig["info"] = (
+                                    "Broker/account does not prove LIMIT + "
+                                    "specified expiry + hedging capability"
+                                )
+                                sig["pending_limit_capabilities"] = {
+                                    key: capabilities.get(key)
+                                    for key in (
+                                        "limit_allowed",
+                                        "specified_expiration",
+                                        "account_hedging",
+                                        "ready",
+                                    )
+                                }
+                                results[symbol] = sig
+                                self._log_signal(symbol, sig)
+                                continue
                             try:
                                 with self._management_lock:
                                     plan = self._arm_pending_limit(

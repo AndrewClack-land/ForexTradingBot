@@ -269,6 +269,40 @@ class MT5Executor:
         )
         return int(getattr(account, "margin_mode", -1)) == hedging_mode
 
+    def pending_limit_capabilities(self, symbol: str) -> Dict[str, bool]:
+        """Read broker capabilities required by persistent LIMIT execution.
+
+        The probe is deliberately side-effect free: it does not select a
+        symbol, size risk, inspect quotes, or submit/check an order.
+        """
+        info = mt5.symbol_info(symbol)
+        account = mt5.account_info()
+        limit_flag = int(getattr(mt5, "SYMBOL_ORDER_LIMIT", 2) or 2)
+        specified_flag = int(
+            getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4) or 4
+        )
+        hedging_mode = int(
+            getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2) or 2
+        )
+        order_mode = int(getattr(info, "order_mode", 0) or 0)
+        expiration_mode = int(getattr(info, "expiration_mode", 0) or 0)
+        margin_mode = int(getattr(account, "margin_mode", -1))
+        limit_allowed = (order_mode & limit_flag) == limit_flag
+        specified_expiration = (
+            expiration_mode & specified_flag
+        ) == specified_flag
+        account_hedging = margin_mode == hedging_mode
+        return {
+            "limit_allowed": limit_allowed,
+            "specified_expiration": specified_expiration,
+            "account_hedging": account_hedging,
+            "ready": (
+                limit_allowed
+                and specified_expiration
+                and account_hedging
+            ),
+        }
+
     def place_limit_leg(
         self,
         symbol: str,
@@ -1088,28 +1122,94 @@ class MT5Executor:
                 self.logger.warning("move_stop_all: failed for position %s: %s", pid, exc)
         return updated
 
-    def close_trade(self, symbol: str, *, position_id: Optional[int], volume: Optional[float]) -> bool:
+    def close_trade(
+        self,
+        symbol: str,
+        *,
+        position_id: Optional[int],
+        volume: Optional[float],
+        expected_comment: Optional[str] = None,
+    ) -> bool:
         # A vanished split leg must never fall back to another position for the
         # same symbol: that could close TP2 while the caller intended the already
         # closed TP1 ticket. Symbol fallback is retained only for legacy calls
         # that do not supply a position id.
-        position = self._find_position(symbol, position_id, strict=bool(position_id))
+        symbol_key = str(symbol or "").strip().upper()
+        if not symbol_key:
+            raise RuntimeError("A non-empty symbol is required to close a trade")
+        normalized_position_id: Optional[int] = None
+        if position_id is not None:
+            if isinstance(position_id, bool):
+                raise RuntimeError("position_id must be a positive integer")
+            try:
+                normalized_position_id = int(position_id)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid position_id {position_id!r}"
+                ) from exc
+            if normalized_position_id <= 0:
+                raise RuntimeError("position_id must be a positive integer")
+        if expected_comment is not None and normalized_position_id is None:
+            raise RuntimeError(
+                "expected_comment requires an exact positive position_id"
+            )
+
+        position = self._find_position(
+            symbol_key,
+            normalized_position_id,
+            strict=normalized_position_id is not None,
+        )
         if position is None:
-            self.logger.warning("No MT5 position found for %s (ticket=%s)", symbol, position_id)
+            self.logger.warning(
+                "No MT5 position found for %s (ticket=%s)",
+                symbol_key,
+                normalized_position_id,
+            )
             return False
+        if normalized_position_id is not None:
+            actual_ticket = int(getattr(position, "ticket", 0) or 0)
+            actual_symbol = str(
+                getattr(position, "symbol", "") or ""
+            ).strip().upper()
+            actual_magic = int(getattr(position, "magic", 0) or 0)
+            if actual_ticket != normalized_position_id:
+                raise RuntimeError(
+                    f"MT5 returned position {actual_ticket} for requested "
+                    f"ticket {normalized_position_id}"
+                )
+            if actual_symbol != symbol_key:
+                raise RuntimeError(
+                    f"Position {normalized_position_id} symbol "
+                    f"{actual_symbol!r} does not match {symbol_key!r}"
+                )
+            if actual_magic != int(self.settings.magic):
+                raise RuntimeError(
+                    f"Position {normalized_position_id} is not owned by "
+                    "this executor"
+                )
+        if expected_comment is not None:
+            expected = str(expected_comment)
+            actual_comment = str(
+                getattr(position, "comment", "") or ""
+            )
+            if actual_comment != expected:
+                raise RuntimeError(
+                    f"Position {position.ticket} comment {actual_comment!r} "
+                    f"does not exactly match {expected!r}"
+                )
         # Cap volume at the actual position size to avoid "Invalid volume"
         vol = min(volume or position.volume, position.volume)
         if vol <= 0:
             self.logger.warning("Invalid volume when closing %s", symbol)
             return False
-        tick = mt5.symbol_info_tick(symbol)
+        tick = mt5.symbol_info_tick(symbol_key)
         if tick is None:
-            raise RuntimeError(f"No tick data for {symbol}")
+            raise RuntimeError(f"No tick data for {symbol_key}")
         order_type = mt5.ORDER_TYPE_SELL if position.type == mt5.POSITION_TYPE_BUY else mt5.ORDER_TYPE_BUY
         price = tick.bid if order_type == mt5.ORDER_TYPE_SELL else tick.ask
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
+            "symbol": symbol_key,
             "position": position.ticket,
             "volume": vol,
             "type": order_type,
@@ -1118,7 +1218,7 @@ class MT5Executor:
             "magic": self.settings.magic,
             "comment": "Close by bot",
         }
-        fill_modes = self._resolve_fill_modes(symbol)
+        fill_modes = self._resolve_fill_modes(symbol_key)
         unsupported_code = getattr(mt5, "TRADE_RETCODE_INVALID_FILLING", 10030)
         last_result = None
         for fill_mode in fill_modes:
@@ -1129,7 +1229,7 @@ class MT5Executor:
             if result is None:
                 raise RuntimeError(f"order_send close returned None: {mt5.last_error()}")
             if result.retcode == mt5.TRADE_RETCODE_DONE:
-                self._fill_mode_cache[symbol] = fill_mode
+                self._fill_mode_cache[symbol_key] = fill_mode
                 return True
             last_result = result
             if result.retcode != unsupported_code:
@@ -2269,7 +2369,11 @@ class MT5Executor:
         return float(tick.bid)
 
     def get_position(self, symbol: str, position_id: Optional[int]) -> Optional[Any]:
-        return self._find_position(symbol, position_id)
+        return self._find_position(
+            symbol,
+            position_id,
+            strict=position_id is not None,
+        )
 
     def list_positions(self) -> List[Dict[str, Any]]:
         positions = mt5.positions_get()
@@ -2311,16 +2415,71 @@ class MT5Executor:
         return None immediately — do NOT fall back to the symbol search.
         This prevents accidentally operating on a different open leg.
         """
-        if ticket:
-            positions = mt5.positions_get(ticket=ticket)
-            if positions:
-                return positions[0]
+        symbol_key = str(symbol or "").strip().upper()
+        if ticket is not None:
+            if isinstance(ticket, bool):
+                raise RuntimeError("position ticket must be a positive integer")
+            try:
+                normalized_ticket = int(ticket)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Invalid position ticket {ticket!r}"
+                ) from exc
+            if normalized_ticket <= 0:
+                raise RuntimeError("position ticket must be a positive integer")
+            positions = mt5.positions_get(ticket=normalized_ticket)
+            if positions is None:
+                raise RuntimeError(
+                    f"MT5 positions_get({normalized_ticket}) failed: "
+                    f"{mt5.last_error()}"
+                )
+            if len(positions) > 0:
+                if len(positions) != 1:
+                    raise RuntimeError(
+                        f"MT5 returned duplicate positions for ticket "
+                        f"{normalized_ticket}"
+                    )
+                position = positions[0]
+                actual_ticket = int(
+                    getattr(position, "ticket", 0) or 0
+                )
+                actual_symbol = str(
+                    getattr(position, "symbol", "") or ""
+                ).strip().upper()
+                actual_magic = int(
+                    getattr(position, "magic", 0) or 0
+                )
+                if actual_ticket != normalized_ticket:
+                    raise RuntimeError(
+                        f"MT5 returned position {actual_ticket} for requested "
+                        f"ticket {normalized_ticket}"
+                    )
+                if actual_symbol != symbol_key:
+                    raise RuntimeError(
+                        f"Position {normalized_ticket} symbol "
+                        f"{actual_symbol!r} does not match {symbol_key!r}"
+                    )
+                if actual_magic != int(self.settings.magic):
+                    raise RuntimeError(
+                        f"Position {normalized_ticket} is not owned by "
+                        "this executor"
+                    )
+                return position
             if strict:
                 return None  # position closed — don't touch another leg
-        positions = mt5.positions_get(symbol=symbol)
-        if not positions:
+        positions = mt5.positions_get(symbol=symbol_key)
+        if positions is None:
+            raise RuntimeError(
+                f"MT5 positions_get({symbol_key}) failed: {mt5.last_error()}"
+            )
+        if len(positions) == 0:
             return None
         for pos in positions:
-            if pos.magic == self.settings.magic:
+            if (
+                str(getattr(pos, "symbol", "") or "").strip().upper()
+                == symbol_key
+                and int(getattr(pos, "magic", 0) or 0)
+                == int(self.settings.magic)
+            ):
                 return pos
-        return positions[0]
+        return None

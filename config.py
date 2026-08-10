@@ -63,11 +63,20 @@ PERSISTENT_LIMIT_ENABLED = (
     os.getenv("PERSISTENT_LIMIT_ENABLED", "0").strip().lower()
     in {"1", "true", "yes", "on"}
 )
+# Emergency-only cleanup for a fill that conflicts with an already active
+# idea.  It remains independently opt-in even when persistent LIMITs are on.
+PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED = (
+    os.getenv(
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        "0",
+    ).strip().lower()
+    in {"1", "true", "yes", "on"}
+)
 PERSISTENT_LIMIT_SYMBOLS = frozenset(
     symbol.strip().upper()
     for symbol in os.getenv(
         "PERSISTENT_LIMIT_SYMBOLS",
-        "GOLD,EURUSD,GBPUSD,USDCAD",
+        "EURUSD",
     ).split(",")
     if symbol.strip()
 )

@@ -72,6 +72,7 @@ def _plan(*, attach_tickets: bool) -> PendingLimitPlan:
 
 def _core(executor, *, plans=None):
     core = main.Core.__new__(main.Core)
+    core.universe = {"EURUSD": "EURUSD"}
     core.mt5_executor = executor
     core.pending_limits = dict(plans or {})
     core._pending_state_safe = True
@@ -83,6 +84,7 @@ def _core(executor, *, plans=None):
     core._trigger_signatures = {}
     core._entry_cooldowns = {}
     core.shadow_tick_watcher = None
+    core._pending_limit_capability_cache = {}
     core._roll_daily_counters = lambda: None
     core._capture_quote = lambda _symbol: None
     return core
@@ -126,13 +128,33 @@ class PlacementExecutor:
 
 
 class ReconcileExecutor:
-    def __init__(self, *, live_orders, fills=None, positions=None):
+    def __init__(
+        self,
+        *,
+        live_orders,
+        fills=None,
+        positions=None,
+        close_results=None,
+        capabilities=None,
+    ):
+        self.settings = SimpleNamespace(magic=4242)
         self.live_orders = [dict(row) for row in live_orders]
         self.fills = dict(fills or {})
         self.positions = [dict(row) for row in (positions or [])]
         self.cancelled = []
         self.fill_queries = []
         self.placement_calls = 0
+        self.close_results = list(close_results or [])
+        self.close_calls = []
+        self.capabilities = dict(
+            capabilities
+            or {
+                "limit_allowed": True,
+                "specified_expiration": True,
+                "account_hedging": True,
+                "ready": True,
+            }
+        )
 
     def list_pending_orders(self):
         return [dict(row) for row in self.live_orders]
@@ -156,6 +178,32 @@ class ReconcileExecutor:
         ]
         return True
 
+    def pending_limit_capabilities(self, _symbol):
+        return dict(self.capabilities)
+
+    def close_trade(
+        self,
+        symbol,
+        *,
+        position_id,
+        volume,
+        expected_comment=None,
+    ):
+        self.close_calls.append(
+            (
+                str(symbol),
+                int(position_id),
+                volume,
+                str(expected_comment or ""),
+            )
+        )
+        if not self.close_results:
+            raise AssertionError("unexpected emergency close")
+        result = self.close_results.pop(0)
+        if isinstance(result, BaseException):
+            raise result
+        return bool(result)
+
     @staticmethod
     def get_pending_order_history(_ticket):
         return {"terminal": True, "fill_expected": False}
@@ -163,6 +211,56 @@ class ReconcileExecutor:
     def place_limit_leg(self, *_args, **_kwargs):
         self.placement_calls += 1
         raise AssertionError("reconciliation must never place a duplicate")
+
+
+def _conflict_runtime(
+    plan,
+    *,
+    live_orders,
+    fills,
+    positions,
+    close_results,
+    capabilities=None,
+):
+    executor = ReconcileExecutor(
+        live_orders=live_orders,
+        fills=fills,
+        positions=positions,
+        close_results=close_results,
+        capabilities=capabilities,
+    )
+    core = _core(executor, plans={plan.symbol: plan})
+    existing_trade = SimpleNamespace(idea_id="different-live-idea")
+    core.active_trades[plan.symbol] = existing_trade
+    snapshots = []
+    core._save_pending_limit_state = lambda: snapshots.append(
+        {
+            symbol: pending.to_dict()
+            for symbol, pending in core.pending_limits.items()
+        }
+    )
+    core._materialize_pending_trade = (
+        lambda *_args, **_kwargs: pytest.fail(
+            "a conflicting fill must never be materialized"
+        )
+    )
+    return core, executor, existing_trade, snapshots
+
+
+def _opening_fill(order_ticket, position_id, comment, *, leg=1):
+    return {
+        "order_ticket": order_ticket,
+        "deals": [
+            {
+                "deal_ticket": 500 + leg,
+                "position_id": position_id,
+                "volume": 0.1,
+                "price": 1.0999,
+                "time_msc": int((NOW + 10.0 + leg) * 1000),
+                "comment": comment,
+            }
+        ],
+    }
 
 
 def test_arm_persists_exact_intent_before_every_broker_placement(monkeypatch):
@@ -277,6 +375,11 @@ def test_partial_fill_cancels_siblings_then_materializes_active_trade(monkeypatc
 def test_conflicting_fill_never_merges_and_stays_durable_after_exposure_absent(
     monkeypatch,
 ):
+    monkeypatch.setattr(
+        main,
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        False,
+    )
     clock = [NOW + 100.0]
     monkeypatch.setattr(main.time, "time", lambda: clock[0])
     plan = _plan(attach_tickets=True)
@@ -387,6 +490,309 @@ def test_conflicting_fill_never_merges_and_stays_durable_after_exposure_absent(
     )
     assert core.active_trades == {}
     assert core._pending_entry_events == {}
+
+
+def test_emergency_autoclose_closes_only_exact_owned_position_and_retains_audit(
+    monkeypatch,
+):
+    clock = [NOW + 100.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(
+        main,
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        True,
+    )
+    plan = _plan(attach_tickets=True)
+    comments = {
+        index: plan.broker_comment_for_leg(index)
+        for index in (1, 2, 3)
+    }
+    positions = [
+        {
+            "symbol": "EURUSD",
+            "ticket": 8000,
+            "comment": "EXISTING:idea",
+        },
+        {
+            "symbol": "EURUSD",
+            "ticket": 9001,
+            "comment": comments[1],
+        },
+    ]
+    core, executor, existing_trade, snapshots = _conflict_runtime(
+        plan,
+        live_orders=[
+            {"ticket": 102, "comment": comments[2]},
+            {"ticket": 103, "comment": comments[3]},
+        ],
+        fills={
+            101: _opening_fill(101, 9001, comments[1]),
+        },
+        positions=positions,
+        close_results=[True],
+    )
+
+    core._manage_pending_limits()
+
+    assert executor.cancelled == [102, 103]
+    assert executor.close_calls == [
+        ("EURUSD", 9001, None, comments[1])
+    ]
+    assert core.active_trades["EURUSD"] is existing_trade
+    assert core._pending_entry_events == {}
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_REQUESTED_REASON
+    )
+    assert any(
+        row["EURUSD"]["reason"]
+        == main._PENDING_CONFLICT_CLOSE_REQUESTED_REASON
+        for row in snapshots
+        if "EURUSD" in row
+    )
+
+    # A successful request is not proof of absence. A still-visible position
+    # is retained and not immediately closed a second time.
+    clock[0] = NOW + 101.0
+    core._manage_pending_limits()
+    assert len(executor.close_calls) == 1
+    assert "EURUSD" in core.pending_limits
+
+    # A later healthy broker snapshot proves exposure absence, but the plan is
+    # still a durable same-symbol recovery/audit marker and cannot auto-resume.
+    executor.positions = [positions[0]]
+    clock[0] = NOW + 102.0
+    core._manage_pending_limits()
+    assert "EURUSD" in core.pending_limits
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_RESOLVED_REASON
+    )
+    assert core.active_trades["EURUSD"] is existing_trade
+    assert core._pending_entry_events == {}
+
+    clock[0] = NOW + 10_000.0
+    core._manage_pending_limits()
+    assert "EURUSD" in core.pending_limits
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_RESOLVED_REASON
+    )
+    assert len(executor.close_calls) == 1
+
+
+@pytest.mark.parametrize(
+    "identity_case",
+    ["wrong_comment", "wrong_id", "wrong_symbol"],
+)
+def test_emergency_autoclose_never_closes_ambiguous_identity(
+    monkeypatch,
+    identity_case,
+):
+    monkeypatch.setattr(main.time, "time", lambda: NOW + 100.0)
+    monkeypatch.setattr(
+        main,
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        True,
+    )
+    plan = _plan(attach_tickets=True)
+    comments = {
+        index: plan.broker_comment_for_leg(index)
+        for index in (1, 2, 3)
+    }
+    adversarial = {
+        "symbol": "EURUSD",
+        "ticket": 9001,
+        "comment": comments[1],
+    }
+    if identity_case == "wrong_comment":
+        adversarial["comment"] = "EXISTING:not-the-plan"
+    elif identity_case == "wrong_id":
+        adversarial["ticket"] = 9999
+    else:
+        adversarial["symbol"] = "GBPUSD"
+    core, executor, existing_trade, _snapshots = _conflict_runtime(
+        plan,
+        live_orders=[
+            {"ticket": 102, "comment": comments[2]},
+            {"ticket": 103, "comment": comments[3]},
+        ],
+        fills={
+            101: _opening_fill(101, 9001, comments[1]),
+        },
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "ticket": 8000,
+                "comment": "EXISTING:idea",
+            },
+            adversarial,
+        ],
+        close_results=[True],
+    )
+
+    core._manage_pending_limits()
+
+    assert executor.cancelled == [102, 103]
+    assert executor.close_calls == []
+    assert "EURUSD" in core.pending_limits
+    assert core.active_trades["EURUSD"] is existing_trade
+    assert core._pending_entry_events == {}
+    assert core._pending_state_safe is False
+
+
+def test_emergency_autoclose_mixed_failure_retries_next_management_tick(
+    monkeypatch,
+):
+    clock = [NOW + 100.0]
+    monkeypatch.setattr(main.time, "time", lambda: clock[0])
+    monkeypatch.setattr(
+        main,
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        True,
+    )
+    plan = _plan(attach_tickets=True)
+    comments = {
+        index: plan.broker_comment_for_leg(index)
+        for index in (1, 2, 3)
+    }
+    existing_row = {
+        "symbol": "EURUSD",
+        "ticket": 8000,
+        "comment": "EXISTING:idea",
+    }
+    position_1 = {
+        "symbol": "EURUSD",
+        "ticket": 9001,
+        "comment": comments[1],
+    }
+    position_2 = {
+        "symbol": "EURUSD",
+        "ticket": 9002,
+        "comment": comments[2],
+    }
+    core, executor, existing_trade, _snapshots = _conflict_runtime(
+        plan,
+        live_orders=[{"ticket": 103, "comment": comments[3]}],
+        fills={
+            101: _opening_fill(101, 9001, comments[1], leg=1),
+            102: _opening_fill(102, 9002, comments[2], leg=2),
+        },
+        positions=[existing_row, position_1, position_2],
+        close_results=[True, False, True],
+    )
+
+    core._manage_pending_limits()
+
+    assert executor.cancelled == [103]
+    assert executor.close_calls == [
+        ("EURUSD", 9001, None, comments[1]),
+        ("EURUSD", 9002, None, comments[2]),
+    ]
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_FAILED_REASON
+    )
+    assert core.active_trades["EURUSD"] is existing_trade
+
+    # The first exact close is now absent. FAILED retries the remaining exact
+    # position on the very next management tick; no 30-second grace applies.
+    executor.positions = [existing_row, position_2]
+    clock[0] = NOW + 101.0
+    core._manage_pending_limits()
+    assert executor.close_calls[-1] == (
+        "EURUSD",
+        9002,
+        None,
+        comments[2],
+    )
+    assert len(executor.close_calls) == 3
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_REQUESTED_REASON
+    )
+    assert "EURUSD" in core.pending_limits
+
+    executor.positions = [existing_row]
+    clock[0] = NOW + 102.0
+    core._manage_pending_limits()
+    assert core.pending_limits["EURUSD"].reason == (
+        main._PENDING_CONFLICT_CLOSE_RESOLVED_REASON
+    )
+    assert core.active_trades["EURUSD"] is existing_trade
+    assert core._pending_entry_events == {}
+
+
+def test_emergency_autoclose_requires_hedging_capability(monkeypatch):
+    monkeypatch.setattr(main.time, "time", lambda: NOW + 100.0)
+    monkeypatch.setattr(
+        main,
+        "PERSISTENT_LIMIT_CONFLICT_AUTOCLOSE_ENABLED",
+        True,
+    )
+    plan = _plan(attach_tickets=True)
+    comments = {
+        index: plan.broker_comment_for_leg(index)
+        for index in (1, 2, 3)
+    }
+    core, executor, existing_trade, _snapshots = _conflict_runtime(
+        plan,
+        live_orders=[
+            {"ticket": 102, "comment": comments[2]},
+            {"ticket": 103, "comment": comments[3]},
+        ],
+        fills={
+            101: _opening_fill(101, 9001, comments[1]),
+        },
+        positions=[
+            {
+                "symbol": "EURUSD",
+                "ticket": 8000,
+                "comment": "EXISTING:idea",
+            },
+            {
+                "symbol": "EURUSD",
+                "ticket": 9001,
+                "comment": comments[1],
+            },
+        ],
+        close_results=[True],
+        capabilities={
+            "limit_allowed": True,
+            "specified_expiration": True,
+            "account_hedging": False,
+            "ready": False,
+        },
+    )
+
+    core._manage_pending_limits()
+
+    assert executor.cancelled == [102, 103]
+    assert executor.close_calls == []
+    assert "EURUSD" in core.pending_limits
+    assert core.active_trades["EURUSD"] is existing_trade
+    assert core._pending_state_safe is False
+
+
+def test_emergency_close_classifier_refuses_missing_recorded_position_id():
+    plan = _plan(attach_tickets=True).record_fill(
+        1,
+        0.1,
+        1.0999,
+        deal_ticket=501,
+        position_id=None,
+        now=NOW + 10.0,
+    )
+    targets, errors = main.Core._pending_plan_close_targets(
+        plan,
+        [
+            {
+                "symbol": "EURUSD",
+                "ticket": 9001,
+                "comment": plan.broker_comment_for_leg(1),
+            }
+        ],
+        executor_magic=4242,
+    )
+
+    assert targets == ()
+    assert errors
+    assert any("recorded" in error for error in errors)
 
 
 def test_pending_conflict_ownership_classifier_is_exact_and_conservative():

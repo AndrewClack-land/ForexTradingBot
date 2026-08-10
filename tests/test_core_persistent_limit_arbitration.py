@@ -78,6 +78,15 @@ class _Executor:
     def account_is_hedging() -> bool:
         return True
 
+    @staticmethod
+    def pending_limit_capabilities(_symbol) -> dict:
+        return {
+            "limit_allowed": True,
+            "specified_expiration": True,
+            "account_hedging": True,
+            "ready": True,
+        }
+
     def place_limit_leg(self, symbol, **request) -> dict:
         self.placements.append({"symbol": symbol, **request})
         return {
