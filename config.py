@@ -315,6 +315,18 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
+# Maximum age, in closed H1 bars, of the IMFVG signal that defines the 1H FVG
+# regime. The regime latches until the opposite signal appears, so without a
+# ceiling a single gap keeps raising the opposing side's score margin for as
+# long as it stays the newest signal — live journals showed regimes driven by
+# signals 77-97 bars old (3-4 days) on every symbol. 24 bars = 24 hours.
+# Past the ceiling the regime is NEUTRAL and both margins fall back to the
+# base margin. Set to 0 to restore the previous unbounded latch.
+_fvg_regime_max_age = _env_int("FVG_REGIME_MAX_AGE_BARS")
+FVG_REGIME_MAX_AGE_BARS = max(
+    0, _fvg_regime_max_age if _fvg_regime_max_age is not None else 24
+)
+
 # ================== SHADOW SCORE (DIAGNOSTIC ONLY) ==================
 # Path to a frozen ``shadow_models.json`` produced by an offline WFO run. When
 # set, the newest fitted fold is replayed against live ENTER signals and its

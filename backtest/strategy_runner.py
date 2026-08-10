@@ -574,6 +574,7 @@ class NarrativeBacktestConfig:
     orderblock_touch_min_abs: float = 0.0005
     orderblock_max_age_bars: int = 80
     htf_score_margin: int = 2
+    fvg_regime_max_age_bars: int = 24
     release_commit: Optional[str] = None
     release_manifest_sha256: Optional[str] = None
     environment_lock_sha256: Optional[str] = None
@@ -611,6 +612,7 @@ class NarrativeBacktestConfig:
         orderblock_touch_min_abs: float = 0.0005,
         orderblock_max_age_bars: int = 80,
         htf_score_margin: int = 2,
+        fvg_regime_max_age_bars: int = 24,
         release_commit: Optional[str] = None,
         release_manifest_sha256: Optional[str] = None,
         environment_lock_sha256: Optional[str] = None,
@@ -797,6 +799,7 @@ class NarrativeBacktestConfig:
             ],
             orderblock_max_age_bars=int(orderblock_max_age_bars),
             htf_score_margin=max(1, int(htf_score_margin)),
+            fvg_regime_max_age_bars=max(0, int(fvg_regime_max_age_bars)),
             release_commit=str(release_commit).strip() if release_commit else None,
             release_manifest_sha256=normalized_release_manifest,
             environment_lock_sha256=normalized_environment_lock,
@@ -839,6 +842,7 @@ class NarrativeBacktestConfig:
                 "orderblock_touch_min_abs": self.orderblock_touch_min_abs,
                 "orderblock_max_age_bars": self.orderblock_max_age_bars,
                 "htf_score_margin": self.htf_score_margin,
+                "fvg_regime_max_age_bars": self.fvg_regime_max_age_bars,
             },
             "release_commit": self.release_commit,
             "release_manifest_sha256": self.release_manifest_sha256,
@@ -1131,6 +1135,7 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.orderblock_touch_min_abs = config.orderblock_touch_min_abs
     strategy.orderblock_max_age_bars = config.orderblock_max_age_bars
     strategy.htf_score_margin = config.htf_score_margin
+    strategy.fvg_regime_max_age_bars = config.fvg_regime_max_age_bars
     expected = {
         "risk_per_trade": config.risk_fraction,
         "rejection_block_entry_enabled": (
@@ -1141,6 +1146,7 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
         "orderblock_touch_min_abs": config.orderblock_touch_min_abs,
         "orderblock_max_age_bars": config.orderblock_max_age_bars,
         "htf_score_margin": config.htf_score_margin,
+        "fvg_regime_max_age_bars": config.fvg_regime_max_age_bars,
     }
     mismatches = {
         name: (getattr(strategy, name, None), value)

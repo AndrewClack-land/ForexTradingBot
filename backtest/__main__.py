@@ -202,6 +202,17 @@ def _build_parser() -> argparse.ArgumentParser:
         default=2,
     )
     strategy_run.add_argument(
+        "--fvg-regime-max-age-bars",
+        type=int,
+        default=24,
+        help=(
+            "maximum age, in closed H1 bars, of the latched IMFVG signal that "
+            "defines the 1H FVG regime; past it the regime expires to NEUTRAL "
+            "and both score margins fall back to the base margin. 0 restores "
+            "the previous unbounded latch"
+        ),
+    )
+    strategy_run.add_argument(
         "--release-commit-file",
         help=(
             "file containing the exact strategy Git commit "
@@ -316,6 +327,17 @@ def _build_parser() -> argparse.ArgumentParser:
         "--htf-score-margin",
         type=int,
         default=2,
+    )
+    optimize_v2.add_argument(
+        "--fvg-regime-max-age-bars",
+        type=int,
+        default=24,
+        help=(
+            "maximum age, in closed H1 bars, of the latched IMFVG signal that "
+            "defines the 1H FVG regime; past it the regime expires to NEUTRAL "
+            "and both score margins fall back to the base margin. 0 restores "
+            "the previous unbounded latch"
+        ),
     )
     optimize_v2.add_argument(
         "--cluster-proxy-data",
@@ -659,6 +681,7 @@ def _strategy_run(args: argparse.Namespace) -> int:
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
+        fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
@@ -808,6 +831,7 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
+        fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,

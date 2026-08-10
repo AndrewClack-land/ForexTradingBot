@@ -99,6 +99,9 @@ ORDERBLOCK_TOUCH_ATR_K = float(getattr(_cfg, "ORDERBLOCK_TOUCH_ATR_K", 0.15))
 ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.0005))
 ORDERBLOCK_MAX_AGE_BARS = int(getattr(_cfg, "ORDERBLOCK_MAX_AGE_BARS", 240))
 HTF_SCORE_MARGIN = int(getattr(_cfg, "HTF_SCORE_MARGIN", 1))
+FVG_REGIME_MAX_AGE_BARS = max(
+    0, int(getattr(_cfg, "FVG_REGIME_MAX_AGE_BARS", 24))
+)
 
 Side = Literal["LONG", "SHORT", "NEUTRAL"]
 
@@ -391,6 +394,8 @@ class NarrativeStrategy:
         self.fvg_width_filter_atr = 0.0     # min gap width in ATR(200) fractions
         self.fvg_regime_lookback = 300      # 1H bars scanned for IMFVG signals
         self.fvg_atr_period = 200
+        # Ceiling on how old the latched IMFVG signal may be. 0 = unbounded.
+        self.fvg_regime_max_age_bars = int(FVG_REGIME_MAX_AGE_BARS)
 
         self.use_prev_candle_stop_floor = True
 
@@ -486,6 +491,18 @@ class NarrativeStrategy:
         if os_state is None:
             return "NEUTRAL", "FVG: сигналов IMFVG на 1H не найдено"
         side: Side = "LONG" if os_state == 1 else "SHORT"
+
+        # The regime latches until the opposite signal appears, so an old gap
+        # can keep raising the opposing side's margin for days. Past the
+        # configured ceiling the regime expires to NEUTRAL instead of being
+        # carried forward; both margins then fall back to the base margin.
+        max_age = int(self.fvg_regime_max_age_bars)
+        if max_age > 0 and last_sig_ago > max_age:
+            return "NEUTRAL", (
+                f"FVG-режим истёк (IMFVG 1H, сигнал {last_sig_ago} барами "
+                f"ранее > лимита {max_age})"
+            )
+
         return side, f"FVG-режим {side} (IMFVG 1H, сигнал {last_sig_ago} барами ранее)"
 
     def _build_htf_context(
