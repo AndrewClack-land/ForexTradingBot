@@ -8,8 +8,9 @@ import threading
 import time
 import traceback
 import uuid
+from dataclasses import replace as dataclass_replace
 from pathlib import Path
-from datetime import datetime, date, time as dt_time, timezone
+from datetime import datetime, date, time as dt_time, timedelta, timezone
 from typing import Dict, Any, List, Tuple, Optional
 from zoneinfo import ZoneInfo
 
@@ -32,6 +33,14 @@ from config import (
     MT5_RISK_PER_TRADE,
     MT5_INITIAL_CAPITAL,
     MT5_SLIPPAGE,
+    PERSISTENT_LIMIT_ENABLED,
+    PERSISTENT_LIMIT_SYMBOLS,
+    PERSISTENT_LIMIT_TTL_MIN,
+    PERSISTENT_LIMIT_STATE_PATH,
+    SHADOW_TICK_WATCHER_ENABLED,
+    SHADOW_TICK_WATCHER_POLL_SEC,
+    SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC,
+    SHADOW_TICK_WATCHER_DB_PATH,
     MT5_BRIDGE_SYMBOLS,
     MT5_BRIDGE_TIMEFRAMES,
     MT5_BRIDGE_LOOKBACK_DAYS,
@@ -100,12 +109,34 @@ from core.vol_regime import VolContext, build_vol_context, entry_gate
 from core.profiler import TickProfiler
 from core.risk_rules import RiskRules
 from core.position_adding import PyramidRiskError, build_manager as build_pyramid_manager
+from core.persistent_limit import (
+    BROKER_COMMENT_PREFIX,
+    PendingLimitLeg,
+    PendingLimitPlan,
+    PendingLimitState,
+    PendingLimitValidationError,
+    load_pending_limits,
+    save_pending_limits,
+)
+from core.shadow_tick_watcher import (
+    MT5ReadOnlyFacade,
+    QuoteTick,
+    ShadowPlanSpec,
+    ShadowTickWatcher,
+    stable_plan_id,
+)
 from executors.mt5_executor import (
     MT5Executor,
     MT5Settings,
     RiskCapacityError,
 )
 from mt5_bridge.mt5_native_bridge import MT5NativeBridge, parse_symbol_spec, parse_timeframes
+
+
+_PENDING_CONFLICT_REASON = (
+    "incompatible active/broker position on symbol"
+)
+_PENDING_CONFLICT_ABSENCE_GRACE_SEC = 30.0
 
 
 def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> List[float]:
@@ -189,6 +220,24 @@ class Core:
 
         self.active_trades: dict[str, ActiveTrade] = load_active_trades(AI_DATA_DIR / "active_trades.json")
         print(f"[Core] restored active_trades={len(self.active_trades)}")
+        self.pending_limits: Dict[str, PendingLimitPlan] = {}
+        self._pending_state_safe = True
+        self._pending_entry_events: Dict[str, Dict[str, Any]] = {}
+        try:
+            self.pending_limits = load_pending_limits(
+                PERSISTENT_LIMIT_STATE_PATH
+            )
+            print(
+                f"[Persistent LIMIT] restored plans={len(self.pending_limits)}"
+            )
+        except PendingLimitValidationError as exc:
+            # Never interpret a corrupt book as empty. Broker orders may still
+            # exist and a fresh entry could duplicate them.
+            self._pending_state_safe = False
+            print(
+                "[Persistent LIMIT] STATE CORRUPT — all new entries blocked "
+                f"until recovery: {exc}"
+            )
 
         self.ai_cfg = AIConfig()
         self.ai_store = TradeStore(self.ai_cfg)
@@ -252,7 +301,51 @@ class Core:
         if MT5_EXECUTION_ENABLED:
             self._try_create_executor()
 
+        self.shadow_tick_watcher: Optional[ShadowTickWatcher] = None
+        if SHADOW_TICK_WATCHER_ENABLED:
+            try:
+                import MetaTrader5 as _mt5
+
+                max_chunks = max(
+                    1,
+                    int(math.ceil(
+                        SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC / 60.0
+                    )),
+                )
+                self.shadow_tick_watcher = ShadowTickWatcher(
+                    mt5=MT5ReadOnlyFacade.from_module(_mt5),
+                    db_path=SHADOW_TICK_WATCHER_DB_PATH,
+                    poll_seconds=SHADOW_TICK_WATCHER_POLL_SEC,
+                    max_query_span_seconds=60.0,
+                    max_chunks_per_poll=max_chunks,
+                )
+                if self.shadow_tick_watcher.start():
+                    print(
+                        "[Shadow Tick] diagnostic watcher started "
+                        f"(poll={SHADOW_TICK_WATCHER_POLL_SEC:g}s, "
+                        f"db={SHADOW_TICK_WATCHER_DB_PATH})"
+                    )
+                else:
+                    print(
+                        "[Shadow Tick] watcher disabled after fail-open init: "
+                        f"{self.shadow_tick_watcher.disabled_reason}"
+                    )
+            except Exception as exc:
+                self.shadow_tick_watcher = None
+                print(f"[Shadow Tick] watcher unavailable (fail-open): {exc}")
+
+        print(
+            "[Persistent LIMIT] "
+            f"{'enabled' if PERSISTENT_LIMIT_ENABLED else 'disabled'} "
+            f"(exact retest, TTL={PERSISTENT_LIMIT_TTL_MIN}m, "
+            f"symbols={','.join(sorted(PERSISTENT_LIMIT_SYMBOLS)) or 'none'})"
+        )
         if self.mt5_executor:
+            # Reconcile the pre-fill order book before generic position
+            # hydration. A pending fill carries richer setup/TP identity than
+            # broker rows alone and must win that race. The diagnostic watcher
+            # starts first so a restart-time fill also receives a terminal fact.
+            self._manage_pending_limits(startup=True)
             self._hydrate_active_trades_from_mt5()
 
         self.fxpro_dom_recorder: Optional[FxProDomRecorder] = None
@@ -378,6 +471,9 @@ class Core:
         return self.fxpro_cluster_dataset
 
     def close(self) -> None:
+        watcher = getattr(self, "shadow_tick_watcher", None)
+        if watcher is not None:
+            watcher.close()
         for attribute in (
             "fxpro_dom_recorder",
             "fxpro_tick_cluster_recorder",
@@ -416,6 +512,1517 @@ class Core:
             print(f"[MT5] Executor unavailable: {exc} — will retry")
             return False
 
+    def _save_pending_limit_state(self) -> None:
+        save_pending_limits(
+            self.pending_limits,
+            PERSISTENT_LIMIT_STATE_PATH,
+        )
+
+    def _capture_quote(self, symbol: str) -> Optional[QuoteTick]:
+        """Read one broker quote for pending/shadow instrumentation."""
+        watcher = getattr(self, "shadow_tick_watcher", None)
+        source_symbol = self.universe.get(symbol, symbol)
+        if watcher is not None:
+            quote = watcher.capture_activation_quote(source_symbol)
+            if quote is not None:
+                return quote
+        try:
+            import MetaTrader5 as _mt5
+
+            raw = _mt5.symbol_info_tick(source_symbol)
+            if raw is None:
+                return None
+            return QuoteTick(
+                time_msc=int(
+                    getattr(raw, "time_msc", 0)
+                    or int(time.time() * 1000)
+                ),
+                bid=float(raw.bid),
+                ask=float(raw.ask),
+                flags=int(getattr(raw, "flags", 0) or 0),
+            )
+        except Exception:
+            return None
+
+    @staticmethod
+    def _closed_m15_decision_time(
+        data: Optional[Dict[str, Any]],
+    ) -> datetime:
+        """Stable identity timestamp for repeated scans of one closed M15."""
+        try:
+            frame = (data or {}).get("15M")
+            raw = frame.index[-1]
+            value = (
+                raw.to_pydatetime()
+                if hasattr(raw, "to_pydatetime")
+                else datetime.fromisoformat(str(raw))
+            )
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            return value + timedelta(minutes=15)
+        except Exception:
+            now = datetime.now(timezone.utc)
+            minute = (now.minute // 15) * 15
+            return now.replace(
+                minute=minute,
+                second=0,
+                microsecond=0,
+            )
+
+    def _record_shadow_scan_raw(
+        self,
+        symbol: str,
+        *,
+        observed_at: datetime,
+    ) -> Optional[QuoteTick]:
+        """Record the quote visible to the actual 60-second loop.
+
+        It is recorded for every still-live shadow plan, even if the strategy
+        no longer emits the candidate. That is what separates a cadence miss
+        from a policy/trigger disappearance.
+        """
+        watcher = getattr(self, "shadow_tick_watcher", None)
+        if watcher is None or not watcher.enabled:
+            return None
+        quote = self._capture_quote(symbol)
+        if quote is None:
+            return None
+        for plan_id in watcher.active_plan_ids(symbol):
+            watcher.record_scan(
+                plan_id,
+                quote,
+                observed_at_utc=observed_at,
+                candidate_matches=False,
+                policy_executable=False,
+                disposition="RAW_60S_SCAN",
+            )
+        return quote
+
+    def _register_shadow_candidate(
+        self,
+        symbol: str,
+        sig: Dict[str, Any],
+        *,
+        trigger_signature: str,
+        data: Optional[Dict[str, Any]],
+        observed_at: datetime,
+    ) -> Tuple[Optional[str], Optional[QuoteTick], float]:
+        """Register one fully filtered candidate without influencing it."""
+        expires_at = (
+            observed_at + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
+        ).timestamp()
+        watcher = getattr(self, "shadow_tick_watcher", None)
+        # Activation must be captured after every policy gate has passed.
+        # Reusing the quote from the start of the symbol scan would count ticks
+        # that happened before the entry decision actually existed.
+        quote = self._capture_quote(symbol)
+        if watcher is None or not watcher.enabled:
+            return None, quote, expires_at
+
+        if quote is None:
+            return None, None, expires_at
+        decision_time = self._closed_m15_decision_time(data)
+        deployment_id = (
+            os.getenv("DEPLOYMENT_ID", "").strip()
+            or os.getenv("STRATEGY_VERSION", "unversioned").strip()
+            or "unversioned"
+        )
+        plan_id = stable_plan_id(
+            deployment_id=deployment_id,
+            symbol=symbol,
+            candidate_signature=trigger_signature,
+            decision_bar_close=decision_time,
+        )
+        planned = float(sig.get("entry_price") or 0.0)
+        lower = float(
+            sig.get("entry_min")
+            if sig.get("entry_min") is not None
+            else planned
+        )
+        upper = float(
+            sig.get("entry_max")
+            if sig.get("entry_max") is not None
+            else planned
+        )
+        point = 0.0
+        try:
+            import MetaTrader5 as _mt5
+
+            info = _mt5.symbol_info(self.universe.get(symbol, symbol))
+            point = float(
+                getattr(info, "point", 0.0)
+                or getattr(info, "trade_tick_size", 0.0)
+                or 0.0
+            )
+        except Exception:
+            pass
+        spec = ShadowPlanSpec(
+            plan_id=plan_id,
+            symbol=symbol,
+            source_symbol=self.universe.get(symbol, symbol),
+            side=str(sig.get("side") or ""),
+            entry_min=min(lower, upper),
+            entry_max=max(lower, upper),
+            planned_entry=planned,
+            stop_price=float(sig.get("stop_price") or 0.0),
+            activated_at_utc=observed_at,
+            activation_tick_msc=int(quote.time_msc),
+            expires_at_utc=datetime.fromtimestamp(
+                expires_at, tz=timezone.utc
+            ),
+            point=point,
+            candidate_signature=trigger_signature,
+            trigger_kind=str(sig.get("trigger_kind") or ""),
+            trigger_event_id=sig.get("trigger_event_id"),
+            setup_tf=str(sig.get("setup_tf") or sig.get("tf") or ""),
+            strategy_version=os.getenv(
+                "STRATEGY_VERSION", "unversioned"
+            ),
+            deployment_id=deployment_id,
+            metadata={
+                "session": self.global_context.get("session"),
+                "entry_range_widened": bool(
+                    sig.get("entry_range_widened")
+                ),
+            },
+        )
+        if watcher.register_plan(spec, activation_quote=quote):
+            print(
+                f"[Shadow Tick] {symbol} plan={plan_id[:12]} "
+                f"expires={PERSISTENT_LIMIT_TTL_MIN}m"
+            )
+        watcher.record_scan(
+            plan_id,
+            quote,
+            observed_at_utc=observed_at,
+            candidate_matches=True,
+            policy_executable=True,
+            disposition="ELIGIBLE_60S_SCAN",
+        )
+        return plan_id, quote, expires_at
+
+    def _arm_pending_limit(
+        self,
+        symbol: str,
+        sig: Dict[str, Any],
+        *,
+        trigger_signature: str,
+        expires_at: float,
+        shadow_plan_id: Optional[str],
+        observed_at: datetime,
+    ) -> PendingLimitPlan:
+        """Persist intent first, then place exact-price broker LIMIT legs."""
+        if not self._pending_state_safe:
+            raise RuntimeError(
+                "Persistent LIMIT state is unsafe; new entries are blocked"
+            )
+        if not self.mt5_executor:
+            raise RuntimeError("Persistent LIMIT requires an MT5 executor")
+        if symbol in self.pending_limits:
+            return self.pending_limits[symbol]
+
+        side = str(sig.get("side") or "").upper()
+        limit_price = float(sig.get("entry_price") or 0.0)
+        stop_price = float(sig.get("stop_price") or 0.0)
+        tp_prices = [
+            float(value)
+            for value in (sig.get("tp_prices") or [sig.get("tp_price")])
+            if value is not None
+        ]
+        tp_prices = (
+            sorted(tp_prices)
+            if side == "LONG"
+            else sorted(tp_prices, reverse=True)
+        )
+        sig["tp_prices"] = tp_prices
+        if tp_prices:
+            sig["tp_price"] = tp_prices[-1]
+
+        prepared = self.mt5_executor.prepare_limit_entry(
+            symbol,
+            side=side,
+            limit_price=limit_price,
+            stop_price=stop_price,
+        )
+        total_volume = float(prepared["volume"])
+        volume_step = float(prepared.get("volume_step") or 0.01)
+        volume_min = float(prepared.get("volume_min") or volume_step)
+        use_split = (
+            len(tp_prices) > 1
+            and PARTIAL_TP_MODE != "monitor"
+            and self.mt5_executor.account_is_hedging()
+        )
+        if use_split:
+            volumes = _compute_tp_volumes(
+                total_volume,
+                len(tp_prices),
+                step=volume_step,
+            )
+            # Preserve the current split-entry policy: sub-minimum far legs
+            # merge toward TP1 instead of leaving only a distant target.
+            for index in range(len(volumes) - 1, 0, -1):
+                if 0 < volumes[index] < volume_min:
+                    volumes[index - 1] = round(
+                        volumes[index - 1] + volumes[index], 8
+                    )
+                    volumes[index] = 0.0
+        else:
+            volumes = [0.0] * max(0, len(tp_prices) - 1) + [
+                total_volume
+            ]
+        legs = tuple(
+            PendingLimitLeg(
+                index=index + 1,
+                target_price=tp_prices[index],
+                requested_volume=float(volume),
+            )
+            for index, volume in enumerate(volumes)
+            if float(volume) > 0
+        )
+        if not legs:
+            raise RuntimeError(
+                f"Persistent LIMIT sizing produced no broker-valid leg for {symbol}"
+            )
+        allocated = sum(leg.requested_volume for leg in legs)
+        allocation_tolerance = max(1e-8, volume_step * 1e-6)
+        if abs(allocated - total_volume) > allocation_tolerance:
+            raise RuntimeError(
+                f"Persistent LIMIT allocation mismatch for {symbol}: "
+                f"{allocated:g} != {total_volume:g}"
+            )
+
+        plan_id = shadow_plan_id or uuid.uuid4().hex
+        sig.setdefault("planned_entry_price", limit_price)
+        sig["setup_id"] = plan_id
+        sig.setdefault("idea_id", uuid.uuid4().hex)
+        sig["entry_index"] = 1
+        plan = PendingLimitPlan.create(
+            symbol=symbol,
+            signal=sig,
+            trigger_signature=trigger_signature,
+            expires_at=expires_at,
+            magic=int(self.mt5_executor.settings.magic),
+            legs=legs,
+            now=observed_at.timestamp(),
+            plan_id=plan_id,
+        )
+        self.pending_limits[symbol] = plan
+        self._save_pending_limit_state()
+        # Arming is one causal attempt for this trigger. Reserve it before the
+        # unsafe broker-call window so a restart cannot arm the same setup twice.
+        self._trigger_signatures.setdefault(symbol, set()).add(
+            trigger_signature
+        )
+
+        order_rows: List[Dict[str, Any]] = []
+        risk_used = 0.0
+        try:
+            for leg in plan.legs:
+                current = self.pending_limits[symbol]
+                current_leg = next(
+                    item
+                    for item in current.legs
+                    if item.index == leg.index
+                )
+                if current_leg.submission_attempted:
+                    raise RuntimeError(
+                        f"Refusing duplicate order_send for {symbol} "
+                        f"leg {leg.index}; reconciliation owns it"
+                    )
+                current = current.mark_submission_attempted(
+                    leg.index,
+                    now=max(time.time(), current.updated_at),
+                )
+                self.pending_limits[symbol] = current
+                self._save_pending_limit_state()
+                plan = current
+                result = self.mt5_executor.place_limit_leg(
+                    symbol,
+                    side=plan.side,
+                    volume=leg.requested_volume,
+                    limit_price=plan.limit_price,
+                    stop_price=plan.stop_price,
+                    tp_price=leg.target_price,
+                    expires_at=plan.expires_at,
+                    comment=plan.broker_comment_for_leg(leg.index),
+                    risk_budget_amount=float(
+                        prepared["risk_budget_amount"]
+                    ),
+                    risk_used_amount=risk_used,
+                )
+                order_rows.append(
+                    {
+                        **result,
+                        "tp_index": leg.index,
+                    }
+                )
+                ticket = int(result.get("ticket") or 0)
+                if ticket > 0:
+                    plan = plan.attach_order(
+                        leg.index,
+                        ticket,
+                        now=max(time.time(), plan.updated_at),
+                    )
+                    self.pending_limits[symbol] = plan
+                    self._save_pending_limit_state()
+                risk_used += float(result.get("risk_amount") or 0.0)
+                # A placement race may execute immediately. Stop submitting
+                # siblings; the fast reconciliation pass will materialize the
+                # fill and cancel every still-working remainder.
+                if int(result.get("deal") or 0) > 0:
+                    break
+        except Exception:
+            current = self.pending_limits.get(symbol, plan)
+            if any(
+                leg.submission_attempted for leg in current.legs
+            ):
+                try:
+                    current = current.transition(
+                        PendingLimitState.CANCELLING,
+                        now=max(time.time(), current.updated_at),
+                        reason="placement failed; cancel submitted legs",
+                    )
+                    self.pending_limits[symbol] = current
+                    self._save_pending_limit_state()
+                except Exception:
+                    pass
+            # order_send can time out after the server accepted a request.
+            # The attempted marker makes that ambiguity durable even when no
+            # ticket was returned.
+            if not order_rows:
+                print(
+                    f"[Persistent LIMIT] {symbol} placement outcome "
+                    "ambiguous; durable plan retained for reconciliation"
+                )
+            raise
+
+        plan = self.pending_limits[symbol]
+        print(
+            f"[Persistent LIMIT] {symbol} {plan.side} "
+            f"@ {plan.limit_price:.6f}: state={plan.state.value}, "
+            f"legs={len(order_rows)}, expires={plan.expires_at:.0f}"
+        )
+        return plan
+
+    def _materialize_pending_trade(
+        self,
+        plan: PendingLimitPlan,
+        *,
+        fill_time_msc: Optional[int] = None,
+        queue_entry_event: bool = False,
+    ) -> Optional[ActiveTrade]:
+        """Promote broker-confirmed pending fills into managed trade state.
+
+        Active state is persisted before the pending plan is ever retired.
+        """
+        filled_legs = [
+            leg for leg in plan.legs if leg.filled_volume > 0
+        ]
+        if not filled_legs:
+            return None
+        total_volume = sum(leg.filled_volume for leg in filled_legs)
+        average_fill = sum(
+            leg.filled_volume * float(leg.average_fill_price or 0.0)
+            for leg in filled_legs
+        ) / total_volume
+        signal = dict(plan.signal_payload)
+        idea_id = str(signal.get("idea_id") or plan.plan_id)
+        trade = self.active_trades.get(plan.symbol)
+        created = trade is None
+        if trade is not None and str(
+            getattr(trade, "idea_id", "") or ""
+        ) != idea_id:
+            self._pending_state_safe = False
+            raise RuntimeError(
+                f"{plan.symbol} pending fill overlaps a different active idea"
+            )
+
+        if any(
+            int(leg.broker_position_id or 0) <= 0
+            for leg in filled_legs
+        ):
+            # Deal history can briefly precede publication of position_id.
+            # Keep the plan durable and retry; never create an unmanageable
+            # ActiveTrade with no broker identity.
+            return None
+        if trade is None:
+            opened_at = (
+                int(fill_time_msc) / 1000.0
+                if fill_time_msc is not None
+                and int(fill_time_msc) > 0
+                else min(float(plan.updated_at), time.time())
+            )
+            trade = ActiveTrade(
+                side=plan.side,
+                entry=round(float(average_fill), 6),
+                stop=float(plan.stop_price),
+                tp_prices=[float(value) for value in plan.tp_prices],
+                tf=str(signal.get("tf") or ""),
+                narrative=str(signal.get("narrative") or ""),
+                symbol=plan.symbol,
+                ts_open=opened_at,
+                last_price_ts=time.time(),
+            )
+            trade.idea_id = idea_id
+            trade.entry_index = 1
+            trade.idea_trigger_signatures = [plan.trigger_signature]
+
+        split_mode = len(plan.legs) > 1
+        execution_legs: List[Dict[str, Any]] = []
+        if split_mode:
+            for leg in filled_legs:
+                position_id = int(leg.broker_position_id or 0)
+                if position_id <= 0:
+                    continue
+                execution_leg = {
+                    "ticket": int(leg.broker_order_ticket or 0),
+                    "position_id": position_id,
+                    "volume": float(leg.filled_volume),
+                    "price": float(leg.average_fill_price or average_fill),
+                    "stop_price": float(plan.stop_price),
+                    "tp": float(leg.target_price),
+                    "tp_index": int(leg.index),
+                    "comment": plan.broker_comment_for_leg(leg.index),
+                }
+                execution_legs.append(execution_leg)
+                if position_id not in trade.split_legs:
+                    trade.split_legs[position_id] = {
+                        "tp_index": int(leg.index),
+                        "tp": float(leg.target_price),
+                        "volume": float(leg.filled_volume),
+                        "order_ticket": int(
+                            leg.broker_order_ticket or 0
+                        ),
+                        "status": "open",
+                    }
+                else:
+                    # Deal publication may be incremental for one broker
+                    # position. Keep the managed/journal volume monotonic with
+                    # the durable leg rather than freezing its first fragment.
+                    meta = trade.split_legs[position_id]
+                    meta["tp_index"] = int(leg.index)
+                    meta["tp"] = float(leg.target_price)
+                    meta["volume"] = float(leg.filled_volume)
+                    meta["order_ticket"] = int(
+                        leg.broker_order_ticket or 0
+                    )
+                    meta["status"] = "open"
+            trade.split_position_ids = [
+                ticket
+                for ticket, meta in sorted(
+                    trade.split_legs.items(),
+                    key=lambda item: (
+                        int(item[1].get("tp_index") or 10**6),
+                        int(item[0]),
+                    ),
+                )
+                if str(meta.get("status") or "open") != "closed"
+            ]
+            trade.mt5_position_id = (
+                trade.split_position_ids[0]
+                if trade.split_position_ids
+                else trade.mt5_position_id
+            )
+            trade.volume_per_tp = [0.0] * len(plan.tp_prices)
+            for leg in filled_legs:
+                idx = int(leg.index) - 1
+                if 0 <= idx < len(trade.volume_per_tp):
+                    trade.volume_per_tp[idx] = float(leg.filled_volume)
+        else:
+            leg = filled_legs[0]
+            position_id = int(leg.broker_position_id or 0)
+            if position_id <= 0:
+                return None
+            trade.mt5_position_id = position_id
+            trade.mt5_ticket = int(leg.broker_order_ticket or 0) or None
+            trade.execution_comment = plan.broker_comment_for_leg(
+                leg.index
+            )
+            trade.volume_per_tp = _compute_tp_volumes(
+                total_volume,
+                len(plan.tp_prices),
+            )
+            execution_legs.append(
+                {
+                    "ticket": int(leg.broker_order_ticket or 0),
+                    "position_id": position_id,
+                    "volume": float(leg.filled_volume),
+                    "price": float(leg.average_fill_price or average_fill),
+                    "stop_price": float(plan.stop_price),
+                    "tp": float(leg.target_price),
+                    "tp_index": int(leg.index),
+                    "comment": trade.execution_comment,
+                }
+            )
+
+        if not getattr(trade, "moved_to_be", False):
+            trade.entry = round(float(average_fill), 6)
+        trade.volume = round(float(total_volume), 8)
+        if split_mode:
+            trade.volume_remaining = round(
+                sum(
+                    float(meta.get("volume") or 0.0)
+                    for meta in trade.split_legs.values()
+                    if str(meta.get("status") or "open") != "closed"
+                ),
+                8,
+            )
+        else:
+            trade.volume_remaining = round(float(total_volume), 8)
+        trade.last_price_ts = time.time()
+        self.active_trades[plan.symbol] = trade
+        save_active_trades(
+            self.active_trades,
+            AI_DATA_DIR / "active_trades.json",
+        )
+
+        if created:
+            self._roll_daily_counters()
+            self._entries_today[plan.symbol] = (
+                self._entries_today.get(plan.symbol, 0) + 1
+            )
+            self._trigger_signatures.setdefault(
+                plan.symbol, set()
+            ).add(plan.trigger_signature)
+        elif (
+            plan.entry_announcement_pending
+            and plan.trigger_signature
+            not in self._trigger_signatures.get(plan.symbol, set())
+        ):
+            # Crash recovery: ActiveTrade may have reached disk before the
+            # in-memory daily counters and durable ENTER outbox were delivered.
+            self._roll_daily_counters()
+            self._entries_today[plan.symbol] = (
+                self._entries_today.get(plan.symbol, 0) + 1
+            )
+            self._trigger_signatures.setdefault(
+                plan.symbol, set()
+            ).add(plan.trigger_signature)
+
+        if queue_entry_event and plan.entry_announcement_pending:
+            signal.update(
+                {
+                    "signal": "ENTER",
+                    "entry_price": round(float(average_fill), 6),
+                    "idea_id": idea_id,
+                    "entry_index": 1,
+                    "execution": {
+                        "mode": (
+                            "pending_limit_split"
+                            if split_mode
+                            else "pending_limit_monitor"
+                        ),
+                        "volume": round(float(total_volume), 8),
+                        "legs": execution_legs,
+                    },
+                    "pending_limit": {
+                        "plan_id": plan.plan_id,
+                        "limit_price": plan.limit_price,
+                        "entry_min": plan.entry_min,
+                        "entry_max": plan.entry_max,
+                        "created_at": plan.created_at,
+                        "expires_at": plan.expires_at,
+                        "gap_beyond_zone": bool(
+                            (
+                                plan.side == "LONG"
+                                and average_fill < plan.entry_min
+                            )
+                            or (
+                                plan.side == "SHORT"
+                                and average_fill > plan.entry_max
+                            )
+                        ),
+                    },
+                }
+            )
+            self._pending_entry_events[plan.symbol] = signal
+        self._record_pending_fill_terminal(
+            plan,
+            fill_time_msc=fill_time_msc,
+        )
+        return trade
+
+    def _record_pending_fill_terminal(
+        self,
+        plan: PendingLimitPlan,
+        *,
+        fill_time_msc: Optional[int],
+    ) -> None:
+        watcher = getattr(self, "shadow_tick_watcher", None)
+        if watcher is None:
+            return
+        terminal_at = (
+            datetime.fromtimestamp(
+                int(fill_time_msc) / 1000.0,
+                tz=timezone.utc,
+            )
+            if fill_time_msc is not None
+            and int(fill_time_msc) > 0
+            else datetime.fromtimestamp(
+                float(plan.updated_at),
+                tz=timezone.utc,
+            )
+        )
+        watcher.record_terminal(
+            plan.plan_id,
+            "FILLED",
+            at_utc=terminal_at,
+            tick_msc=fill_time_msc,
+            reason="broker pending LIMIT filled",
+            inclusive=True,
+        )
+
+    @staticmethod
+    def _mark_pending_conflict(
+        plan: PendingLimitPlan,
+    ) -> PendingLimitPlan:
+        """Persist that this plan must never merge into an active idea."""
+
+        if plan.reason == _PENDING_CONFLICT_REASON:
+            return plan
+        return dataclass_replace(
+            plan,
+            reason=_PENDING_CONFLICT_REASON,
+            updated_at=max(time.time(), float(plan.updated_at)),
+        )
+
+    @staticmethod
+    def _pending_plan_owned_position_ids(
+        plan: PendingLimitPlan,
+        positions: List[Dict[str, Any]],
+    ) -> Tuple[Tuple[int, ...], Tuple[str, ...]]:
+        """Classify exact plan-owned positions without changing broker state."""
+
+        symbol = plan.symbol.upper()
+        symbol_rows = [
+            row
+            for row in positions
+            if str(row.get("symbol") or "").upper() == symbol
+        ]
+        rows_by_ticket = {
+            int(row.get("ticket") or 0): row
+            for row in symbol_rows
+            if int(row.get("ticket") or 0) > 0
+        }
+        rows_by_comment: Dict[str, List[Dict[str, Any]]] = {}
+        for row in symbol_rows:
+            comment = str(row.get("comment") or "")
+            if comment:
+                rows_by_comment.setdefault(comment, []).append(row)
+
+        owned: set[int] = set()
+        ambiguous: List[str] = []
+        for leg in plan.legs:
+            comment = plan.broker_comment_for_leg(leg.index)
+            matches = rows_by_comment.get(comment, [])
+            recorded_id = int(leg.broker_position_id or 0)
+            if recorded_id > 0:
+                recorded_row = rows_by_ticket.get(recorded_id)
+                if recorded_row is not None:
+                    actual_comment = str(
+                        recorded_row.get("comment") or ""
+                    )
+                    if actual_comment != comment:
+                        ambiguous.append(
+                            f"position {recorded_id} comment "
+                            f"{actual_comment!r} != {comment!r}"
+                        )
+                    else:
+                        owned.add(recorded_id)
+                unexpected = sorted(
+                    int(row.get("ticket") or 0)
+                    for row in matches
+                    if int(row.get("ticket") or 0) != recorded_id
+                )
+                if unexpected:
+                    ambiguous.append(
+                        f"leg {leg.index} maps to unexpected "
+                        f"positions {unexpected}"
+                    )
+                continue
+
+            if len(matches) > 1:
+                ambiguous.append(
+                    f"leg {leg.index} maps to multiple live positions"
+                )
+            elif matches:
+                ticket = int(matches[0].get("ticket") or 0)
+                if ticket <= 0:
+                    ambiguous.append(
+                        f"leg {leg.index} live position has no ticket"
+                    )
+                else:
+                    owned.add(ticket)
+        return tuple(sorted(owned)), tuple(ambiguous)
+
+    def _pending_cancel_reason(
+        self,
+        plan: PendingLimitPlan,
+        *,
+        now: float,
+        quote: Optional[QuoteTick],
+    ) -> Optional[str]:
+        """Return a causal reason why an unfilled remainder must be removed."""
+        if plan.has_fills:
+            return "first pending leg filled; cancel every sibling"
+        if plan.is_due(now):
+            return "entry TTL elapsed"
+        if (
+            not PERSISTENT_LIMIT_ENABLED
+            or plan.symbol not in PERSISTENT_LIMIT_SYMBOLS
+        ):
+            return "persistent LIMIT feature disabled for symbol"
+        session_allowed, session_name = self._session_allowance()
+        if not session_allowed:
+            return f"session closed ({session_name})"
+        if self._is_friday_weekend_close():
+            return "Friday weekend close"
+        if self._is_daily_flat_close():
+            return "daily flat close"
+        if self._is_daily_entry_cutoff():
+            return "daily entry cutoff"
+        self._roll_daily_counters()
+        self._check_daily_loss_stop()
+        if self._daily_loss_stop:
+            return "daily loss stop"
+        if quote is None:
+            return None
+
+        # Pending-entry invalidation uses the broker's closing side of spread:
+        # BUY positions stop/target on BID, SELL positions on ASK.
+        nearest_target = float(plan.tp_prices[0])
+        if plan.side == "LONG":
+            if float(quote.bid) <= float(plan.stop_price):
+                return "LONG path crossed stop before retest"
+            if float(quote.bid) >= nearest_target:
+                return "LONG path crossed TP1 before retest"
+        else:
+            if float(quote.ask) >= float(plan.stop_price):
+                return "SHORT path crossed stop before retest"
+            if float(quote.ask) <= nearest_target:
+                return "SHORT path crossed TP1 before retest"
+        return None
+
+    def _manage_pending_limits(self, *, startup: bool = False) -> None:
+        """Reconcile durable entry intents with MT5 orders, deals and positions.
+
+        No plan is retired until either its broker fill has first been persisted
+        as an ActiveTrade, or every submitted remainder is authoritatively
+        terminal in order history. Any ambiguous broker query fails closed.
+        """
+        executor = self.mt5_executor
+        if executor is None or not hasattr(self, "pending_limits"):
+            return
+        lock = getattr(self, "_management_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._management_lock = lock
+
+        with lock:
+            try:
+                live_orders = executor.list_pending_orders()
+                positions = executor.list_positions()
+            except Exception as exc:
+                now = time.time()
+                last = float(
+                    getattr(self, "_pending_reconcile_error_ts", 0.0)
+                )
+                if now - last >= 30.0:
+                    phase = "startup" if startup else "live"
+                    print(
+                        f"[Persistent LIMIT] {phase} reconciliation "
+                        f"deferred (fail-closed): {exc}"
+                    )
+                    self._pending_reconcile_error_ts = now
+                return
+
+            plans = list(self.pending_limits.values())
+            known_comments = {
+                plan.broker_comment_for_leg(leg.index)
+                for plan in plans
+                for leg in plan.legs
+            }
+            orphan_orders = [
+                row
+                for row in live_orders
+                if str(row.get("comment") or "").startswith(
+                    BROKER_COMMENT_PREFIX
+                )
+                and str(row.get("comment") or "") not in known_comments
+            ]
+            if orphan_orders:
+                self._pending_state_safe = False
+                tickets = sorted(
+                    int(row.get("ticket") or 0) for row in orphan_orders
+                )
+                print(
+                    "[Persistent LIMIT] orphan broker orders detected; "
+                    f"new entries blocked: {tickets}"
+                )
+                # Admission is now fail-closed, but an unrelated orphan must
+                # never freeze cancellation/reconciliation of plans whose
+                # ownership is still known exactly.
+            if not plans:
+                return
+
+            live_by_ticket = {
+                int(row["ticket"]): row
+                for row in live_orders
+                if int(row.get("ticket") or 0) > 0
+            }
+            live_by_comment: Dict[str, List[Dict[str, Any]]] = {}
+            for row in live_orders:
+                comment = str(row.get("comment") or "")
+                if comment in known_comments:
+                    live_by_comment.setdefault(comment, []).append(row)
+            positions_by_comment: Dict[str, List[Dict[str, Any]]] = {}
+            for row in positions:
+                comment = str(row.get("comment") or "")
+                if comment in known_comments:
+                    positions_by_comment.setdefault(comment, []).append(row)
+
+            duplicate_comments = {
+                comment
+                for comment, rows in (
+                    list(live_by_comment.items())
+                    + list(positions_by_comment.items())
+                )
+                if len(rows) > 1
+            }
+            if duplicate_comments:
+                self._pending_state_safe = False
+                print(
+                    "[Persistent LIMIT] duplicate per-leg broker identity; "
+                    "new entries blocked: "
+                    + ", ".join(sorted(duplicate_comments))
+                )
+                return
+
+            attached_tickets = [
+                int(leg.broker_order_ticket)
+                for plan in plans
+                for leg in plan.legs
+                if leg.broker_order_ticket is not None
+            ]
+            oldest_created_at = min(
+                float(plan.created_at) for plan in plans
+            )
+            lookback_days = max(
+                1,
+                int(
+                    math.ceil(
+                        max(0.0, time.time() - oldest_created_at)
+                        / 86_400.0
+                    )
+                )
+                + 1,
+            )
+            try:
+                fills_by_order = executor.get_pending_order_fills(
+                    attached_tickets,
+                    comments=sorted(known_comments),
+                    lookback_days=lookback_days,
+                )
+                if hasattr(executor, "get_pending_order_histories"):
+                    histories_by_comment = (
+                        executor.get_pending_order_histories(
+                            sorted(known_comments),
+                            lookback_days=lookback_days,
+                        )
+                    )
+                else:
+                    histories_by_comment = {}
+            except Exception as exc:
+                now = time.time()
+                last = float(
+                    getattr(self, "_pending_reconcile_error_ts", 0.0)
+                )
+                if now - last >= 30.0:
+                    print(
+                        "[Persistent LIMIT] deal reconciliation deferred "
+                        f"(fail-closed): {exc}"
+                    )
+                    self._pending_reconcile_error_ts = now
+                return
+
+            history_by_ticket = {
+                int(row["ticket"]): row
+                for rows in histories_by_comment.values()
+                for row in rows
+                if int(row.get("ticket") or 0) > 0
+            }
+
+            fills_by_comment: Dict[str, List[Dict[str, Any]]] = {}
+            for group in fills_by_order.values():
+                comments = {
+                    str(row.get("comment") or "")
+                    for row in group.get("deals") or []
+                    if str(row.get("comment") or "") in known_comments
+                }
+                for comment in comments:
+                    fills_by_comment.setdefault(comment, []).append(group)
+            duplicated_fill_comments = {
+                comment
+                for comment, groups in fills_by_comment.items()
+                if len(
+                    {
+                        int(group.get("order_ticket") or 0)
+                        for group in groups
+                    }
+                )
+                > 1
+            }
+            if duplicated_fill_comments:
+                self._pending_state_safe = False
+                print(
+                    "[Persistent LIMIT] multiple broker orders share one "
+                    "leg identity; new entries blocked: "
+                    + ", ".join(sorted(duplicated_fill_comments))
+                )
+                return
+
+            removed: List[str] = []
+            book_dirty = False
+            now = time.time()
+            for symbol, original in list(self.pending_limits.items()):
+                plan = original
+                plan_changed = False
+                fill_time_msc: Optional[int] = None
+                position_fill_visible = False
+
+                # Recover the crash window after broker acceptance but before
+                # the returned order ticket reached the durable state file.
+                if not plan.is_terminal:
+                    for leg in plan.legs:
+                        comment = plan.broker_comment_for_leg(leg.index)
+                        evidence = {
+                            int(row.get("ticket") or 0)
+                            for row in live_by_comment.get(comment, [])
+                            if int(row.get("ticket") or 0) > 0
+                        }
+                        evidence.update(
+                            int(group.get("order_ticket") or 0)
+                            for group in fills_by_comment.get(comment, [])
+                            if int(group.get("order_ticket") or 0) > 0
+                        )
+                        evidence.update(
+                            int(row.get("ticket") or 0)
+                            for row in histories_by_comment.get(
+                                comment, []
+                            )
+                            if int(row.get("ticket") or 0) > 0
+                        )
+                        if leg.broker_order_ticket is not None:
+                            evidence.add(int(leg.broker_order_ticket))
+                        if len(evidence) > 1:
+                            self._pending_state_safe = False
+                            print(
+                                f"[Persistent LIMIT] {symbol} leg "
+                                f"{leg.index} maps to multiple tickets "
+                                f"{sorted(evidence)}; new entries blocked"
+                            )
+                            return
+                        if leg.broker_order_ticket is None and evidence:
+                            ticket = next(iter(evidence))
+                            updated_leg = leg.with_order(ticket)
+                            plan = plan.replace_leg(
+                                updated_leg,
+                                now=max(time.time(), plan.updated_at),
+                            )
+                            plan_changed = True
+                    if (
+                        plan.state == PendingLimitState.PLACING
+                        and all(
+                            leg.broker_order_ticket is not None
+                            for leg in plan.legs
+                        )
+                    ):
+                        plan = plan.transition(
+                            PendingLimitState.PLACED,
+                            now=max(time.time(), plan.updated_at),
+                        )
+                        plan_changed = True
+
+                # Deal tickets are immutable dedupe keys. Record every opening
+                # fill incrementally, never feed an aggregate back to the model.
+                if not plan.is_terminal:
+                    for leg in plan.legs:
+                        comment = plan.broker_comment_for_leg(leg.index)
+                        group = None
+                        if leg.broker_order_ticket is not None:
+                            group = fills_by_order.get(
+                                int(leg.broker_order_ticket)
+                            )
+                        if group is None:
+                            groups = fills_by_comment.get(comment, [])
+                            group = groups[0] if groups else None
+                        for row in (group or {}).get("deals") or []:
+                            deal_ticket = int(
+                                row.get("deal_ticket") or 0
+                            )
+                            position_id = int(
+                                row.get("position_id") or 0
+                            )
+                            row_time_msc = int(
+                                row.get("time_msc") or 0
+                            )
+                            if row_time_msc > 0:
+                                fill_time_msc = (
+                                    row_time_msc
+                                    if fill_time_msc is None
+                                    else min(
+                                        fill_time_msc,
+                                        row_time_msc,
+                                    )
+                                )
+                            if deal_ticket <= 0 or position_id <= 0:
+                                continue
+                            before = plan
+                            plan = plan.record_fill(
+                                leg.index,
+                                float(row["volume"]),
+                                float(row["price"]),
+                                deal_ticket=deal_ticket,
+                                position_id=position_id,
+                                now=max(time.time(), plan.updated_at),
+                            )
+                            plan_changed = plan_changed or plan is not before
+
+                        # A position can publish before its opening deal. It is
+                        # sufficient to cancel sibling orders, but it must not
+                        # be added as a synthetic fill: when the same deal later
+                        # appears, incremental accounting would double-count it.
+                        position_rows = positions_by_comment.get(comment, [])
+                        position_fill_visible = (
+                            position_fill_visible or bool(position_rows)
+                        )
+
+                if plan_changed:
+                    self.pending_limits[symbol] = plan
+                    self._save_pending_limit_state()
+                    book_dirty = True
+
+                plan_comments = {
+                    plan.broker_comment_for_leg(leg.index)
+                    for leg in plan.legs
+                }
+                active_trade = self.active_trades.get(symbol)
+                plan_idea_id = str(
+                    plan.signal_payload.get("idea_id") or plan.plan_id
+                )
+                active_idea_id = str(
+                    getattr(active_trade, "idea_id", "") or ""
+                )
+                incompatible_active = bool(
+                    active_trade is not None
+                    and active_idea_id != plan_idea_id
+                )
+                incompatible_broker_position = any(
+                    str(row.get("symbol") or "").upper()
+                    == symbol.upper()
+                    and str(row.get("comment") or "")
+                    not in plan_comments
+                    for row in positions
+                )
+                incompatible_exposure = bool(
+                    incompatible_active
+                    or incompatible_broker_position
+                )
+                conflict_plan = bool(
+                    plan.reason == _PENDING_CONFLICT_REASON
+                )
+                if incompatible_exposure and not conflict_plan:
+                    plan = self._mark_pending_conflict(plan)
+                    self.pending_limits[symbol] = plan
+                    self._save_pending_limit_state()
+                    book_dirty = True
+                    conflict_plan = True
+
+                trade = None
+                if plan.has_fills and not conflict_plan:
+                    try:
+                        trade = self._materialize_pending_trade(
+                            plan,
+                            fill_time_msc=fill_time_msc,
+                        )
+                    except Exception as exc:
+                        self._pending_state_safe = False
+                        print(
+                            f"[Persistent LIMIT] {symbol} fill promotion "
+                            f"failed closed: {exc}"
+                        )
+                        return
+                elif plan.has_fills and conflict_plan:
+                    self._record_pending_fill_terminal(
+                        plan,
+                        fill_time_msc=fill_time_msc,
+                    )
+                    print(
+                        f"[Persistent LIMIT] {symbol} fill conflicts with "
+                        "another active idea; durable cleanup retained"
+                    )
+
+                quote = self._capture_quote(symbol)
+                if conflict_plan:
+                    cancel_reason = _PENDING_CONFLICT_REASON
+                elif (
+                    startup
+                    and plan.state == PendingLimitState.PLACING
+                    and not all(
+                        leg.broker_order_ticket is not None
+                        for leg in plan.legs
+                    )
+                ):
+                    cancel_reason = (
+                        "restart interrupted basket placement"
+                    )
+                elif position_fill_visible:
+                    cancel_reason = (
+                        "broker position visible; awaiting deal history"
+                    )
+                else:
+                    cancel_reason = self._pending_cancel_reason(
+                        plan,
+                        now=now,
+                        quote=quote,
+                    )
+                if cancel_reason and not plan.is_terminal:
+                    has_broker_evidence = bool(
+                        plan.has_fills
+                        or any(
+                            leg.broker_order_ticket is not None
+                            or leg.submission_attempted
+                            for leg in plan.legs
+                        )
+                    )
+                    if has_broker_evidence:
+                        if plan.state != PendingLimitState.CANCELLING:
+                            plan = plan.transition(
+                                PendingLimitState.CANCELLING,
+                                now=max(time.time(), plan.updated_at),
+                                reason=cancel_reason,
+                            )
+                    elif position_fill_visible:
+                        # A live position proves broker acceptance, but the
+                        # opening deal is not yet available for exact,
+                        # idempotent volume accounting. Keep ownership durable.
+                        pass
+                    else:
+                        target = (
+                            PendingLimitState.EXPIRED
+                            if plan.is_due(now)
+                            else PendingLimitState.CANCELLED
+                        )
+                        plan = plan.transition(
+                            target,
+                            now=max(time.time(), plan.updated_at),
+                            reason=cancel_reason,
+                        )
+                    self.pending_limits[symbol] = plan
+                    self._save_pending_limit_state()
+                    book_dirty = True
+
+                should_cancel = bool(
+                    cancel_reason
+                    or plan.state
+                    in {
+                        PendingLimitState.CANCELLING,
+                        PendingLimitState.CANCELLED,
+                        PendingLimitState.EXPIRED,
+                        PendingLimitState.FILLED,
+                    }
+                )
+                if should_cancel:
+                    for leg in plan.legs:
+                        if leg.remaining_volume <= 1e-9:
+                            continue
+                        ticket = int(
+                            leg.broker_order_ticket or 0
+                        )
+                        row = live_by_ticket.get(ticket)
+                        if row is None:
+                            comment = plan.broker_comment_for_leg(
+                                leg.index
+                            )
+                            rows = live_by_comment.get(comment, [])
+                            row = rows[0] if rows else None
+                            if row is not None:
+                                ticket = int(row.get("ticket") or 0)
+                        if row is None or ticket <= 0:
+                            continue
+                        try:
+                            if executor.cancel_pending_order(
+                                ticket,
+                                expected_comment_prefix=plan.broker_comment,
+                            ):
+                                live_by_ticket.pop(ticket, None)
+                                live_by_comment.pop(
+                                    str(row.get("comment") or ""),
+                                    None,
+                                )
+                        except Exception as exc:
+                            print(
+                                f"[Persistent LIMIT] {symbol} cancel "
+                                f"{ticket} deferred: {exc}"
+                            )
+
+                all_resolved = True
+                for leg in plan.legs:
+                    if leg.remaining_volume <= 1e-9:
+                        continue
+                    ticket = int(leg.broker_order_ticket or 0)
+                    if ticket <= 0:
+                        if leg.submission_attempted:
+                            if now < float(plan.expires_at) + 30.0:
+                                all_resolved = False
+                            # After server-side expiry plus publication grace,
+                            # healthy exact-comment live/order/deal queries with
+                            # no evidence prove the ambiguous send did not leave
+                            # working risk.
+                            continue
+                        if plan.state in {
+                            PendingLimitState.CANCELLING,
+                            PendingLimitState.CANCELLED,
+                            PendingLimitState.EXPIRED,
+                            PendingLimitState.FILLED,
+                            PendingLimitState.FAILED,
+                        }:
+                            continue
+                        all_resolved = False
+                        continue
+                    if ticket in live_by_ticket:
+                        all_resolved = False
+                        continue
+                    history = history_by_ticket.get(ticket)
+                    if history is None:
+                        try:
+                            history = executor.get_pending_order_history(
+                                ticket
+                            )
+                        except Exception as exc:
+                            print(
+                                f"[Persistent LIMIT] {symbol} history "
+                                f"{ticket} deferred: {exc}"
+                            )
+                            all_resolved = False
+                            continue
+                    if history is None:
+                        all_resolved = False
+                        continue
+                    if (
+                        bool(history.get("had_execution"))
+                        and leg.filled_volume <= 1e-9
+                    ):
+                        all_resolved = False
+                        continue
+                    done_msc = int(
+                        history.get("time_done_msc") or 0
+                    )
+                    if (
+                        leg.filled_volume <= 1e-9
+                        and done_msc > 0
+                        and int(time.time() * 1000) - done_msc
+                        < 30_000
+                    ):
+                        # Terminal order history can precede the opening deal
+                        # during a cancel/fill race. Preserve ownership through
+                        # a bounded publication grace window.
+                        all_resolved = False
+                        continue
+                    if bool(history.get("fill_expected")):
+                        # Order history may publish before its opening deal.
+                        # Once at least one opening deal is already durable,
+                        # a terminal FILLED history row also resolves a broker
+                        # short-fill remainder. With no deal yet, keep waiting.
+                        if not (
+                            bool(history.get("terminal"))
+                            and leg.filled_volume > 0
+                        ):
+                            all_resolved = False
+                            continue
+                    if not bool(history.get("terminal")):
+                        all_resolved = False
+
+                if not all_resolved:
+                    continue
+
+                watcher = getattr(self, "shadow_tick_watcher", None)
+                if conflict_plan:
+                    owned_position_ids, ownership_errors = (
+                        self._pending_plan_owned_position_ids(
+                            plan,
+                            positions,
+                        )
+                    )
+                    if ownership_errors:
+                        self._pending_state_safe = False
+                        print(
+                            f"[Persistent LIMIT] {symbol} conflict "
+                            "ownership ambiguous; durable plan retained: "
+                            + "; ".join(ownership_errors)
+                        )
+                        continue
+                    if owned_position_ids:
+                        print(
+                            f"[Persistent LIMIT] {symbol} conflict "
+                            "positions still open; durable plan retained: "
+                            f"{list(owned_position_ids)}"
+                        )
+                        continue
+                    if (
+                        time.time() - float(plan.updated_at)
+                        < _PENDING_CONFLICT_ABSENCE_GRACE_SEC
+                    ):
+                        # Deal history can precede publication of the position.
+                        # Require one bounded absence window before retirement.
+                        continue
+                    if plan.has_fills:
+                        print(
+                            f"[Persistent LIMIT] {symbol} conflicting "
+                            "fill exposure absent; durable plan retained "
+                            "for explicit recovery"
+                        )
+                        continue
+
+                if plan.has_fills:
+                    if trade is None:
+                        continue
+                    if plan.state != PendingLimitState.FILLED:
+                        plan = plan.transition(
+                            PendingLimitState.FILLED,
+                            now=max(time.time(), plan.updated_at),
+                            reason="all pending remainders resolved",
+                        )
+                        self.pending_limits[symbol] = plan
+                        self._save_pending_limit_state()
+                    trade = self._materialize_pending_trade(
+                        plan,
+                        fill_time_msc=fill_time_msc,
+                        queue_entry_event=True,
+                    )
+                    if trade is None:
+                        continue
+                    if plan.entry_announcement_pending:
+                        # Durable outbox: retain terminal ownership until
+                        # Telegram/journal delivery explicitly acknowledges it.
+                        continue
+                    removed.append(symbol)
+                    print(
+                        f"[Persistent LIMIT] {symbol} fill promoted; "
+                        "pending plan retired"
+                    )
+                else:
+                    if not plan.is_terminal:
+                        target = (
+                            PendingLimitState.EXPIRED
+                            if plan.is_due(now)
+                            else PendingLimitState.CANCELLED
+                        )
+                        plan = plan.transition(
+                            target,
+                            now=max(time.time(), plan.updated_at),
+                            reason=(
+                                cancel_reason
+                                or "broker pending order ended without fill"
+                            ),
+                        )
+                        self.pending_limits[symbol] = plan
+                        self._save_pending_limit_state()
+                    if watcher is not None:
+                        if plan.state == PendingLimitState.EXPIRED:
+                            terminal_msc = int(
+                                float(plan.expires_at) * 1000
+                            )
+                        elif (
+                            quote is not None
+                            and cancel_reason is not None
+                            and "path crossed" in cancel_reason
+                        ):
+                            terminal_msc = int(quote.time_msc)
+                        else:
+                            terminal_msc = int(time.time() * 1000)
+                        watcher.record_terminal(
+                            plan.plan_id,
+                            (
+                                "EXPIRED"
+                                if plan.state
+                                == PendingLimitState.EXPIRED
+                                else "CANCELLED"
+                            ),
+                            at_utc=datetime.fromtimestamp(
+                                terminal_msc / 1000.0,
+                                tz=timezone.utc,
+                            ),
+                            tick_msc=terminal_msc,
+                            reason=plan.reason,
+                            inclusive=False,
+                        )
+                    removed.append(symbol)
+                    print(
+                        f"[Persistent LIMIT] {symbol} retired "
+                        f"without fill ({plan.state.value})"
+                    )
+
+            if removed:
+                for symbol in removed:
+                    self.pending_limits.pop(symbol, None)
+                self._save_pending_limit_state()
+                book_dirty = True
+            if book_dirty:
+                self._pending_reconcile_error_ts = 0.0
+
+    def ack_pending_limit_entry(self, plan_id: str) -> bool:
+        """Durably acknowledge delivery of one broker-filled ENTER outbox."""
+        lock = getattr(self, "_management_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._management_lock = lock
+        with lock:
+            for symbol, plan in self.pending_limits.items():
+                if plan.plan_id != str(plan_id):
+                    continue
+                if not plan.has_fills:
+                    return False
+                updated = plan.mark_entry_announced(
+                    now=max(time.time(), plan.updated_at),
+                )
+                self.pending_limits[symbol] = updated
+                self._save_pending_limit_state()
+                return True
+        return False
+
+    def bind_pending_entry_message(
+        self,
+        symbol: str,
+        plan_id: str,
+        *,
+        chat_id: int,
+        message_id: int,
+    ) -> bool:
+        """Persist Telegram identity before the durable outbox is acked."""
+        lock = getattr(self, "_management_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._management_lock = lock
+        with lock:
+            plan = self.pending_limits.get(symbol)
+            trade = self.active_trades.get(symbol)
+            if (
+                plan is None
+                or plan.plan_id != str(plan_id)
+                or trade is None
+            ):
+                return False
+            trade.telegram_chat_id = int(chat_id)
+            trade.telegram_message_id = int(message_id)
+            save_active_trades(
+                self.active_trades,
+                AI_DATA_DIR / "active_trades.json",
+            )
+            return True
+
     def _hydrate_active_trades_from_mt5(self) -> None:
         try:
             positions = self.mt5_executor.list_positions() if self.mt5_executor else []
@@ -429,8 +2036,18 @@ class Core:
         # Group positions by symbol so we can properly rebuild split_position_ids
         from collections import defaultdict
         by_symbol: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        pending_comments = {
+            plan.broker_comment_for_leg(leg.index)
+            for plan in getattr(self, "pending_limits", {}).values()
+            for leg in plan.legs
+        }
         for pos in positions:
             symbol = pos.get("symbol")
+            if str(pos.get("comment") or "") in pending_comments:
+                # The richer pending plan owns this position until opening deal
+                # history is reconciled. Generic hydration would create a
+                # second, incompatible idea identity.
+                continue
             if symbol and symbol in self.universe:
                 by_symbol[symbol].append(pos)
 
@@ -1024,7 +2641,23 @@ class Core:
             lock = threading.RLock()
             self._management_lock = lock
         with lock:
+            self._manage_pending_limits()
+            pending_events = getattr(
+                self, "_pending_entry_events", None
+            )
+            if pending_events:
+                results.update(pending_events)
+                pending_events.clear()
+            fresh_pending_fills = {
+                symbol
+                for symbol, signal in results.items()
+                if signal.get("signal") == "ENTER"
+            }
             for symbol, trade in list(self.active_trades.items()):
+                if symbol in fresh_pending_fills:
+                    # Deliver the durable ENTER first. Normal lifecycle polling
+                    # resumes on the next fast tick.
+                    continue
                 scheduled_flat = self._is_friday_weekend_close() or self._is_daily_flat_close()
                 if scheduled_flat:
                     last_price = self.mt5_executor.get_current_price(symbol, trade.side)
@@ -1827,6 +3460,14 @@ class Core:
         risk in the market and passes exactly the same frequency, hedging and
         correlation checks as any other entry.
         """
+        if not getattr(self, "_pending_state_safe", True):
+            sig["signal"] = "WAIT_PENDING_STATE"
+            sig["info"] = (
+                "Persistent LIMIT ownership is ambiguous; "
+                "new risk is fail-closed"
+            )
+            return True
+
         # Skip if this symbol is in cooldown (failed execution or stop-out)
         cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
         if time.time() < cooldown_until:
@@ -1848,7 +3489,14 @@ class Core:
         # Anti-hedging guard: block entry if opposite MT5 position is open
         if self.mt5_executor:
             import MetaTrader5 as _mt5
-            _open_pos = _mt5.positions_get(symbol=symbol) or []
+            _open_pos = _mt5.positions_get(symbol=symbol)
+            if _open_pos is None:
+                sig["signal"] = "WAIT_RISK"
+                sig["info"] = (
+                    "MT5 positions_get unavailable; anti-hedge "
+                    "check is fail-closed"
+                )
+                return True
             _expected_type = _mt5.POSITION_TYPE_BUY if side == "LONG" else _mt5.POSITION_TYPE_SELL
             _opposite = [p for p in _open_pos if p.magic == self.mt5_executor.settings.magic and p.type != _expected_type]
             if _opposite:
@@ -1868,6 +3516,16 @@ class Core:
                     continue
                 _other_trade = self.active_trades.get(_other)
                 if _other_trade is not None and _other_trade.side == side:
+                    _corr_partner = _other
+                    break
+                _other_pending = getattr(
+                    self, "pending_limits", {}
+                ).get(_other)
+                if (
+                    _other_pending is not None
+                    and not _other_pending.is_terminal
+                    and _other_pending.side == side
+                ):
                     _corr_partner = _other
                     break
             if _corr_partner:
@@ -2222,11 +3880,42 @@ class Core:
             if now - self._executor_retry_ts >= 60.0:
                 self._executor_retry_ts = now
                 if self._try_create_executor():
+                    self._manage_pending_limits(startup=True)
                     self._hydrate_active_trades_from_mt5()
+
+        if self.mt5_executor:
+            self._manage_pending_limits()
 
         dirty = False
 
         for symbol in symbols:
+            observed_at = datetime.now(timezone.utc)
+            self._record_shadow_scan_raw(
+                symbol,
+                observed_at=observed_at,
+            )
+            pending_plan = self.pending_limits.get(symbol)
+            if (
+                pending_plan is not None
+                and symbol not in self.active_trades
+            ):
+                results[symbol] = {
+                    "signal": "WAIT_PENDING_LIMIT",
+                    "side": pending_plan.side,
+                    "entry_price": pending_plan.limit_price,
+                    "pending_limit": {
+                        "plan_id": pending_plan.plan_id,
+                        "state": pending_plan.state.value,
+                        "created_at": pending_plan.created_at,
+                        "expires_at": pending_plan.expires_at,
+                    },
+                    "info": (
+                        "Durable exact-retest LIMIT lifecycle owns symbol; "
+                        "fresh entry blocked"
+                    ),
+                }
+                self._log_signal(symbol, results[symbol])
+                continue
             if time.time() - t_start > self.TIME_BUDGET_SEC:
                 results[symbol] = {"signal": "SKIP_BUDGET", "info": "Time budget exceeded, continue next tick"}
                 continue
@@ -2565,7 +4254,11 @@ class Core:
 
                     # Position Adding: a still-working idea may be confirmed
                     # again and earn one more entry under the shared risk cap.
-                    if manage.get("signal") == "HOLD" and not _in_grace:
+                    if (
+                        manage.get("signal") == "HOLD"
+                        and not _in_grace
+                        and symbol not in self.pending_limits
+                    ):
                         addon_sig = self._try_position_add(symbol, trade, data, last_price)
                         if addon_sig is not None:
                             dirty = True
@@ -2620,6 +4313,166 @@ class Core:
                         self._log_signal(symbol, sig)
                         continue
 
+                    candidate_observed_at = datetime.now(timezone.utc)
+                    (
+                        shadow_plan_id,
+                        entry_quote,
+                        pending_expires_at,
+                    ) = self._register_shadow_candidate(
+                        symbol,
+                        sig,
+                        trigger_signature=trig_sig,
+                        data=data,
+                        observed_at=candidate_observed_at,
+                    )
+                    if shadow_plan_id:
+                        sig.setdefault("setup_id", shadow_plan_id)
+
+                    if (
+                        PERSISTENT_LIMIT_ENABLED
+                        and symbol.upper() in PERSISTENT_LIMIT_SYMBOLS
+                        and self.mt5_executor
+                    ):
+                        if entry_quote is None:
+                            sig["signal"] = "WAIT_LIMIT_QUOTE"
+                            sig["info"] = (
+                                "No causal broker quote; exact LIMIT "
+                                "placement is fail-closed"
+                            )
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            continue
+
+                        side_key = str(side).upper()
+                        executable_price = float(
+                            entry_quote.ask
+                            if side_key == "LONG"
+                            else entry_quote.bid
+                        )
+                        planned_entry = float(
+                            sig.get("entry_price") or 0.0
+                        )
+                        entry_min = float(
+                            sig.get("entry_min")
+                            if sig.get("entry_min") is not None
+                            else planned_entry
+                        )
+                        entry_max = float(
+                            sig.get("entry_max")
+                            if sig.get("entry_max") is not None
+                            else planned_entry
+                        )
+                        lower, upper = sorted((entry_min, entry_max))
+                        strict_touch = (
+                            lower <= executable_price <= upper
+                        )
+                        awaiting_retest = (
+                            (
+                                side_key == "LONG"
+                                and executable_price > upper
+                            )
+                            or (
+                                side_key == "SHORT"
+                                and executable_price < lower
+                            )
+                        )
+
+                        if awaiting_retest:
+                            try:
+                                with self._management_lock:
+                                    plan = self._arm_pending_limit(
+                                        symbol,
+                                        sig,
+                                        trigger_signature=trig_sig,
+                                        expires_at=pending_expires_at,
+                                        shadow_plan_id=shadow_plan_id,
+                                        observed_at=candidate_observed_at,
+                                    )
+                            except RiskCapacityError as exc:
+                                sig["signal"] = "WAIT_RISK_ENTRY"
+                                sig["info"] = str(exc)
+                                adjustment = exc.to_payload()
+                                if adjustment:
+                                    sig["risk_adjustment"] = adjustment
+                                results[symbol] = sig
+                                self._log_signal(symbol, sig)
+                                continue
+                            except Exception as exc:
+                                retained = self.pending_limits.get(symbol)
+                                if retained is not None:
+                                    sig["signal"] = (
+                                        "WAIT_PENDING_RECONCILE"
+                                    )
+                                    sig["pending_limit"] = {
+                                        "plan_id": retained.plan_id,
+                                        "state": retained.state.value,
+                                        "created_at": retained.created_at,
+                                        "expires_at": retained.expires_at,
+                                    }
+                                    sig["info"] = (
+                                        "Placement outcome is ambiguous; "
+                                        "durable intent retained"
+                                    )
+                                else:
+                                    sig["signal"] = "EXECUTION_ERROR"
+                                    sig["execution_error"] = str(exc)
+                                    self._entry_cooldowns[symbol] = (
+                                        time.time()
+                                        + self._entry_cooldown_sec
+                                    )
+                                results[symbol] = sig
+                                self._log_signal(symbol, sig)
+                                print(
+                                    f"[Core] Persistent LIMIT failed for "
+                                    f"{symbol}: {exc}"
+                                )
+                                continue
+
+                            sig["signal"] = "PENDING_LIMIT"
+                            sig["pending_limit"] = {
+                                "plan_id": plan.plan_id,
+                                "state": plan.state.value,
+                                "limit_price": plan.limit_price,
+                                "entry_min": plan.entry_min,
+                                "entry_max": plan.entry_max,
+                                "created_at": plan.created_at,
+                                "expires_at": plan.expires_at,
+                                "broker_order_tickets": list(
+                                    plan.working_order_tickets
+                                ),
+                            }
+                            sig["info"] = (
+                                "Native exact-retest LIMIT armed"
+                            )
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            continue
+
+                        if not strict_touch:
+                            sig["signal"] = "WAIT_LIMIT_INVALIDATED"
+                            sig["info"] = (
+                                "Price already crossed beyond the "
+                                "two-sided entry zone; gap fill rejected"
+                            )
+                            watcher = getattr(
+                                self, "shadow_tick_watcher", None
+                            )
+                            if (
+                                watcher is not None
+                                and shadow_plan_id is not None
+                            ):
+                                watcher.record_terminal(
+                                    shadow_plan_id,
+                                    "INVALIDATED",
+                                    at_utc=candidate_observed_at,
+                                    tick_msc=entry_quote.time_msc,
+                                    reason=sig["info"],
+                                    inclusive=True,
+                                )
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            continue
+
                     try:
                         new_trade = self._execute_entry_signal(symbol, sig)
                     except RiskCapacityError as exc:
@@ -2664,6 +4517,22 @@ class Core:
                     dirty = True
                     self._entries_today[symbol] = self._entries_today.get(symbol, 0) + 1
                     self._trigger_signatures.setdefault(symbol, set()).add(trig_sig)
+                    watcher = getattr(
+                        self, "shadow_tick_watcher", None
+                    )
+                    if (
+                        watcher is not None
+                        and shadow_plan_id is not None
+                    ):
+                        watcher.record_terminal(
+                            shadow_plan_id,
+                            "FILLED",
+                            at_utc=datetime.now(timezone.utc),
+                            reason=(
+                                "minute-cycle market entry executed"
+                            ),
+                            inclusive=True,
+                        )
 
                 results[symbol] = sig
                 self._log_signal(symbol, sig)

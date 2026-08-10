@@ -331,10 +331,11 @@ class TelegramBot:
         except Exception:
             traceback.print_exc()
 
-    async def _post_enter(self, app, symbol: str, sig: Dict[str, Any]) -> None:
+    async def _post_enter(self, app, symbol: str, sig: Dict[str, Any]) -> bool:
         # Journal the executed setup independently from Telegram availability.
         # Previously a failed send returned early and silently removed a real
         # MT5 trade from every win-rate/P&L report.
+        journal_ok = True
         try:
             with self.profiler.section("journal_ingest"):
                 self.journal.ingest_signal(
@@ -345,6 +346,7 @@ class TelegramBot:
                     features=None,
                 )
         except Exception:
+            journal_ok = False
             traceback.print_exc()
 
         if sig.get("idea_id"):
@@ -360,6 +362,34 @@ class TelegramBot:
 
         text = self._format_signal(symbol, sig)
 
+        tr = self.core.active_trades.get(symbol)
+        pending_plan_id = (
+            (sig.get("pending_limit") or {}).get("plan_id")
+        )
+        if (
+            pending_plan_id
+            and tr is not None
+            and getattr(tr, "telegram_message_id", None)
+        ):
+            # A previous delivery succeeded but journal/outbox ack did not.
+            # Retry the idempotent journal write without duplicating Telegram,
+            # and restore the message identity that may have been lost from the
+            # journal in the same crash window.
+            try:
+                with self.profiler.section("journal_update"):
+                    self.journal.update_open_trade_state(
+                        symbol,
+                        telegram_chat_id_open=(
+                            getattr(tr, "telegram_chat_id", None)
+                            or self.channel_id
+                        ),
+                        telegram_message_id_open=tr.telegram_message_id,
+                    )
+            except Exception:
+                journal_ok = False
+                traceback.print_exc()
+            return journal_ok
+
         msg = await self._safe_send_message(
             app,
             chat_id=self.channel_id,
@@ -367,13 +397,27 @@ class TelegramBot:
             disable_web_page_preview=True,
         )
         if msg is None:
-            return
+            return False
 
         # bind for reply + persistence
-        tr = self.core.active_trades.get(symbol)
         if tr is not None:
             tr.telegram_chat_id = self.channel_id
             tr.telegram_message_id = msg.message_id
+        message_bound = not pending_plan_id
+        if pending_plan_id:
+            try:
+                message_bound = bool(
+                    await asyncio.to_thread(
+                        self.core.bind_pending_entry_message,
+                        symbol,
+                        pending_plan_id,
+                        chat_id=self.channel_id,
+                        message_id=msg.message_id,
+                    )
+                )
+            except Exception:
+                message_bound = False
+                traceback.print_exc()
 
         try:
             with self.profiler.section("journal_update"):
@@ -383,7 +427,9 @@ class TelegramBot:
                     telegram_message_id_open=msg.message_id,
                 )
         except Exception:
-            pass
+            journal_ok = False
+            traceback.print_exc()
+        return journal_ok and message_bound
 
     def _journal_position_add(self, symbol: str, addon: Dict[str, Any]) -> None:
         """Fold an add-on entry into the idea's open journal row.
@@ -477,7 +523,21 @@ class TelegramBot:
             app = context.application
             for symbol, sig in (signals or {}).items():
                 try:
-                    if sig.get("signal") == "HOLD" and sig.get("events"):
+                    if sig.get("signal") == "ENTER":
+                        delivered = await self._post_enter(
+                            app, symbol, sig
+                        )
+                        plan_id = (
+                            (sig.get("pending_limit") or {}).get(
+                                "plan_id"
+                            )
+                        )
+                        if delivered and plan_id:
+                            await asyncio.to_thread(
+                                self.core.ack_pending_limit_entry,
+                                plan_id,
+                            )
+                    elif sig.get("signal") == "HOLD" and sig.get("events"):
                         await self._handle_events(app, symbol, sig)
                     elif sig.get("signal") == "EXIT_BROKER":
                         await self._handle_broker_exit(app, symbol, sig)

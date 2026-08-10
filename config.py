@@ -57,6 +57,42 @@ MT5_RISK_PER_TRADE = min(max(_env_float("MT5_RISK_PCT", 0.01), 0.0), 0.01)
 MT5_INITIAL_CAPITAL = _env_float("MT5_INITIAL_CAPITAL", 0.0)
 MT5_SLIPPAGE = _env_int("MT5_SLIPPAGE") or 20
 
+# Exact-retest entry lifecycle. Both switches default off so a code deploy does
+# not silently alter live execution before a broker canary is approved.
+PERSISTENT_LIMIT_ENABLED = (
+    os.getenv("PERSISTENT_LIMIT_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+PERSISTENT_LIMIT_SYMBOLS = frozenset(
+    symbol.strip().upper()
+    for symbol in os.getenv(
+        "PERSISTENT_LIMIT_SYMBOLS",
+        "GOLD,EURUSD,GBPUSD,USDCAD",
+    ).split(",")
+    if symbol.strip()
+)
+PERSISTENT_LIMIT_TTL_MIN = min(
+    240,
+    max(1, _env_int("PERSISTENT_LIMIT_TTL_MIN") or 15),
+)
+PERSISTENT_LIMIT_STATE_PATH = AI_DATA_DIR / "pending_limits.json"
+
+# Strictly diagnostic tick observer. It recovers the terminal tick stream in
+# batches and writes to its own SQLite database; it cannot submit orders.
+SHADOW_TICK_WATCHER_ENABLED = (
+    os.getenv("SHADOW_TICK_WATCHER_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SHADOW_TICK_WATCHER_POLL_SEC = min(
+    30.0,
+    max(0.25, _env_float("SHADOW_TICK_WATCHER_POLL_SEC", 5.0)),
+)
+SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC = min(
+    86_400,
+    max(60, _env_int("SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC") or 3_600),
+)
+SHADOW_TICK_WATCHER_DB_PATH = AI_DATA_DIR / "shadow_tick_touches.db"
+
 if MT5_EXECUTION_ENABLED and (MT5_LOGIN is None or not MT5_PASSWORD or not MT5_SERVER):
     MT5_EXECUTION_ENABLED = False
 

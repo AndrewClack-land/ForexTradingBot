@@ -5,7 +5,7 @@ import logging
 import math
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -180,6 +180,652 @@ class MT5Executor:
     @property
     def initial_capital(self) -> float:
         return self._resolve_initial_capital()
+
+    def prepare_limit_entry(
+        self,
+        symbol: str,
+        *,
+        side: str,
+        limit_price: float,
+        stop_price: float,
+    ) -> Dict[str, Any]:
+        """Validate and size one exact-price pending LIMIT setup.
+
+        The returned volume is the total setup allocation. Risk is measured at
+        the future limit price rather than at the current quote. Both LIMIT
+        support and server-side specified expiry are mandatory.
+        """
+        side_key = str(side).upper()
+        if side_key not in {"LONG", "SHORT"}:
+            raise ValueError(f"Unsupported pending side {side!r}")
+        try:
+            limit = float(limit_price)
+            stop = float(stop_price)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid pending geometry for {symbol}: {exc}"
+            ) from exc
+        if (
+            not math.isfinite(limit)
+            or not math.isfinite(stop)
+            or limit <= 0
+            or stop <= 0
+        ):
+            raise RiskLimitError(
+                f"Invalid pending geometry for {symbol}: "
+                f"limit={limit!r}, stop={stop!r}"
+            )
+        if side_key == "LONG" and stop >= limit:
+            raise RiskLimitError(
+                f"Invalid LONG pending geometry for {symbol}: "
+                f"stop {stop:g} >= limit {limit:g}"
+            )
+        if side_key == "SHORT" and stop <= limit:
+            raise RiskLimitError(
+                f"Invalid SHORT pending geometry for {symbol}: "
+                f"stop {stop:g} <= limit {limit:g}"
+            )
+
+        info = self._get_symbol_info(symbol)
+        order_mode = int(getattr(info, "order_mode", 0) or 0)
+        limit_flag = int(getattr(mt5, "SYMBOL_ORDER_LIMIT", 2) or 2)
+        if (order_mode & limit_flag) != limit_flag:
+            raise RuntimeError(f"Pending LIMIT orders are not allowed for {symbol}")
+
+        expiration_mode = int(getattr(info, "expiration_mode", 0) or 0)
+        specified_flag = int(
+            getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4) or 4
+        )
+        if (expiration_mode & specified_flag) != specified_flag:
+            raise RuntimeError(
+                f"Server-side specified expiration is not supported for {symbol}; "
+                "refusing an unbounded pending order"
+            )
+
+        sizing = self._size_volume_for_risk(symbol, side_key, limit, stop)
+        return {
+            "volume": float(sizing.volume),
+            "risk_amount": float(sizing.risk_amount),
+            "risk_per_lot": float(sizing.risk_per_lot),
+            "risk_budget_amount": float(sizing.limit.budget_amount),
+            "risk_capital_base": float(sizing.limit.capital_base),
+            "risk_pct": float(sizing.limit.fraction),
+            "account_currency": str(sizing.limit.account_currency),
+            "volume_min": float(getattr(info, "volume_min", 0.0) or 0.0),
+            "volume_step": float(getattr(info, "volume_step", 0.0) or 0.0),
+            "digits": int(getattr(info, "digits", 0) or 0),
+            "min_gap": float(self._broker_min_gap(info)),
+        }
+
+    def account_is_hedging(self) -> bool:
+        """Return whether separate pending TP legs become separate positions."""
+        account = mt5.account_info()
+        if account is None:
+            raise RuntimeError(
+                f"MT5 account_info unavailable: {mt5.last_error()}"
+            )
+        hedging_mode = int(
+            getattr(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2) or 2
+        )
+        return int(getattr(account, "margin_mode", -1)) == hedging_mode
+
+    def place_limit_leg(
+        self,
+        symbol: str,
+        *,
+        side: str,
+        volume: float,
+        limit_price: float,
+        stop_price: float,
+        tp_price: float,
+        expires_at: float,
+        comment: str,
+        risk_budget_amount: float,
+        risk_used_amount: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Place one broker-side BUY_LIMIT or SELL_LIMIT TP leg.
+
+        The basket must be sized with prepare_limit_entry first. Every
+        safety-critical geometry check is repeated here immediately before
+        submission because quotes and symbol rules can change meanwhile.
+        """
+        side_key = str(side).upper()
+        if side_key not in {"LONG", "SHORT"}:
+            raise ValueError(f"Unsupported pending side {side!r}")
+        try:
+            vol = float(volume)
+            limit = float(limit_price)
+            stop = float(stop_price)
+            target = float(tp_price)
+            expiry = float(expires_at)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"Invalid pending request for {symbol}: {exc}") from exc
+        if not all(
+            math.isfinite(value)
+            for value in (vol, limit, stop, target, expiry)
+        ):
+            raise RuntimeError(f"Non-finite pending request for {symbol}")
+        if min(vol, limit, stop, target) <= 0:
+            raise RuntimeError(f"Non-positive pending request for {symbol}")
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if expiry <= now_ts + 1.0:
+            raise RuntimeError(f"Pending expiry is not in the future for {symbol}")
+
+        info = self._get_symbol_info(symbol)
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            raise RuntimeError(f"No tick data for {symbol} before pending LIMIT")
+
+        order_mode = int(getattr(info, "order_mode", 0) or 0)
+        limit_flag = int(getattr(mt5, "SYMBOL_ORDER_LIMIT", 2) or 2)
+        if (order_mode & limit_flag) != limit_flag:
+            raise RuntimeError(f"Pending LIMIT orders are not allowed for {symbol}")
+        expiration_mode = int(getattr(info, "expiration_mode", 0) or 0)
+        specified_flag = int(
+            getattr(mt5, "SYMBOL_EXPIRATION_SPECIFIED", 4) or 4
+        )
+        if (expiration_mode & specified_flag) != specified_flag:
+            raise RuntimeError(
+                f"Server-side specified expiration is not supported for {symbol}"
+            )
+
+        point = float(
+            getattr(info, "point", 0.0)
+            or getattr(info, "trade_tick_size", 0.0)
+            or getattr(info, "tick_size", 0.0)
+            or 0.0
+        )
+        digits = int(getattr(info, "digits", 0) or 0)
+        if digits <= 0 and point > 0:
+            digits = max(0, int(round(-math.log10(point))))
+        limit = round(limit, digits)
+        stop = round(stop, digits)
+        target = round(target, digits)
+        min_gap = float(self._broker_min_gap(info))
+        epsilon = max(point * 1e-6, 1e-12)
+
+        if side_key == "LONG":
+            market = float(tick.ask)
+            if limit > market - min_gap + epsilon:
+                raise RuntimeError(
+                    f"BUY_LIMIT {limit:g} is not below ASK {market:g} "
+                    f"by broker gap {min_gap:g}"
+                )
+            if stop >= limit - min_gap + epsilon:
+                raise RuntimeError(
+                    f"LONG pending SL {stop:g} is too close to limit {limit:g}"
+                )
+            if target <= limit + min_gap - epsilon:
+                raise RuntimeError(
+                    f"LONG pending TP {target:g} is too close to limit {limit:g}"
+                )
+            order_type = mt5.ORDER_TYPE_BUY_LIMIT
+        else:
+            market = float(tick.bid)
+            if limit < market + min_gap - epsilon:
+                raise RuntimeError(
+                    f"SELL_LIMIT {limit:g} is not above BID {market:g} "
+                    f"by broker gap {min_gap:g}"
+                )
+            if stop <= limit + min_gap - epsilon:
+                raise RuntimeError(
+                    f"SHORT pending SL {stop:g} is too close to limit {limit:g}"
+                )
+            if target >= limit - min_gap + epsilon:
+                raise RuntimeError(
+                    f"SHORT pending TP {target:g} is too close to limit {limit:g}"
+                )
+            order_type = mt5.ORDER_TYPE_SELL_LIMIT
+
+        risk_per_lot = self._risk_per_lot(
+            symbol, side_key, limit, stop, info=info
+        )
+        leg_risk = risk_per_lot * vol
+        try:
+            budget = float(risk_budget_amount)
+            used = float(risk_used_amount)
+        except (TypeError, ValueError) as exc:
+            raise RiskLimitError(
+                f"Invalid pending risk budget for {symbol}: "
+                f"budget={risk_budget_amount!r}, used={risk_used_amount!r}"
+            ) from exc
+        if not math.isfinite(budget) or budget <= 0:
+            raise RiskLimitError(
+                f"Invalid pending risk budget for {symbol}: {budget!r}"
+            )
+        if not math.isfinite(used) or used < 0:
+            raise RiskLimitError(
+                f"Invalid pending used risk for {symbol}: {used!r}"
+            )
+        tolerance = max(1e-8, budget * 1e-10)
+        if used + leg_risk > budget + tolerance:
+            raise RiskLimitError(
+                f"Pending cumulative risk {used + leg_risk:.2f} exceeds "
+                f"setup budget {budget:.2f}"
+            )
+
+        request = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": vol,
+            "type": order_type,
+            "price": limit,
+            "sl": stop,
+            "tp": target,
+            "deviation": self.settings.slippage,
+            "magic": self.settings.magic,
+            "comment": str(comment or "FBPL")[:31],
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+            "type_time": mt5.ORDER_TIME_SPECIFIED,
+            "expiration": int(expiry),
+        }
+        result = _send_request(request)
+        if result is None:
+            raise RuntimeError(
+                f"MT5 pending order_send returned None: {mt5.last_error()}"
+            )
+        success_codes = {
+            getattr(mt5, "TRADE_RETCODE_PLACED", 10008),
+            mt5.TRADE_RETCODE_DONE,
+            getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010),
+        }
+        if int(result.retcode) not in success_codes:
+            raise RuntimeError(f"MT5 pending order_send failed: {result}")
+        return {
+            "ticket": int(getattr(result, "order", 0) or 0),
+            "deal": int(getattr(result, "deal", 0) or 0),
+            "volume": float(getattr(result, "volume", 0.0) or vol),
+            "price": float(getattr(result, "price", 0.0) or limit),
+            "limit_price": limit,
+            "stop_price": stop,
+            "tp": target,
+            "risk_amount": float(leg_risk),
+            "comment": request["comment"],
+            "expires_at": expiry,
+            "retcode": int(result.retcode),
+        }
+
+    def list_pending_orders(
+        self, symbol: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """Return live pending orders owned by this executor."""
+        orders = mt5.orders_get(symbol=symbol) if symbol else mt5.orders_get()
+        if orders is None:
+            raise RuntimeError(
+                f"MT5 orders_get failed: {mt5.last_error()}"
+            )
+        if len(orders) == 0:
+            return []
+        pending_types = {
+            getattr(mt5, "ORDER_TYPE_BUY_LIMIT", 2),
+            getattr(mt5, "ORDER_TYPE_SELL_LIMIT", 3),
+            getattr(mt5, "ORDER_TYPE_BUY_STOP", 4),
+            getattr(mt5, "ORDER_TYPE_SELL_STOP", 5),
+            getattr(mt5, "ORDER_TYPE_BUY_STOP_LIMIT", 6),
+            getattr(mt5, "ORDER_TYPE_SELL_STOP_LIMIT", 7),
+        }
+        out: List[Dict[str, Any]] = []
+        for order in orders:
+            try:
+                if int(getattr(order, "magic", 0) or 0) != int(
+                    self.settings.magic
+                ):
+                    continue
+                order_type = int(getattr(order, "type", -1))
+                if order_type not in pending_types:
+                    continue
+                out.append(
+                    {
+                        "ticket": int(getattr(order, "ticket", 0) or 0),
+                        "symbol": str(
+                            getattr(order, "symbol", "") or ""
+                        ).upper(),
+                        "type": order_type,
+                        "volume_initial": float(
+                            getattr(order, "volume_initial", 0.0) or 0.0
+                        ),
+                        "volume_current": float(
+                            getattr(order, "volume_current", 0.0) or 0.0
+                        ),
+                        "price_open": float(
+                            getattr(order, "price_open", 0.0) or 0.0
+                        ),
+                        "stop": float(getattr(order, "sl", 0.0) or 0.0),
+                        "tp": float(getattr(order, "tp", 0.0) or 0.0),
+                        "expiration": float(
+                            getattr(order, "time_expiration", 0) or 0
+                        ),
+                        "comment": str(
+                            getattr(order, "comment", "") or ""
+                        ),
+                    }
+                )
+            except Exception:
+                continue
+        return out
+
+    def cancel_pending_order(
+        self,
+        ticket: int,
+        *,
+        expected_comment_prefix: str,
+    ) -> bool:
+        """Cancel one live pending order after strict ownership validation.
+
+        False means the ticket is no longer in the live order book. It is not a
+        cancellation confirmation: the caller must reconcile deal and order
+        history because the order may have filled in the cancellation race.
+        """
+        ticket = int(ticket)
+        rows = mt5.orders_get(ticket=ticket)
+        if rows is None:
+            raise RuntimeError(
+                f"MT5 orders_get({ticket}) failed: {mt5.last_error()}"
+            )
+        if len(rows) == 0:
+            return False
+        order = rows[0]
+        if int(getattr(order, "magic", 0) or 0) != int(self.settings.magic):
+            raise RuntimeError(
+                f"Refusing to cancel non-owned pending order {ticket}"
+            )
+        expected = str(expected_comment_prefix or "")
+        actual_comment = str(getattr(order, "comment", "") or "")
+        if not expected or not actual_comment.startswith(expected):
+            raise RuntimeError(
+                f"Refusing to cancel pending order {ticket}: "
+                f"comment {actual_comment!r} does not match {expected!r}"
+            )
+        result = _send_request(
+            {"action": mt5.TRADE_ACTION_REMOVE, "order": ticket}
+        )
+        if result is None:
+            raise RuntimeError(
+                f"MT5 pending cancel returned None: {mt5.last_error()}"
+            )
+        success_codes = {
+            mt5.TRADE_RETCODE_DONE,
+            getattr(mt5, "TRADE_RETCODE_ORDER_CHANGED", 10023),
+        }
+        if int(result.retcode) not in success_codes:
+            raise RuntimeError(
+                f"MT5 pending cancel failed for {ticket}: {result}"
+            )
+        return True
+
+    def get_pending_order_fills(
+        self,
+        tickets: Optional[List[int]] = None,
+        *,
+        comments: Optional[List[str]] = None,
+        lookback_days: int = 7,
+    ) -> Dict[int, Dict[str, Any]]:
+        """Return incremental opening-deal facts for pending order tickets.
+
+        History is queried once for the whole basket. Each deal remains
+        separate so the durable plan can deduplicate by deal ticket.
+        """
+        wanted = {
+            int(ticket) for ticket in (tickets or []) if int(ticket) > 0
+        }
+        wanted_comments = {
+            str(comment)
+            for comment in (comments or [])
+            if str(comment)
+        }
+        if not wanted and not wanted_comments:
+            return {}
+        now = datetime.now(timezone.utc)
+        try:
+            deals = mt5.history_deals_get(
+                now - timedelta(days=max(1, int(lookback_days))),
+                now + timedelta(minutes=5),
+            )
+        except Exception as exc:
+            raise RuntimeError(f"MT5 history_deals_get failed: {exc}") from exc
+        if deals is None:
+            raise RuntimeError(
+                f"MT5 history_deals_get failed: {mt5.last_error()}"
+            )
+        if len(deals) == 0:
+            return {}
+        entry_in = getattr(mt5, "DEAL_ENTRY_IN", 0)
+        grouped: Dict[int, List[Dict[str, Any]]] = {}
+        for deal in deals:
+            try:
+                order_ticket = int(getattr(deal, "order", 0) or 0)
+                deal_comment = str(getattr(deal, "comment", "") or "")
+                if (
+                    order_ticket not in wanted
+                    and deal_comment not in wanted_comments
+                ):
+                    continue
+                magic = int(
+                    getattr(deal, "magic", self.settings.magic) or 0
+                )
+                if magic != int(self.settings.magic):
+                    continue
+                if int(getattr(deal, "entry", entry_in)) != int(entry_in):
+                    continue
+                volume = float(getattr(deal, "volume", 0.0) or 0.0)
+                price = float(getattr(deal, "price", 0.0) or 0.0)
+                if volume <= 0 or price <= 0:
+                    continue
+                grouped.setdefault(order_ticket, []).append(
+                    {
+                        "deal_ticket": int(
+                            getattr(deal, "ticket", 0) or 0
+                        ),
+                        "position_id": int(
+                            getattr(deal, "position_id", 0) or 0
+                        ),
+                        "volume": volume,
+                        "price": price,
+                        "time_msc": int(
+                            getattr(deal, "time_msc", 0) or 0
+                        ),
+                        "comment": deal_comment,
+                    }
+                )
+            except Exception:
+                continue
+        out: Dict[int, Dict[str, Any]] = {}
+        for order_ticket, rows in grouped.items():
+            rows.sort(
+                key=lambda row: (
+                    int(row["time_msc"]),
+                    int(row["deal_ticket"]),
+                )
+            )
+            total_volume = sum(float(row["volume"]) for row in rows)
+            average = sum(
+                float(row["volume"]) * float(row["price"]) for row in rows
+            ) / total_volume
+            out[order_ticket] = {
+                "order_ticket": order_ticket,
+                "deals": rows,
+                "deal_tickets": [
+                    int(row["deal_ticket"]) for row in rows
+                ],
+                "volume": total_volume,
+                "price": average,
+                "position_ids": sorted(
+                    {
+                        int(row["position_id"])
+                        for row in rows
+                        if int(row["position_id"]) > 0
+                    }
+                ),
+                "time_msc": min(int(row["time_msc"]) for row in rows),
+            }
+        return out
+
+    def get_pending_order_fill(
+        self, ticket: int, *, lookback_days: int = 7
+    ) -> Optional[Dict[str, Any]]:
+        """Compatibility wrapper for one pending order ticket."""
+        return self.get_pending_order_fills(
+            [int(ticket)], lookback_days=lookback_days
+        ).get(int(ticket))
+
+    def get_pending_order_history(
+        self, ticket: int
+    ) -> Optional[Dict[str, Any]]:
+        """Return the authoritative historical order row when published."""
+        ticket = int(ticket)
+        try:
+            rows = mt5.history_orders_get(ticket=ticket)
+        except Exception as exc:
+            raise RuntimeError(
+                f"MT5 history_orders_get({ticket}) failed: {exc}"
+            ) from exc
+        if rows is None:
+            raise RuntimeError(
+                f"MT5 history_orders_get({ticket}) failed: {mt5.last_error()}"
+            )
+        if len(rows) == 0:
+            return None
+        row = rows[-1]
+        if int(getattr(row, "magic", 0) or 0) != int(self.settings.magic):
+            raise RuntimeError(
+                f"Historical pending order {ticket} is not owned by this executor"
+            )
+        volume_initial = float(
+            getattr(row, "volume_initial", 0.0) or 0.0
+        )
+        volume_current = float(
+            getattr(row, "volume_current", 0.0) or 0.0
+        )
+        executed_volume = max(0.0, volume_initial - volume_current)
+        state = int(getattr(row, "state", -1))
+        fill_states = {
+            int(getattr(mt5, "ORDER_STATE_PARTIAL", 3)),
+            int(getattr(mt5, "ORDER_STATE_FILLED", 4)),
+        }
+        # A positive residual-volume delta and PARTIAL/FILLED state are
+        # affirmative execution evidence. Conversely, False is deliberately
+        # not proof that a terminal CANCELED order never traded: MT5 historical
+        # volume fields can collapse after cancellation, so opening-deal
+        # history remains authoritative for that question.
+        had_execution = executed_volume > 1e-9 or state in fill_states
+        return {
+            "ticket": ticket,
+            "state": state,
+            "type": int(getattr(row, "type", -1)),
+            "volume_initial": volume_initial,
+            "volume_current": volume_current,
+            "executed_volume": executed_volume,
+            "had_execution": had_execution,
+            "price_open": float(getattr(row, "price_open", 0.0) or 0.0),
+            "time_done_msc": int(
+                getattr(row, "time_done_msc", 0) or 0
+            ),
+            "comment": str(getattr(row, "comment", "") or ""),
+            "terminal": state
+            in {
+                int(getattr(mt5, "ORDER_STATE_CANCELED", 2)),
+                int(getattr(mt5, "ORDER_STATE_FILLED", 4)),
+                int(getattr(mt5, "ORDER_STATE_REJECTED", 5)),
+                int(getattr(mt5, "ORDER_STATE_EXPIRED", 6)),
+            },
+            "fill_expected": state in fill_states,
+        }
+
+    def get_pending_order_histories(
+        self,
+        comments: List[str],
+        *,
+        lookback_days: int = 7,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return exact-comment historical order evidence in one query.
+
+        This closes the restart window where order_send was accepted but the
+        process died before persisting the returned ticket.
+        """
+        wanted = {
+            str(comment) for comment in comments if str(comment)
+        }
+        if not wanted:
+            return {}
+        now = datetime.now(timezone.utc)
+        try:
+            rows = mt5.history_orders_get(
+                now - timedelta(days=max(1, int(lookback_days))),
+                now + timedelta(minutes=5),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"MT5 history_orders_get range failed: {exc}"
+            ) from exc
+        if rows is None:
+            raise RuntimeError(
+                f"MT5 history_orders_get range failed: {mt5.last_error()}"
+            )
+        terminal_states = {
+            int(getattr(mt5, "ORDER_STATE_CANCELED", 2)),
+            int(getattr(mt5, "ORDER_STATE_FILLED", 4)),
+            int(getattr(mt5, "ORDER_STATE_REJECTED", 5)),
+            int(getattr(mt5, "ORDER_STATE_EXPIRED", 6)),
+        }
+        fill_states = {
+            int(getattr(mt5, "ORDER_STATE_PARTIAL", 3)),
+            int(getattr(mt5, "ORDER_STATE_FILLED", 4)),
+        }
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for row in rows:
+            try:
+                if int(getattr(row, "magic", 0) or 0) != int(
+                    self.settings.magic
+                ):
+                    continue
+                comment = str(getattr(row, "comment", "") or "")
+                if comment not in wanted:
+                    continue
+                ticket = int(getattr(row, "ticket", 0) or 0)
+                if ticket <= 0:
+                    continue
+                state = int(getattr(row, "state", -1))
+                volume_initial = float(
+                    getattr(row, "volume_initial", 0.0) or 0.0
+                )
+                volume_current = float(
+                    getattr(row, "volume_current", 0.0) or 0.0
+                )
+                executed_volume = max(
+                    0.0, volume_initial - volume_current
+                )
+                grouped.setdefault(comment, []).append(
+                    {
+                        "ticket": ticket,
+                        "state": state,
+                        "type": int(getattr(row, "type", -1)),
+                        "volume_initial": volume_initial,
+                        "volume_current": volume_current,
+                        "executed_volume": executed_volume,
+                        "had_execution": (
+                            executed_volume > 1e-9 or state in fill_states
+                        ),
+                        "price_open": float(
+                            getattr(row, "price_open", 0.0) or 0.0
+                        ),
+                        "time_done_msc": int(
+                            getattr(row, "time_done_msc", 0) or 0
+                        ),
+                        "comment": comment,
+                        "terminal": state in terminal_states,
+                        "fill_expected": state in fill_states,
+                    }
+                )
+            except Exception:
+                continue
+        for histories in grouped.values():
+            histories.sort(
+                key=lambda item: (
+                    int(item["time_done_msc"]),
+                    int(item["ticket"]),
+                )
+            )
+        return grouped
 
     def execute_entry(self, symbol: str, *, side: str, entry_price: float, stop_price: float,
                       tp_price: Optional[float], comment: Optional[str] = None,
@@ -1627,7 +2273,11 @@ class MT5Executor:
 
     def list_positions(self) -> List[Dict[str, Any]]:
         positions = mt5.positions_get()
-        if not positions:
+        if positions is None:
+            raise RuntimeError(
+                f"MT5 positions_get failed: {mt5.last_error()}"
+            )
+        if len(positions) == 0:
             return []
         out: List[Dict[str, Any]] = []
         for pos in positions:
@@ -1645,6 +2295,9 @@ class MT5Executor:
                         "volume": float(getattr(pos, "volume", 0.0) or 0.0),
                         "comment": str(getattr(pos, "comment", "") or ""),
                         "time": float(getattr(pos, "time", 0) or 0),
+                        "time_msc": int(
+                            getattr(pos, "time_msc", 0) or 0
+                        ),
                     }
                 )
             except Exception:
