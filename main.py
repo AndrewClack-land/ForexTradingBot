@@ -682,8 +682,6 @@ class Core:
     def _record_shadow_scan_raw(
         self,
         symbol: str,
-        *,
-        observed_at: datetime,
     ) -> Optional[QuoteTick]:
         """Record the quote visible to the actual 60-second loop.
 
@@ -697,11 +695,12 @@ class Core:
         quote = self._capture_quote(symbol)
         if quote is None:
             return None
+        quote_observed_at = datetime.now(timezone.utc)
         for plan_id in watcher.active_plan_ids(symbol):
             watcher.record_scan(
                 plan_id,
                 quote,
-                observed_at_utc=observed_at,
+                observed_at_utc=quote_observed_at,
                 candidate_matches=False,
                 policy_executable=False,
                 disposition="RAW_60S_SCAN",
@@ -715,22 +714,23 @@ class Core:
         *,
         trigger_signature: str,
         data: Optional[Dict[str, Any]],
-        observed_at: datetime,
-    ) -> Tuple[Optional[str], Optional[QuoteTick], float]:
+    ) -> Tuple[Optional[str], Optional[QuoteTick], float, datetime]:
         """Register one fully filtered candidate without influencing it."""
-        expires_at = (
-            observed_at + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
-        ).timestamp()
         watcher = getattr(self, "shadow_tick_watcher", None)
         # Activation must be captured after every policy gate has passed.
         # Reusing the quote from the start of the symbol scan would count ticks
         # that happened before the entry decision actually existed.
         quote = self._capture_quote(symbol)
+        activation_observed_at = datetime.now(timezone.utc)
+        expires_at = (
+            activation_observed_at
+            + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
+        ).timestamp()
         if watcher is None or not watcher.enabled:
-            return None, quote, expires_at
+            return None, quote, expires_at, activation_observed_at
 
         if quote is None:
-            return None, None, expires_at
+            return None, None, expires_at, activation_observed_at
         decision_time = self._closed_m15_decision_time(data)
         deployment_id = (
             os.getenv("DEPLOYMENT_ID", "").strip()
@@ -775,8 +775,11 @@ class Core:
             entry_max=max(lower, upper),
             planned_entry=planned,
             stop_price=float(sig.get("stop_price") or 0.0),
-            activated_at_utc=observed_at,
-            activation_tick_msc=int(quote.time_msc),
+            activated_at_utc=activation_observed_at,
+            activation_tick_msc=int(
+                activation_observed_at.timestamp() * 1000
+            ),
+            activation_source_tick_msc=int(quote.time_msc),
             expires_at_utc=datetime.fromtimestamp(
                 expires_at, tz=timezone.utc
             ),
@@ -804,12 +807,12 @@ class Core:
         watcher.record_scan(
             plan_id,
             quote,
-            observed_at_utc=observed_at,
+            observed_at_utc=activation_observed_at,
             candidate_matches=True,
             policy_executable=True,
             disposition="ELIGIBLE_60S_SCAN",
         )
-        return plan_id, quote, expires_at
+        return plan_id, quote, expires_at, activation_observed_at
 
     def _arm_pending_limit(
         self,
@@ -4322,11 +4325,7 @@ class Core:
         dirty = False
 
         for symbol in symbols:
-            observed_at = datetime.now(timezone.utc)
-            self._record_shadow_scan_raw(
-                symbol,
-                observed_at=observed_at,
-            )
+            self._record_shadow_scan_raw(symbol)
             pending_plan = self.pending_limits.get(symbol)
             if (
                 pending_plan is not None
@@ -4746,17 +4745,16 @@ class Core:
                         self._log_signal(symbol, sig)
                         continue
 
-                    candidate_observed_at = datetime.now(timezone.utc)
                     (
                         shadow_plan_id,
                         entry_quote,
                         pending_expires_at,
+                        pending_observed_at,
                     ) = self._register_shadow_candidate(
                         symbol,
                         sig,
                         trigger_signature=trig_sig,
                         data=data,
-                        observed_at=candidate_observed_at,
                     )
                     if shadow_plan_id:
                         sig.setdefault("setup_id", shadow_plan_id)
@@ -4842,7 +4840,7 @@ class Core:
                                         trigger_signature=trig_sig,
                                         expires_at=pending_expires_at,
                                         shadow_plan_id=shadow_plan_id,
-                                        observed_at=candidate_observed_at,
+                                        observed_at=pending_observed_at,
                                     )
                             except RiskCapacityError as exc:
                                 sig["signal"] = "WAIT_RISK_ENTRY"
@@ -4920,8 +4918,11 @@ class Core:
                                 watcher.record_terminal(
                                     shadow_plan_id,
                                     "INVALIDATED",
-                                    at_utc=candidate_observed_at,
-                                    tick_msc=entry_quote.time_msc,
+                                    at_utc=pending_observed_at,
+                                    tick_msc=int(
+                                        pending_observed_at.timestamp()
+                                        * 1000
+                                    ),
                                     reason=sig["info"],
                                     inclusive=True,
                                 )

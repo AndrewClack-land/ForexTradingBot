@@ -28,7 +28,8 @@ def test_report_keeps_unknown_coverage_out_of_miss_rate(tmp_path):
             recoverable_by_limit INTEGER,
             status TEXT,
             terminal_reason TEXT,
-            first_gap_msc INTEGER
+            first_gap_msc INTEGER,
+            result_class TEXT
         )
         """
     )
@@ -51,6 +52,7 @@ def test_report_keeps_unknown_coverage_out_of_miss_rate(tmp_path):
             "FILLED",
             "broker pending LIMIT filled",
             None,
+            "MISSED_BY_CADENCE",
         ),
         (
             "unknown",
@@ -70,11 +72,12 @@ def test_report_keeps_unknown_coverage_out_of_miss_rate(tmp_path):
             "EXPIRED",
             "coverage gap",
             10_500,
+            "UNKNOWN_CLOCK_DOMAIN",
         ),
     ]
     connection.executemany(
         "INSERT INTO plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-        "?, ?, ?, ?, ?, ?)",
+        "?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     connection.commit()
@@ -88,6 +91,7 @@ def test_report_keeps_unknown_coverage_out_of_miss_rate(tmp_path):
     assert report["total"]["plans"] == 2
     assert report["total"]["complete"] == 1
     assert report["total"]["unknown_coverage"] == 1
+    assert report["total"]["unknown_clock_domain"] == 1
     assert report["total"]["missed_by_cadence"] == 1
     assert report["total"]["cadence_miss_rate"] == 1.0
     assert report["total"]["actual_pending_fills"] == 1

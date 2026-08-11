@@ -119,6 +119,7 @@ class ShadowPlanSpec:
     activated_at_utc: datetime
     activation_tick_msc: int
     expires_at_utc: datetime
+    activation_source_tick_msc: Optional[int] = None
     source_symbol: Optional[str] = None
     point: float = 0.0
     candidate_signature: str = ""
@@ -151,10 +152,22 @@ class ShadowPlanSpec:
             raise ValueError("entry_min cannot exceed entry_max")
         if int(self.activation_tick_msc) < 0:
             raise ValueError("activation_tick_msc must be non-negative")
+        if (
+            self.activation_source_tick_msc is not None
+            and int(self.activation_source_tick_msc) < 0
+        ):
+            raise ValueError("activation_source_tick_msc must be non-negative")
         activated = _utc(self.activated_at_utc)
         expires = _utc(self.expires_at_utc)
         if expires <= activated:
             raise ValueError("expires_at_utc must be after activated_at_utc")
+        causal_msc = _epoch_msc(activated)
+        if abs(int(self.activation_tick_msc) - causal_msc) > 5_000:
+            raise ValueError(
+                "activation_tick_msc must use the UTC observation clock"
+            )
+        if int(self.activation_tick_msc) >= _epoch_msc(expires):
+            raise ValueError("activation_tick_msc must precede expiry")
 
 
 @dataclass(frozen=True)
@@ -293,7 +306,7 @@ class MT5ReadOnlyFacade:
 class ShadowTickWatcher:
     """Persist and label entry touches while remaining structurally inert."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -390,6 +403,7 @@ class ShadowTickWatcher:
                     point REAL NOT NULL,
                     activated_at_utc TEXT NOT NULL,
                     activation_tick_msc INTEGER NOT NULL,
+                    activation_source_tick_msc INTEGER,
                     expires_at_utc TEXT NOT NULL,
                     expires_tick_msc INTEGER NOT NULL,
                     candidate_signature TEXT,
@@ -440,6 +454,7 @@ class ShadowTickWatcher:
                     plan_id TEXT NOT NULL REFERENCES plans(plan_id),
                     observed_at_utc TEXT NOT NULL,
                     tick_msc INTEGER NOT NULL,
+                    source_tick_msc INTEGER,
                     bid REAL,
                     ask REAL,
                     executable_price REAL,
@@ -475,6 +490,87 @@ class ShadowTickWatcher:
                 );
                 """
             )
+            previous_version_row = self._conn.execute(
+                "SELECT value FROM shadow_meta WHERE key = 'schema_version'"
+            ).fetchone()
+            try:
+                previous_version = int(previous_version_row[0])
+            except (TypeError, ValueError, IndexError):
+                previous_version = 1
+
+            plan_columns = {
+                str(row[1])
+                for row in self._conn.execute("PRAGMA table_info(plans)").fetchall()
+            }
+            if "activation_source_tick_msc" not in plan_columns:
+                self._conn.execute(
+                    "ALTER TABLE plans ADD COLUMN activation_source_tick_msc INTEGER"
+                )
+            scan_columns = {
+                str(row[1])
+                for row in self._conn.execute(
+                    "PRAGMA table_info(scan_observations)"
+                ).fetchall()
+            }
+            if "source_tick_msc" not in scan_columns:
+                self._conn.execute(
+                    "ALTER TABLE scan_observations ADD COLUMN source_tick_msc INTEGER"
+                )
+
+            if previous_version < 2:
+                self._conn.execute(
+                    """
+                    UPDATE plans
+                    SET activation_source_tick_msc = COALESCE(
+                        activation_source_tick_msc,
+                        activation_tick_msc
+                    )
+                    """
+                )
+                # Schema v1 used raw ``symbol_info_tick.time_msc`` as the causal
+                # watermark. Some MT5 terminals expose that field in broker
+                # server time while copy_ticks_range is UTC. Such rows cannot
+                # support a binary no-touch conclusion and must remain UNKNOWN.
+                self._conn.execute(
+                    """
+                    UPDATE plans
+                    SET status = CASE
+                            WHEN finalized = 0 THEN 'INVALIDATED'
+                            ELSE status
+                        END,
+                        terminal_reason = 'legacy watcher clock-domain mismatch',
+                        terminal_at_utc = COALESCE(
+                            terminal_at_utc,
+                            expires_at_utc
+                        ),
+                        terminal_tick_msc = COALESCE(
+                            terminal_tick_msc,
+                            expires_tick_msc
+                        ),
+                        finalized = 1,
+                        data_complete = 0,
+                        first_strict_touch_msc = NULL,
+                        first_tolerant_touch_msc = NULL,
+                        first_limit_touch_msc = NULL,
+                        first_gap_msc = NULL,
+                        first_broker_invalidated_msc = NULL,
+                        first_legacy_invalidated_msc = NULL,
+                        first_scan_touch_msc = NULL,
+                        first_policy_touch_msc = NULL,
+                        missed_by_cadence = NULL,
+                        missed_by_policy = NULL,
+                        recoverable_by_limit = NULL,
+                        result_class = 'UNKNOWN_CLOCK_DOMAIN',
+                        updated_at_utc = ?
+                    WHERE activation_tick_msc >= expires_tick_msc
+                       OR ABS(
+                            activation_tick_msc
+                            - CAST(strftime('%s', activated_at_utc) AS INTEGER)
+                              * 1000
+                       ) > 60000
+                    """,
+                    (_iso(datetime.now(UTC)),),
+                )
             self._conn.execute(
                 "INSERT OR REPLACE INTO shadow_meta(key, value) VALUES('schema_version', ?)",
                 (str(self.SCHEMA_VERSION),),
@@ -541,12 +637,13 @@ class ShadowTickWatcher:
                         plan_id, symbol, source_symbol, side,
                         entry_min, entry_max, planned_entry, stop_price, point,
                         activated_at_utc, activation_tick_msc,
+                        activation_source_tick_msc,
                         expires_at_utc, expires_tick_msc,
                         candidate_signature, trigger_kind, trigger_event_id,
                         setup_tf, strategy_version, deployment_id, metadata_json,
                         auto_invalidate, covered_through_msc,
                         created_at_utc, updated_at_utc
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         spec.plan_id,
@@ -560,6 +657,11 @@ class ShadowTickWatcher:
                         max(0.0, float(spec.point)),
                         _iso(spec.activated_at_utc),
                         int(spec.activation_tick_msc),
+                        (
+                            None
+                            if spec.activation_source_tick_msc is None
+                            else int(spec.activation_source_tick_msc)
+                        ),
                         _iso(spec.expires_at_utc),
                         expires_msc,
                         spec.candidate_signature,
@@ -582,14 +684,25 @@ class ShadowTickWatcher:
                         "PLAN_CREATED",
                         event_at=spec.activated_at_utc,
                         tick_msc=int(spec.activation_tick_msc),
-                        payload={"expires_at_utc": _iso(spec.expires_at_utc)},
+                        payload={
+                            "expires_at_utc": _iso(spec.expires_at_utc),
+                            "activation_source_tick_msc": (
+                                spec.activation_source_tick_msc
+                            ),
+                        },
                     )
                 self._conn.commit()
             if created and activation_quote is not None:
+                causal_quote = QuoteTick(
+                    time_msc=int(spec.activation_tick_msc),
+                    bid=float(activation_quote.bid),
+                    ask=float(activation_quote.ask),
+                    flags=int(activation_quote.flags),
+                )
                 self._apply_ticks_to_plan(
                     spec.plan_id,
-                    [activation_quote],
-                    coverage_end_msc=int(activation_quote.time_msc),
+                    [causal_quote],
+                    coverage_end_msc=int(spec.activation_tick_msc),
                 )
             return created
         except Exception as exc:
@@ -622,6 +735,7 @@ class ShadowTickWatcher:
         if not self.enabled:
             return False
         try:
+            observed_msc = _epoch_msc(observed_at_utc)
             with self._db_lock:
                 assert self._conn is not None
                 row = self._conn.execute(
@@ -629,7 +743,7 @@ class ShadowTickWatcher:
                 ).fetchone()
                 if row is None or int(row["finalized"]):
                     return False
-                if not self._tick_inside_plan(row, int(quote.time_msc)):
+                if not self._tick_inside_plan(row, observed_msc):
                     return False
                 classification = classify_quote(dict(row), quote)
                 policy_touch = bool(
@@ -640,10 +754,11 @@ class ShadowTickWatcher:
                 self._conn.execute(
                     """
                     INSERT INTO scan_observations (
-                        plan_id, observed_at_utc, tick_msc, bid, ask,
+                        plan_id, observed_at_utc, tick_msc, source_tick_msc,
+                        bid, ask,
                         executable_price, strict_touch, tolerant_touch,
                         candidate_matches, policy_executable, disposition
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(plan_id, observed_at_utc, tick_msc)
                     DO UPDATE SET
                         candidate_matches = MAX(
@@ -654,6 +769,7 @@ class ShadowTickWatcher:
                             scan_observations.policy_executable,
                             excluded.policy_executable
                         ),
+                        source_tick_msc = excluded.source_tick_msc,
                         disposition = CASE
                             WHEN excluded.candidate_matches = 1
                             THEN excluded.disposition
@@ -663,6 +779,7 @@ class ShadowTickWatcher:
                     (
                         plan_id,
                         _iso(observed_at_utc),
+                        observed_msc,
                         int(quote.time_msc),
                         float(quote.bid),
                         float(quote.ask),
@@ -678,23 +795,29 @@ class ShadowTickWatcher:
                 values: list[Any] = [_iso(datetime.now(UTC))]
                 if classification.strict_touch and row["first_scan_touch_msc"] is None:
                     updates.append("first_scan_touch_msc = ?")
-                    values.append(int(quote.time_msc))
+                    values.append(observed_msc)
                     self._insert_event_locked(
                         plan_id,
                         "SCAN_TOUCH",
                         event_at=observed_at_utc,
-                        tick_msc=int(quote.time_msc),
-                        payload={"candidate_matches": bool(candidate_matches)},
+                        tick_msc=observed_msc,
+                        payload={
+                            "candidate_matches": bool(candidate_matches),
+                            "source_tick_msc": int(quote.time_msc),
+                        },
                     )
                 if policy_touch and row["first_policy_touch_msc"] is None:
                     updates.append("first_policy_touch_msc = ?")
-                    values.append(int(quote.time_msc))
+                    values.append(observed_msc)
                     self._insert_event_locked(
                         plan_id,
                         "POLICY_TOUCH",
                         event_at=observed_at_utc,
-                        tick_msc=int(quote.time_msc),
-                        payload={"disposition": disposition},
+                        tick_msc=observed_msc,
+                        payload={
+                            "disposition": disposition,
+                            "source_tick_msc": int(quote.time_msc),
+                        },
                     )
                 values.append(plan_id)
                 self._conn.execute(
@@ -1458,6 +1581,7 @@ class ShadowTickWatcher:
             "missed_by_policy": 0,
             "limit_recoverable": 0,
             "unknown_coverage": 0,
+            "unknown_clock_domain": 0,
             "miss_rate": None,
         }
         if not self.enabled:
@@ -1477,7 +1601,11 @@ class ShadowTickWatcher:
                         SUM(CASE WHEN missed_by_cadence = 1 THEN 1 ELSE 0 END) AS missed_by_cadence,
                         SUM(CASE WHEN missed_by_policy = 1 THEN 1 ELSE 0 END) AS missed_by_policy,
                         SUM(CASE WHEN recoverable_by_limit = 1 THEN 1 ELSE 0 END) AS limit_recoverable,
-                        SUM(CASE WHEN data_complete = 0 THEN 1 ELSE 0 END) AS unknown_coverage
+                        SUM(CASE WHEN data_complete = 0 THEN 1 ELSE 0 END) AS unknown_coverage,
+                        SUM(
+                            CASE WHEN result_class = 'UNKNOWN_CLOCK_DOMAIN'
+                            THEN 1 ELSE 0 END
+                        ) AS unknown_clock_domain
                     FROM plans {where}
                     """
                 ).fetchone()

@@ -83,6 +83,10 @@ def _metric(rows: Iterable[sqlite3.Row]) -> dict[str, Any]:
         "finalized": sum(int(row["finalized"]) for row in population),
         "complete": len(complete),
         "unknown_coverage": len(population) - len(complete),
+        "unknown_clock_domain": sum(
+            str(row["result_class"] or "") == "UNKNOWN_CLOCK_DOMAIN"
+            for row in population
+        ),
         "tick_touched": len(touched),
         "scan_touched": sum(
             row["first_scan_touch_msc"] is not None for row in complete
@@ -182,6 +186,7 @@ def _print_text(report: dict[str, Any]) -> None:
     print(f"Shadow tick DB: {report['db']}")
     print(
         "plans={plans} complete={complete} unknown={unknown_coverage} "
+        "unknown_clock={unknown_clock_domain} "
         "tick_touched={tick_touched} scan_touched={scan_touched} "
         "cadence_missed={missed_by_cadence} ({miss_rate}) "
         "limit_recoverable={limit_recoverable} ({recovery_rate}) "
@@ -195,7 +200,7 @@ def _print_text(report: dict[str, Any]) -> None:
         return
     print(
         "group | plans | complete | tick | scan | cadence_miss | "
-        "limit_recoverable | pending_fills | unknown"
+        "limit_recoverable | pending_fills | unknown | unknown_clock"
     )
     for key, row in report["groups"].items():
         print(
@@ -206,7 +211,8 @@ def _print_text(report: dict[str, Any]) -> None:
             f"{row['limit_recoverable']} "
             f"({_fmt_rate(row['limit_recovery_rate'])}) | "
             f"{row['actual_pending_fills']} | "
-            f"{row['unknown_coverage']}"
+            f"{row['unknown_coverage']} | "
+            f"{row['unknown_clock_domain']}"
         )
 
 
