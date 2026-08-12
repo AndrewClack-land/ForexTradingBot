@@ -11,6 +11,18 @@ from typing import Optional, Dict, Any, List
 
 import MetaTrader5 as mt5
 
+try:  # config is optional so the executor stays importable in isolation
+    import config as _cfg
+except Exception:  # pragma: no cover - defensive, mirrors strategy_narrative
+    _cfg = None
+
+MAX_ENTRY_SPREAD_ENABLED = bool(
+    getattr(_cfg, "MAX_ENTRY_SPREAD_ENABLED", False)
+)
+MAX_ENTRY_SPREAD_PIPS: Dict[str, float] = dict(
+    getattr(_cfg, "MAX_ENTRY_SPREAD_PIPS", {}) or {}
+)
+
 
 _SERVER_CLOCK_SNAP_SEC = 15 * 60
 _SERVER_CLOCK_RESIDUAL_TOLERANCE_SEC = 120.0
@@ -271,6 +283,33 @@ class MT5Executor:
     @property
     def initial_capital(self) -> float:
         return self._resolve_initial_capital()
+
+    def _max_entry_spread(self, symbol: str) -> Optional[float]:
+        """Absolute price limit on the quoted spread for a new entry.
+
+        Returns ``None`` when the gate is disabled or no limit is configured
+        for this symbol, so an unlisted symbol is never blocked by accident.
+        The configured value is in pips; it is converted with the symbol's own
+        pip size so a JPY-quoted or metal symbol is not silently mis-scaled.
+        """
+
+        if not MAX_ENTRY_SPREAD_ENABLED:
+            return None
+        limit_pips = MAX_ENTRY_SPREAD_PIPS.get(str(symbol).strip().upper())
+        if limit_pips is None:
+            return None
+        limit_pips = float(limit_pips)
+        if not math.isfinite(limit_pips) or limit_pips <= 0:
+            return None
+        return limit_pips * self._pip_size(symbol)
+
+    def _pip_size(self, symbol: str) -> float:
+        """Pip size for a symbol, derived from the broker's own digits."""
+
+        info = mt5.symbol_info(symbol)
+        digits = int(getattr(info, "digits", 5) or 5) if info is not None else 5
+        # 5/3-digit quotes carry a fractional pip; 4/2-digit ones do not.
+        return 10.0 ** (-(digits - 1)) if digits in (3, 5) else 10.0 ** (-digits)
 
     def prepare_limit_entry(
         self,
@@ -2261,6 +2300,21 @@ class MT5Executor:
         order_type = mt5.ORDER_TYPE_BUY if is_buy else mt5.ORDER_TYPE_SELL
         price = tick.ask if is_buy else tick.bid
         current_spread = abs(float(tick.ask) - float(tick.bid))
+
+        # Refuse an entry while the quoted spread is abnormally wide. Cost
+        # repricing of the sealed OOS population showed the gross edge is a
+        # small multiple of round-turn friction, so a single blown-out fill can
+        # erase many normal setups. Measured FxPro DOM (2026-07-28 onward,
+        # 3,252 finalized M15 bars) puts the in-session spread at a stable
+        # 0.20/0.60/0.31 pips for EURUSD/GBPUSD/USDCAD, while the off-session
+        # p99 reaches 9-10 pips. The session gate already excludes most of
+        # that; this is the guard for the remainder.
+        max_spread = self._max_entry_spread(symbol)
+        if max_spread is not None and current_spread > max_spread:
+            raise RuntimeError(
+                f"Spread gate rejected {symbol}: current spread "
+                f"{current_spread:.5f} exceeds limit {max_spread:.5f}"
+            )
 
         # The strategy calculates SL/TP from the worst edge of its entry zone.
         # Enforce that zone at execution time so a delayed market order cannot

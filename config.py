@@ -384,6 +384,60 @@ FVG_VETO_ENABLED = os.getenv("FVG_VETO_ENABLED", "0").strip().lower() in {
     "1", "true", "yes", "on",
 }
 
+# ================== EXECUTION: SPREAD GATE ==================
+# Refuse a new entry while the quoted spread is abnormally wide. Cost repricing
+# of the sealed 2020-2026 OOS population showed the gross edge is only a small
+# multiple of round-turn friction, so one blown-out fill can erase many normal
+# setups.
+#
+# Defaults come from the bot's own FxPro DOM capture, 3,252 finalized M15 bars
+# from 2026-07-28, in pips:
+#
+#   symbol   median  p90   p95   p99    in-session p95 (LONDON/NY)
+#   EURUSD    0.20   0.30  0.39  2.19        0.20 / 0.34
+#   GBPUSD    0.60   0.90  0.98  9.41        0.60 / 0.92
+#   USDCAD    0.31   0.90  1.12  9.96        0.32 / 1.06
+#
+# The p99 blowouts sit in off-session hours that the session gate already
+# excludes, so these limits are set just above the in-session p95: they pass
+# normal trading and cut only genuine dislocations. Raise, never silently
+# lower, a limit for a symbol whose measured spread profile differs.
+MAX_ENTRY_SPREAD_ENABLED = os.getenv(
+    "MAX_ENTRY_SPREAD_ENABLED", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
+
+_DEFAULT_MAX_ENTRY_SPREAD_PIPS = {
+    "EURUSD": 0.6,
+    "GBPUSD": 1.4,
+    "USDCAD": 1.6,
+}
+
+
+def _parse_spread_limits(raw: str) -> dict:
+    """Parse 'EURUSD=0.6,GBPUSD=1.4' into a pip-limit mapping."""
+
+    limits = dict(_DEFAULT_MAX_ENTRY_SPREAD_PIPS)
+    for chunk in str(raw or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        symbol, _, value = chunk.partition("=")
+        symbol = symbol.strip().upper()
+        if not symbol:
+            continue
+        try:
+            pips = float(value.strip())
+        except ValueError:
+            continue
+        if pips > 0:
+            limits[symbol] = pips
+    return limits
+
+
+MAX_ENTRY_SPREAD_PIPS = _parse_spread_limits(
+    os.getenv("MAX_ENTRY_SPREAD_PIPS", "")
+)
+
 # Optional research ceiling on the IMFVG regime. Paired WFO showed that 24 H1
 # bars added trades but reduced net R and PF, so production remains unbounded.
 # Non-zero values are retained only for explicit sensitivity experiments.
