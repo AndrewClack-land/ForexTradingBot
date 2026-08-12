@@ -3,8 +3,6 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Optional
 
 
 def _env_float(key: str, default: float) -> float:
@@ -37,8 +35,24 @@ class AIConfig:
     """
     enabled: bool = field(default_factory=lambda: _env_bool("AI_ENABLED", True))
 
-    # Minimum closed trades per symbol before trusting stats
+    # Legacy binary TP/SL by trigger is not an execution-quality model for
+    # split/BE/time exits. Keep both its capture and gate dormant until a
+    # durable idea-level realized-net-R calibration replaces it.
+    trigger_calibration_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "AI_TRIGGER_CALIBRATION_ENABLED",
+            False,
+        )
+    )
+
+    # Legacy aggregate threshold retained for diagnostics.
     min_closed_per_symbol: int = field(default_factory=lambda: _env_int("AI_MIN_CLOSED", 30))
+
+    # Entry quality is calibrated on the independent-idea source, not pooled
+    # across unrelated trigger families on the same symbol.
+    min_closed_per_trigger: int = field(
+        default_factory=lambda: _env_int("AI_MIN_CLOSED_TRIGGER", 30)
+    )
 
     # Absolute minimum p(TP) threshold — fallback when rr_numeric unavailable
     min_p_tp: float = field(default_factory=lambda: _env_float("AI_MIN_P_TP", 0.20))

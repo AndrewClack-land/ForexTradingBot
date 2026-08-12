@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 from collections import Counter
+import json
 from types import SimpleNamespace
 
 import pandas as pd
 import pytest
 
+import backtest.__main__ as backtest_main
 import backtest.counterfactual as counterfactual_module
 from backtest.counterfactual import (
     TRIGGER_MANIFEST,
     run_counterfactual_backtest,
 )
+from backtest.cost_model import CostProfile
 from backtest.data import HistoricalDataset
 from backtest.strategy_runner import (
     NarrativeBacktestConfig,
@@ -26,6 +29,36 @@ def _frame(index, rows):
         columns=["open", "high", "low", "close"],
         index=pd.DatetimeIndex(index, name="timestamp"),
     )
+
+
+def test_optimize_v2_cli_cost_ranking_defaults_gross_and_accepts_net():
+    argv = [
+        "optimize-v2",
+        "--data",
+        "snapshot",
+        "--symbols",
+        "EURUSD",
+        "--initial-capital",
+        "10000",
+        "--output",
+        "report",
+        "--profile",
+        "signal-quality",
+        "--train",
+        "730D",
+        "--test",
+        "180D",
+    ]
+
+    default = backtest_main._build_parser().parse_args(argv)
+    explicit = backtest_main._build_parser().parse_args([
+        *argv,
+        "--cost-ranking-mode",
+        "net",
+    ])
+
+    assert default.cost_ranking_mode == "gross"
+    assert explicit.cost_ranking_mode == "net"
 
 
 def _dataset(tmp_path):
@@ -171,6 +204,7 @@ class _AllSideAllTriggerStrategy:
 def _config(
     *,
     rejection_block_entry_enabled=True,
+    rejection_block_h1_oos_enabled=False,
     orderblock_entry_enabled=True,
     entry_ttl="15min",
 ):
@@ -191,8 +225,43 @@ def _config(
         test="30min",
         step="30min",
         rejection_block_entry_enabled=rejection_block_entry_enabled,
+        rejection_block_h1_oos_enabled=(
+            rejection_block_h1_oos_enabled
+        ),
         orderblock_entry_enabled=orderblock_entry_enabled,
     )
+
+
+def _cost_profile(
+    *,
+    created_at_utc: str = "2026-01-01T00:00:00Z",
+    measured_through_utc: str | None = None,
+) -> CostProfile:
+    payload = {
+        "schema": "fx-cost-profile-v1",
+        "profile_id": "test-forward-costs",
+        "account_currency": "USD",
+        "measured_from": "deterministic unit-test fixture",
+        "created_at_utc": created_at_utc,
+        "rollover_timezone": "UTC",
+        "rollover_hour": 0,
+        "triple_swap_weekday": 2,
+        "symbols": {
+            "EURUSD": {
+                "base_currency": "EUR",
+                "quote_currency": "USD",
+                "contract_size": 100000,
+                "spread_price": 0.10,
+                "slippage_price_per_side": 0.02,
+                "commission_round_turn_per_lot": 7.0,
+                "swap_long_per_lot_rollover": -2.0,
+                "swap_short_per_lot_rollover": 1.0,
+            },
+        },
+    }
+    if measured_through_utc is not None:
+        payload["measured_through_utc"] = measured_through_utc
+    return CostProfile.from_mapping(payload)
 
 
 def test_optimize_v2_rejects_cross_decision_pending_overlap():
@@ -557,6 +626,127 @@ def test_train_only_weights_replay_oos_without_threshold_and_keep_one_pct_risk(
     } == set(TRIGGER_MANIFEST)
 
 
+def test_cost_profile_defaults_to_gross_rank_and_reports_cost_audit(tmp_path):
+    result = run_counterfactual_backtest(
+        _dataset(tmp_path / "data"),
+        _config(),
+        strategy_factory=_AllSideAllTriggerStrategy,
+        min_train_opportunities=1,
+        cost_profile=_cost_profile(),
+    )
+
+    ranked = [
+        row
+        for row in result.selections
+        if row["selection_status"] == "RANKED_FOR_REPLAY"
+    ]
+    assert ranked
+    assert {row["ranking_basis"] for row in ranked} == {
+        "predicted_gross_r"
+    }
+    assert all(
+        row["expected_net_r"]
+        == pytest.approx(
+            row["expected_gross_r"] - row["estimated_cost_r"]
+        )
+        for row in ranked
+    )
+    assert result.setups
+    assert all(row["cost_status"] for row in result.setups)
+    assert all(
+        row["net_r"] == pytest.approx(row["net_after_cost_r"])
+        for row in result.setups
+    )
+    assert result.summary["oos_primary_gross_metrics"] is not None
+    assert result.summary["transaction_cost_profile"]["profile_id"] == (
+        "test-forward-costs"
+    )
+    assert result.summary["cost_ranking"]["mode"] == "gross"
+    assert result.summary["cost_ranking"]["profile_use"] == (
+        "STATIC_STRESS_SCENARIO_NOT_POINT_IN_TIME"
+    )
+    assert result.summary["cost_ranking"]["point_in_time"]["issues"] == [
+        "MISSING_MEASURED_THROUGH_UTC"
+    ]
+    assert result.summary["transaction_cost_profile"][
+        "estimated_net_candidate_audit_computed"
+    ] is True
+    assert result.summary["transaction_cost_profile"][
+        "ranking_entry_friction_only"
+    ] is False
+    assert "STATIC STRESS SCENARIO" in result.summary["warnings"][0]
+    assert result.summary["paired_comparison"]["same_cost_profile"] is True
+
+    report = result.write(tmp_path / "cost-report")
+    setup_header = (report / "setups.csv").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    assert "gross_net_r" in setup_header
+    assert "transaction_cost_r" in setup_header
+    selection_header = (report / "oos_selections.csv").read_text(
+        encoding="utf-8"
+    ).splitlines()[0]
+    assert "expected_net_r" in selection_header
+    config_payload = json.loads(
+        (report / "config.json").read_text(encoding="utf-8")
+    )
+    summary_payload = json.loads(
+        (report / "summary.json").read_text(encoding="utf-8")
+    )
+    manifest_payload = json.loads(
+        (report / "manifest.json").read_text(encoding="utf-8")
+    )
+    assert config_payload["counterfactual_optimizer"][
+        "cost_ranking"
+    ]["mode"] == "gross"
+    assert summary_payload["cost_ranking"]["profile_use"] == (
+        "STATIC_STRESS_SCENARIO_NOT_POINT_IN_TIME"
+    )
+    assert manifest_payload["cost_ranking"] == (
+        summary_payload["cost_ranking"]
+    )
+
+
+def test_explicit_causal_net_ranking_is_audited_in_public_api(tmp_path):
+    profile = _cost_profile(
+        created_at_utc="2025-12-31T22:00:00Z",
+        measured_through_utc="2025-12-31T21:00:00Z",
+    )
+    result = run_counterfactual_backtest(
+        _dataset(tmp_path / "data"),
+        _config(),
+        strategy_factory=_AllSideAllTriggerStrategy,
+        min_train_opportunities=1,
+        cost_profile=profile,
+        cost_ranking_mode="net",
+    )
+
+    ranked = [
+        row
+        for row in result.selections
+        if row["selection_status"] == "RANKED_FOR_REPLAY"
+    ]
+    assert ranked
+    assert {row["ranking_basis"] for row in ranked} == {
+        "expected_net_r"
+    }
+    assert result.summary["cost_ranking"]["profile_use"] == (
+        "POINT_IN_TIME_PROFILE_NET_RANKING"
+    )
+    assert result.summary["cost_ranking"]["point_in_time"][
+        "causal_for_all_fold_test_starts"
+    ] is True
+    assert result.summary["transaction_cost_profile"][
+        "candidate_ranking_mode"
+    ] == "net"
+    assert result.summary["transaction_cost_profile"][
+        "ranking_entry_friction_only"
+    ] is True
+    assert result.config["counterfactual_optimizer"]["cost_ranking"][
+        "mode"
+    ] == "net"
+
+
 def test_not_fit_fold_is_audited_but_never_trades_reference_weights(
     tmp_path,
 ):
@@ -623,6 +813,83 @@ def test_disabled_trigger_is_still_labelled_but_blocked_only_in_replay():
         for row in result.selections
         if row["selection_status"] == "RANKED_FOR_REPLAY"
     )
+
+
+def test_h1_rb_oos_gate_is_default_off_and_independent_from_m15():
+    m15_only = run_counterfactual_backtest(
+        _dataset("counterfactual-rb-m15-only"),
+        _config(
+            rejection_block_entry_enabled=True,
+            rejection_block_h1_oos_enabled=False,
+        ),
+        strategy_factory=_AllSideAllTriggerStrategy,
+        min_train_opportunities=1,
+    )
+    h1_only = run_counterfactual_backtest(
+        _dataset("counterfactual-rb-h1-only"),
+        _config(
+            rejection_block_entry_enabled=False,
+            rejection_block_h1_oos_enabled=True,
+        ),
+        strategy_factory=_AllSideAllTriggerStrategy,
+        min_train_opportunities=1,
+    )
+
+    m15_only_h1 = [
+        row
+        for row in m15_only.opportunities
+        if row["trigger_kind"] == "rejection_block_1h"
+    ]
+    m15_only_m15 = [
+        row
+        for row in m15_only.opportunities
+        if row["trigger_kind"] == "rejection_block_15m"
+    ]
+    h1_only_h1 = [
+        row
+        for row in h1_only.opportunities
+        if row["trigger_kind"] == "rejection_block_1h"
+    ]
+    h1_only_m15 = [
+        row
+        for row in h1_only.opportunities
+        if row["trigger_kind"] == "rejection_block_15m"
+    ]
+    assert m15_only_h1 and m15_only_m15
+    assert h1_only_h1 and h1_only_m15
+    assert {row["gate"] for row in m15_only_h1} == {
+        "BLOCK_TRIGGER_DISABLED"
+    }
+    assert "BLOCK_TRIGGER_DISABLED" not in {
+        row["gate"] for row in m15_only_m15
+    }
+    assert "BLOCK_TRIGGER_DISABLED" not in {
+        row["gate"] for row in h1_only_h1
+    }
+    assert {row["gate"] for row in h1_only_m15} == {
+        "BLOCK_TRIGGER_DISABLED"
+    }
+    assert "rejection_block_1h" not in m15_only.summary[
+        "enabled_trigger_manifest"
+    ]
+    assert "rejection_block_15m" in m15_only.summary[
+        "enabled_trigger_manifest"
+    ]
+    assert "rejection_block_1h" in h1_only.summary[
+        "enabled_trigger_manifest"
+    ]
+    assert "rejection_block_15m" not in h1_only.summary[
+        "enabled_trigger_manifest"
+    ]
+    assert h1_only.config["strategy_settings"][
+        "rejection_block_h1_oos_enabled"
+    ] is True
+    assert h1_only.summary["rejection_block_h1_oos"] == {
+        "enabled": True,
+        "detector": "live_parity_rejection_block_1h",
+        "research_only": True,
+        "independent_from_rejection_block_15m": True,
+    }
 
 
 def test_orderblock_detector_is_forced_on_for_training_then_replay_blocked():
@@ -843,3 +1110,183 @@ def test_ranked_replay_uses_earliest_fill_then_rank_for_timestamp_tie():
     assert "EXPIRED_ENTRY_RANGE" not in {
         row["disposition"] for row in executions
     }
+
+
+def test_cost_aware_arbitration_can_reverse_a_gross_score_choice():
+    decision = pd.Timestamp("2026-01-01T00:15:00Z")
+    period = counterfactual_module._Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=decision,
+        test_end=decision + pd.Timedelta(minutes=30),
+    )
+
+    def opportunity(opportunity_id, trigger_kind, stop):
+        return counterfactual_module._Opportunity(
+            opportunity_id=opportunity_id,
+            decision_event_id="decision-1",
+            symbol="EURUSD",
+            bar_close_time=decision,
+            decision_time=decision,
+            trigger_kind=trigger_kind,
+            trigger_tags=(trigger_kind,),
+            gate="ENTER",
+            gate_reason="eligible",
+            signal={
+                "side": "LONG",
+                "entry_price": 1.10,
+                "entry_min": 1.10,
+                "entry_max": 1.10,
+                "stop_price": stop,
+                "tp_prices": [1.20, 1.30, 1.40],
+                "trigger_kind": trigger_kind,
+            },
+        )
+
+    opportunities = {
+        "gross-winner": opportunity(
+            "gross-winner",
+            "rejection_block_15m",
+            1.09,
+        ),
+        "net-winner": opportunity(
+            "net-winner",
+            "h1_pivot_reclaim_15m",
+            0.10,
+        ),
+    }
+    predictions = [
+        {
+            "fold_index": 0,
+            "opportunity_id": "gross-winner",
+            "model_status": "FIT",
+            "model_id": "model",
+            "predicted_opportunity_r": 0.50,
+        },
+        {
+            "fold_index": 0,
+            "opportunity_id": "net-winner",
+            "model_status": "FIT",
+            "model_id": "model",
+            "predicted_opportunity_r": 0.40,
+        },
+    ]
+
+    gross_selected, gross_audit = (
+        counterfactual_module._select_oos_candidates(
+        predictions=predictions,
+        opportunity_by_id=opportunities,
+        periods=[period],
+        )
+    )
+    causal_profile = _cost_profile(
+        created_at_utc="2025-12-31T22:00:00Z",
+        measured_through_utc="2025-12-31T21:00:00Z",
+    )
+    gross_profile_selected, gross_profile_audit = (
+        counterfactual_module._select_oos_candidates(
+            predictions=predictions,
+            opportunity_by_id=opportunities,
+            periods=[period],
+            cost_profile=causal_profile,
+        )
+    )
+    net_selected, net_audit = counterfactual_module._select_oos_candidates(
+        predictions=predictions,
+        opportunity_by_id=opportunities,
+        periods=[period],
+        cost_profile=causal_profile,
+        cost_ranking_mode="net",
+    )
+
+    assert [row["opportunity_id"] for row in gross_audit] == [
+        "gross-winner",
+        "net-winner",
+    ]
+    assert gross_selected[0].signal["expected_gross_r"] == 0.50
+    assert gross_profile_selected[0].signal["expected_gross_r"] == 0.50
+    assert gross_profile_selected[0].signal["expected_net_r"] < (
+        gross_profile_selected[1].signal["expected_net_r"]
+    )
+    assert [row["opportunity_id"] for row in gross_profile_audit] == [
+        "gross-winner",
+        "net-winner",
+    ]
+    assert {
+        row["ranking_basis"] for row in gross_profile_audit
+    } == {"predicted_gross_r"}
+    assert net_selected[0].signal["expected_gross_r"] == 0.40
+    assert net_selected[0].signal["expected_net_r"] > (
+        net_selected[1].signal["expected_net_r"]
+    )
+    assert [row["opportunity_id"] for row in net_audit] == [
+        "net-winner",
+        "gross-winner",
+    ]
+    assert {row["ranking_basis"] for row in net_audit} == {
+        "expected_net_r"
+    }
+
+
+@pytest.mark.parametrize(
+    ("profile", "expected_issue"),
+    [
+        (
+            _cost_profile(),
+            "MISSING_MEASURED_THROUGH_UTC",
+        ),
+        (
+            _cost_profile(
+                created_at_utc="2026-01-01T00:16:00Z",
+                measured_through_utc="2025-12-31T21:00:00Z",
+            ),
+            "CREATED_AT_AFTER_FOLD_TEST_START",
+        ),
+        (
+            _cost_profile(
+                created_at_utc="2025-12-31T22:00:00Z",
+                measured_through_utc="2026-01-01T00:16:00Z",
+            ),
+            "MEASURED_THROUGH_AFTER_FOLD_TEST_START",
+        ),
+    ],
+)
+def test_net_cost_ranking_fails_closed_on_noncausal_provenance(
+    profile,
+    expected_issue,
+):
+    period = counterfactual_module._Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=pd.Timestamp("2026-01-01T00:15:00Z"),
+        test_end=pd.Timestamp("2026-01-01T00:45:00Z"),
+    )
+
+    with pytest.raises(StrategyBacktestError, match=expected_issue):
+        counterfactual_module._cost_ranking_audit(
+            cost_profile=profile,
+            periods=[period],
+            mode="net",
+        )
+
+
+def test_net_cost_ranking_requires_a_cost_profile():
+    period = counterfactual_module._Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=pd.Timestamp("2026-01-01T00:15:00Z"),
+        test_end=pd.Timestamp("2026-01-01T00:45:00Z"),
+    )
+
+    with pytest.raises(
+        StrategyBacktestError,
+        match="net cost ranking requires a --cost-profile",
+    ):
+        counterfactual_module._cost_ranking_audit(
+            cost_profile=None,
+            periods=[period],
+            mode="net",
+        )

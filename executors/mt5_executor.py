@@ -12,6 +12,75 @@ from typing import Optional, Dict, Any, List
 import MetaTrader5 as mt5
 
 
+_SERVER_CLOCK_SNAP_SEC = 15 * 60
+_SERVER_CLOCK_RESIDUAL_TOLERANCE_SEC = 120.0
+_MAX_SERVER_UTC_OFFSET_SEC = 14 * 60 * 60
+
+
+def _specified_expiration_for_server(
+    *,
+    expires_at_utc: float,
+    tick: Any,
+    observed_at_utc: float,
+) -> tuple[int, int]:
+    """Translate a canonical UTC deadline to the terminal's server clock.
+
+    MT5 history timestamps are queried in UTC, but some terminals expose the
+    latest quote timestamp in broker-server local time and validate
+    ORDER_TIME_SPECIFIED against that same clock. Derive the offset from a
+    fresh quote, snap it to a real timezone boundary, and fail closed when the
+    observation cannot prove a trustworthy mapping.
+    """
+
+    raw_time_msc = getattr(tick, "time_msc", None)
+    try:
+        server_now = float(raw_time_msc) / 1000.0
+    except (TypeError, ValueError):
+        server_now = 0.0
+    if not math.isfinite(server_now) or server_now <= 0.0:
+        try:
+            server_now = float(getattr(tick, "time", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            server_now = 0.0
+    if not math.isfinite(server_now) or server_now <= 0.0:
+        raise PendingOrderRejected(
+            "Fresh MT5 quote has no usable server timestamp",
+            submitted=False,
+        )
+
+    observed = float(observed_at_utc)
+    expiry = float(expires_at_utc)
+    if not math.isfinite(observed) or not math.isfinite(expiry):
+        raise PendingOrderRejected(
+            "Pending expiration clock inputs are non-finite",
+            submitted=False,
+        )
+    raw_offset = server_now - observed
+    snapped_offset = int(
+        round(raw_offset / _SERVER_CLOCK_SNAP_SEC)
+        * _SERVER_CLOCK_SNAP_SEC
+    )
+    residual = abs(raw_offset - snapped_offset)
+    if (
+        abs(snapped_offset) > _MAX_SERVER_UTC_OFFSET_SEC
+        or residual > _SERVER_CLOCK_RESIDUAL_TOLERANCE_SEC
+    ):
+        raise PendingOrderRejected(
+            "Cannot prove MT5 server-clock offset "
+            f"(raw={raw_offset:.3f}s, snapped={snapped_offset}s, "
+            f"residual={residual:.3f}s)",
+            submitted=False,
+        )
+
+    broker_expiration = int(expiry + snapped_offset)
+    if broker_expiration <= server_now + 1.0:
+        raise PendingOrderRejected(
+            "Server-clock pending expiration is not in the future",
+            submitted=False,
+        )
+    return broker_expiration, snapped_offset
+
+
 def _send_request(request: Dict[str, Any]):
     """order_send() compatible with both MetaTrader5 package generations.
 
@@ -135,6 +204,28 @@ class RiskCapacityError(RiskLimitError):
         if self.minimum_volume is not None:
             payload["broker_min_volume"] = float(self.minimum_volume)
         return payload
+
+
+class PendingOrderRejected(RuntimeError):
+    """No working pending order can result from this failed call.
+
+    ``submitted`` distinguishes a synchronous broker rejection from a local
+    preflight refusal. Both are definitive for reconciliation: unlike a
+    timeout/connection failure, neither can leave an accepted hidden order.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        retcode: Optional[int] = None,
+        broker_comment: str = "",
+        submitted: bool,
+    ) -> None:
+        super().__init__(message)
+        self.retcode = None if retcode is None else int(retcode)
+        self.broker_comment = str(broker_comment or "")
+        self.submitted = bool(submitted)
 
 
 # This is a code-level ceiling, independent of .env. A lower configured value
@@ -438,6 +529,14 @@ class MT5Executor:
                 f"setup budget {budget:.2f}"
             )
 
+        broker_expiration, server_utc_offset_sec = (
+            _specified_expiration_for_server(
+                expires_at_utc=expiry,
+                tick=tick,
+                observed_at_utc=datetime.now(timezone.utc).timestamp(),
+            )
+        )
+
         request = {
             "action": mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
@@ -451,7 +550,7 @@ class MT5Executor:
             "comment": str(comment or "FBPL")[:31],
             "type_filling": mt5.ORDER_FILLING_RETURN,
             "type_time": mt5.ORDER_TIME_SPECIFIED,
-            "expiration": int(expiry),
+            "expiration": broker_expiration,
         }
         result = _send_request(request)
         if result is None:
@@ -463,8 +562,26 @@ class MT5Executor:
             mt5.TRADE_RETCODE_DONE,
             getattr(mt5, "TRADE_RETCODE_DONE_PARTIAL", 10010),
         }
-        if int(result.retcode) not in success_codes:
-            raise RuntimeError(f"MT5 pending order_send failed: {result}")
+        retcode = int(result.retcode)
+        if retcode not in success_codes:
+            ambiguous_codes = {
+                int(getattr(mt5, "TRADE_RETCODE_ERROR", 10011)),
+                int(getattr(mt5, "TRADE_RETCODE_TIMEOUT", 10012)),
+                int(getattr(mt5, "TRADE_RETCODE_LOCKED", 10028)),
+                int(getattr(mt5, "TRADE_RETCODE_CONNECTION", 10031)),
+            }
+            if retcode in ambiguous_codes:
+                raise RuntimeError(
+                    f"MT5 pending order_send outcome ambiguous: {result}"
+                )
+            broker_comment = str(getattr(result, "comment", "") or "")
+            raise PendingOrderRejected(
+                "MT5 pending order rejected "
+                f"(retcode={retcode}, comment={broker_comment!r})",
+                retcode=retcode,
+                broker_comment=broker_comment,
+                submitted=True,
+            )
         return {
             "ticket": int(getattr(result, "order", 0) or 0),
             "deal": int(getattr(result, "deal", 0) or 0),
@@ -476,7 +593,9 @@ class MT5Executor:
             "risk_amount": float(leg_risk),
             "comment": request["comment"],
             "expires_at": expiry,
-            "retcode": int(result.retcode),
+            "broker_expiration": broker_expiration,
+            "server_utc_offset_sec": server_utc_offset_sec,
+            "retcode": retcode,
         }
 
     def list_pending_orders(
@@ -2367,6 +2486,34 @@ class MT5Executor:
         if side is not None and str(side).upper() == "SHORT":
             return float(tick.ask)
         return float(tick.bid)
+
+    def get_current_quote(
+        self,
+        symbol: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Return one causal broker bid/ask snapshot for entry-quality gates."""
+
+        tick = mt5.symbol_info_tick(symbol)
+        if tick is None:
+            return None
+        try:
+            bid = float(tick.bid)
+            ask = float(tick.ask)
+            time_msc = int(getattr(tick, "time_msc", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            return None
+        if (
+            not math.isfinite(bid)
+            or not math.isfinite(ask)
+            or bid <= 0.0
+            or ask < bid
+        ):
+            return None
+        return {
+            "bid": bid,
+            "ask": ask,
+            "time_msc": time_msc or None,
+        }
 
     def get_position(self, symbol: str, position_id: Optional[int]) -> Optional[Any]:
         return self._find_position(

@@ -66,8 +66,8 @@ def test_zero_restores_the_unbounded_latch():
     assert side == "LONG"
 
 
-def test_default_ceiling_is_twenty_four_bars():
-    assert NarrativeStrategy().fvg_regime_max_age_bars == 24
+def test_default_regime_is_time_unbounded():
+    assert NarrativeStrategy().fvg_regime_max_age_bars == 0
 
 
 def test_expired_regime_restores_the_symmetric_base_margin():
@@ -102,3 +102,133 @@ def test_expired_regime_restores_the_symmetric_base_margin():
     assert expired["fvg_side"] == "NEUTRAL"
     assert expired["margin_short"] == 2
     assert expired["margin_long"] == 2
+
+
+def test_full_zone_break_is_causal_event_invalidation_first_copy():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "zone_break"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (1.0, 1.2, 0.7, 0.8)
+
+    side, text = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "NEUTRAL"
+    assert "полное пробитие зоны" in text
+    assert strategy._last_fvg_regime_meta["invalidation_reason"] == (
+        "full_zone_break"
+    )
+    assert strategy._last_fvg_regime_meta["zone_low"] == 1.0
+
+
+def test_structure_change_requires_confirmed_post_signal_swing_first_copy():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "structure_change"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (2.3, 2.8, 2.0, 2.4)
+    frame.loc[len(frame)] = (2.0, 2.7, 1.8, 2.1)
+    frame.loc[len(frame)] = (2.2, 2.9, 2.0, 2.5)
+    frame.loc[len(frame)] = (1.8, 2.6, 1.6, 1.7)
+
+    side, text = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "NEUTRAL"
+    assert "смена структуры" in text
+    assert strategy._last_fvg_regime_meta["invalidation_level"] == 1.8
+    # The close never traversed the original gap's distal edge at 1.0.
+    assert frame["close"].iloc[-1] > 1.0
+
+
+def test_event_breaks_do_not_affect_production_when_mode_is_none_first_copy():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "none"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (1.0, 1.2, 0.7, 0.8)
+
+    assert strategy.calc_fvg_regime_1h(frame)[0] == "LONG"
+    assert strategy._last_fvg_regime_meta["invalidated"] is False
+
+
+def test_opposite_fvg_supersedes_the_latch_without_time_expiry_first_copy():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (0.9, 1.0, 0.8, 0.9)
+    frame.loc[len(frame)] = (1.4, 1.6, 1.2, 1.5)
+    frame.loc[len(frame)] = (2.1, 2.3, 2.0, 2.2)
+    frame.loc[len(frame)] = (0.6, 0.9, 0.5, 0.6)
+
+    side, _ = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "SHORT"
+    assert strategy._last_fvg_regime_meta[
+        "opposite_transition_seen"
+    ] is True
+    assert strategy._last_fvg_regime_meta["signal_age_bars"] == 0
+
+
+def test_full_zone_break_is_causal_event_invalidation():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "zone_break"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (1.0, 1.2, 0.7, 0.8)
+
+    side, text = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "NEUTRAL"
+    assert "полное пробитие зоны" in text
+    assert strategy._last_fvg_regime_meta["invalidation_reason"] == (
+        "full_zone_break"
+    )
+    assert strategy._last_fvg_regime_meta["zone_low"] == 1.0
+
+
+def test_structure_change_requires_confirmed_post_signal_swing():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "structure_change"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (2.3, 2.8, 2.0, 2.4)
+    frame.loc[len(frame)] = (2.0, 2.7, 1.8, 2.1)
+    frame.loc[len(frame)] = (2.2, 2.9, 2.0, 2.5)
+    frame.loc[len(frame)] = (1.8, 2.6, 1.6, 1.7)
+
+    side, text = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "NEUTRAL"
+    assert "смена структуры" in text
+    assert strategy._last_fvg_regime_meta["invalidation_level"] == 1.8
+    # The close never traversed the original gap's distal edge at 1.0.
+    assert frame["close"].iloc[-1] > 1.0
+
+
+def test_event_breaks_do_not_affect_production_when_mode_is_none():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    strategy.fvg_event_invalidation_mode = "none"
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (1.0, 1.2, 0.7, 0.8)
+
+    assert strategy.calc_fvg_regime_1h(frame)[0] == "LONG"
+    assert strategy._last_fvg_regime_meta["invalidated"] is False
+
+
+def test_opposite_fvg_supersedes_the_latch_without_time_expiry():
+    strategy = NarrativeStrategy()
+    strategy.fvg_regime_max_age_bars = 0
+    frame = _fvg_frame(0)
+    frame.loc[len(frame)] = (0.9, 1.0, 0.8, 0.9)
+    frame.loc[len(frame)] = (1.4, 1.6, 1.2, 1.5)
+    frame.loc[len(frame)] = (2.1, 2.3, 2.0, 2.2)
+    frame.loc[len(frame)] = (0.6, 0.9, 0.5, 0.6)
+
+    side, _ = strategy.calc_fvg_regime_1h(frame)
+
+    assert side == "SHORT"
+    assert strategy._last_fvg_regime_meta[
+        "opposite_transition_seen"
+    ] is True
+    assert strategy._last_fvg_regime_meta["signal_age_bars"] == 0

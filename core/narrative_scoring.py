@@ -13,7 +13,7 @@ import math
 from typing import Any, Mapping, Optional
 
 
-FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v1"
+FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v2"
 
 
 @dataclass(frozen=True)
@@ -23,6 +23,11 @@ class FactorDefinition:
     configured_weight: int
 
 
+# ``configured_weight`` is the weight of the contract that is actually live.
+# The 1H FVG regime carries a zero weight here because under the live contract
+# it is not a vote at all — it only raises the opposing side's margin. Keeping
+# the row in the schema lets both contracts share one factor vector layout, so
+# a challenger run stays paired with its baseline through the same simulator.
 FACTOR_DEFINITIONS = (
     FactorDefinition(
         "h1_premium_discount",
@@ -49,12 +54,68 @@ FACTOR_DEFINITIONS = (
         "Valid Rejection Block 1H",
         1,
     ),
+    FactorDefinition(
+        "fvg_regime_1h",
+        "1H FVG regime (IMFVG)",
+        0,
+    ),
 )
 
 FACTOR_WEIGHTS = {
     definition.key: definition.configured_weight
     for definition in FACTOR_DEFINITIONS
 }
+
+LEGACY_FACTOR_WEIGHTS = dict(FACTOR_WEIGHTS)
+
+# Challenger: H1 Premium/Discount 2->1, Order Block 1H 1->2, and the FVG regime
+# promoted from a margin penalty to a +1 directional vote. H1 P/D and the FVG
+# regime both effectively always vote, so at 1 each they cancel when they
+# disagree instead of H1 P/D's 2 dominating.
+CHALLENGER_FACTOR_WEIGHTS = {
+    "h1_premium_discount": 1,
+    "false_breakout_4h": 2,
+    "true_breakout_15m": 1,
+    "order_block_1h": 2,
+    "rejection_block_1h": 1,
+    "fvg_regime_1h": 1,
+}
+
+FACTOR_CONTRACT_LEGACY = "v1-fvg-margin"
+FACTOR_CONTRACT_FVG_VOTE = "v2-fvg-vote"
+
+# ``fvg_margin_enabled`` and the FVG weight are deliberately mutually
+# exclusive. As a margin rule the regime can only brake the opposing entry; as
+# a vote it also relaxes its own direction by one point. Enabling both would
+# shift the threshold by two points for a factor that never abstains.
+FACTOR_CONTRACTS = {
+    FACTOR_CONTRACT_LEGACY: {
+        "weights": dict(LEGACY_FACTOR_WEIGHTS),
+        "fvg_margin_enabled": True,
+    },
+    FACTOR_CONTRACT_FVG_VOTE: {
+        "weights": dict(CHALLENGER_FACTOR_WEIGHTS),
+        "fvg_margin_enabled": False,
+    },
+}
+
+
+def resolve_factor_contract(name: Optional[str]) -> dict[str, Any]:
+    """Return the frozen weight/margin pair for a named factor contract."""
+
+    key = str(name or FACTOR_CONTRACT_LEGACY).strip()
+    if key not in FACTOR_CONTRACTS:
+        raise ValueError(
+            f"unknown factor contract {key!r}; "
+            f"expected one of {sorted(FACTOR_CONTRACTS)}"
+        )
+    contract = FACTOR_CONTRACTS[key]
+    return {
+        "name": key,
+        "weights": dict(contract["weights"]),
+        "fvg_margin_enabled": bool(contract["fvg_margin_enabled"]),
+    }
+
 
 _SIDES = {"LONG", "SHORT", "NEUTRAL"}
 
@@ -86,6 +147,7 @@ def build_factor_vector(
     base_margin: int,
     fvg_side: str = "NEUTRAL",
     weights: Optional[Mapping[str, float]] = None,
+    fvg_margin_enabled: bool = True,
 ) -> dict[str, Any]:
     """Build a deterministic factor vector from frozen directional votes.
 
@@ -93,6 +155,11 @@ def build_factor_vector(
     mapping for every configured factor. Missing factors are retained as
     explicit ABSENT rows so absence never gets confused with a zero-valued
     observation.
+
+    ``fvg_side`` is recorded on every vector for attribution. It only moves the
+    margins while ``fvg_margin_enabled`` is set; under the FVG-vote contract the
+    regime enters through the ``fvg_regime_1h`` vote instead and the margins
+    stay symmetric.
     """
 
     effective_weights = {
@@ -115,11 +182,12 @@ def build_factor_vector(
         )
     normalized_fvg = _side(fvg_side)
     normalized_margin = max(1, int(base_margin))
+    margin_penalty = bool(fvg_margin_enabled)
     margin_long = normalized_margin + (
-        1 if normalized_fvg == "SHORT" else 0
+        1 if margin_penalty and normalized_fvg == "SHORT" else 0
     )
     margin_short = normalized_margin + (
-        1 if normalized_fvg == "LONG" else 0
+        1 if margin_penalty and normalized_fvg == "LONG" else 0
     )
 
     factor_rows: list[dict[str, Any]] = []
@@ -190,6 +258,7 @@ def build_factor_vector(
         "margin_long": margin_long,
         "margin_short": margin_short,
         "fvg_side": normalized_fvg,
+        "fvg_margin_enabled": margin_penalty,
         "factors": factor_rows,
     }
 
@@ -215,4 +284,7 @@ def rescore_factor_vector(
         base_margin=int(factor_vector.get("base_margin") or 1),
         fvg_side=str(factor_vector.get("fvg_side") or "NEUTRAL"),
         weights=weights,
+        fvg_margin_enabled=bool(
+            factor_vector.get("fvg_margin_enabled", True)
+        ),
     )

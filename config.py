@@ -102,6 +102,56 @@ SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC = min(
 )
 SHADOW_TICK_WATCHER_DB_PATH = AI_DATA_DIR / "shadow_tick_touches.db"
 
+# Full simultaneous-trigger population. It runs on a cloned strategy after
+# production decisions and writes to a separate SQLite ledger. Default OFF
+# until its CPU/latency overhead has been canaried.
+SHADOW_CANDIDATE_LEDGER_ENABLED = (
+    os.getenv("SHADOW_CANDIDATE_LEDGER_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+SHADOW_CANDIDATE_LEDGER_DB_PATH = (
+    AI_DATA_DIR / "shadow_candidate_ledger.db"
+)
+_SHADOW_CANDIDATE_COST_PROFILE_PATH = os.getenv(
+    "SHADOW_CANDIDATE_COST_PROFILE_PATH",
+    "",
+).strip()
+SHADOW_CANDIDATE_COST_PROFILE_PATH = (
+    Path(_SHADOW_CANDIDATE_COST_PROFILE_PATH)
+    if _SHADOW_CANDIDATE_COST_PROFILE_PATH
+    else None
+)
+_SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH = os.getenv(
+    "SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH",
+    "",
+).strip()
+SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH = (
+    Path(_SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH)
+    if _SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH
+    else None
+)
+
+# Compensating execution-quality filters. Default OFF: enabling without a
+# complete versioned profile (and point-in-time calendar when news is enabled)
+# fails closed for new entries.
+EXECUTION_QUALITY_FILTER_ENABLED = (
+    os.getenv("EXECUTION_QUALITY_FILTER_ENABLED", "0").strip().lower()
+    in {"1", "true", "yes", "on"}
+)
+_EXECUTION_QUALITY_PROFILE_PATH = os.getenv(
+    "EXECUTION_QUALITY_PROFILE_PATH",
+    "",
+).strip()
+EXECUTION_QUALITY_PROFILE_PATH = (
+    Path(_EXECUTION_QUALITY_PROFILE_PATH)
+    if _EXECUTION_QUALITY_PROFILE_PATH
+    else None
+)
+_NEWS_CALENDAR_PATH = os.getenv("NEWS_CALENDAR_PATH", "").strip()
+NEWS_CALENDAR_PATH = (
+    Path(_NEWS_CALENDAR_PATH) if _NEWS_CALENDAR_PATH else None
+)
+
 if MT5_EXECUTION_ENABLED and (MT5_LOGIN is None or not MT5_PASSWORD or not MT5_SERVER):
     MT5_EXECUTION_ENABLED = False
 
@@ -315,16 +365,31 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 # ================== HTF SCORING ==================
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
-# Maximum age, in closed H1 bars, of the IMFVG signal that defines the 1H FVG
-# regime. The regime latches until the opposite signal appears, so without a
-# ceiling a single gap keeps raising the opposing side's score margin for as
-# long as it stays the newest signal — live journals showed regimes driven by
-# signals 77-97 bars old (3-4 days) on every symbol. 24 bars = 24 hours.
-# Past the ceiling the regime is NEUTRAL and both margins fall back to the
-# base margin. Set to 0 to restore the previous unbounded latch.
+# Named factor weight/margin contract.
+#   v1-fvg-margin  live contract: five votes [2, 2, 1, 1, 1] and a 1H FVG
+#                  regime that only raises the opposing side's margin.
+#   v2-fvg-vote    challenger: H1 P/D 2->1, Order Block 1H 1->2, and the FVG
+#                  regime promoted to a +1 directional vote with symmetric
+#                  margins.
+# The challenger changes production scoring semantics and must not reach live
+# trading before a frozen paired OOS comparison is reviewed.
+FACTOR_CONTRACT = os.getenv("FACTOR_CONTRACT", "v1-fvg-margin").strip()
+
+# Optional research ceiling on the IMFVG regime. Paired WFO showed that 24 H1
+# bars added trades but reduced net R and PF, so production remains unbounded.
+# Non-zero values are retained only for explicit sensitivity experiments.
 _fvg_regime_max_age = _env_int("FVG_REGIME_MAX_AGE_BARS")
 FVG_REGIME_MAX_AGE_BARS = max(
-    0, _fvg_regime_max_age if _fvg_regime_max_age is not None else 24
+    0, _fvg_regime_max_age if _fvg_regime_max_age is not None else 0
+)
+_fvg_event_mode = os.getenv(
+    "FVG_EVENT_INVALIDATION_MODE", "none"
+).strip().lower()
+FVG_EVENT_INVALIDATION_MODE = (
+    _fvg_event_mode
+    if _fvg_event_mode
+    in {"none", "zone_break", "structure_change", "zone_or_structure"}
+    else "none"
 )
 
 # ================== SHADOW SCORE (DIAGNOSTIC ONLY) ==================

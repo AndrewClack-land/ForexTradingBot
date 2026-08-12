@@ -7,6 +7,24 @@ from core.m1.config import AIConfig
 from core.m1.store import TradeStore
 
 
+def signal_trigger_kind(sig: Dict[str, Any]) -> str:
+    """Return the structured trigger identity used for calibration."""
+
+    return str(sig.get("trigger_kind") or "").strip().lower()
+
+
+def primary_idea_trigger_kind(trade: Any) -> str:
+    """Return the trigger that opened an independent idea, not an add-on."""
+
+    signatures = list(
+        getattr(trade, "idea_trigger_signatures", []) or []
+    )
+    if not signatures:
+        return ""
+    parts = str(signatures[0]).split("|", 2)
+    return parts[1].strip().lower() if len(parts) == 3 else ""
+
+
 class AILive:
     """
     Лёгкий AI слой:
@@ -44,12 +62,36 @@ class AILive:
                 except Exception:
                     rr_numeric = None
 
-            self.store.update_on_close(symbol, outcome, rr_numeric=rr_numeric)
+            trigger_kind = primary_idea_trigger_kind(tr)
+            self.store.update_on_close(
+                symbol,
+                outcome,
+                rr_numeric=rr_numeric,
+                trigger_kind=(
+                    trigger_kind
+                    if self.cfg.trigger_calibration_enabled
+                    else None
+                ),
+            )
 
             # можно добавить немного инфы в сообщение
             stats = self.store.get_symbol_stats(symbol)
+            bucket = self.store.get_symbol_trigger_stats(
+                symbol,
+                trigger_kind,
+            )
             sig["ai_stats_closed"] = stats["closed"]
             sig["ai_p_tp"] = round(float(stats["p_tp"]), 3)
+            sig["ai_trigger_stats_closed"] = bucket["closed"]
+            sig["ai_trigger_p_tp"] = round(
+                float(bucket["p_tp"]),
+                3,
+            )
+            sig["ai_calibration_key"] = (
+                f"{str(symbol).upper()}x{trigger_kind}"
+                if trigger_kind
+                else None
+            )
             return sig
 
         # ---- filter on enter ----
@@ -67,13 +109,34 @@ class AILive:
                     "ai_p_tp": None,
                 }
 
-            stats = self.store.get_symbol_stats(symbol)
+            trigger_kind = signal_trigger_kind(sig)
+            aggregate = self.store.get_symbol_stats(symbol)
+            stats = self.store.get_symbol_trigger_stats(
+                symbol,
+                trigger_kind,
+            )
             p_tp = float(stats["p_tp"])
             closed = int(stats["closed"])
 
             # если мало сделок — НЕ режем жёстко, но даём p(TP) в текст
             sig["ai_p_tp"] = round(p_tp, 3)
             sig["ai_stats_closed"] = closed
+            sig["ai_trigger_p_tp"] = round(p_tp, 3)
+            sig["ai_trigger_stats_closed"] = closed
+            sig["ai_symbol_p_tp"] = round(
+                float(aggregate["p_tp"]),
+                3,
+            )
+            sig["ai_symbol_stats_closed"] = int(aggregate["closed"])
+            sig["ai_calibration_scope"] = "symbol_trigger"
+            sig["ai_trigger_calibration_enabled"] = bool(
+                self.cfg.trigger_calibration_enabled
+            )
+            sig["ai_calibration_key"] = (
+                f"{str(symbol).upper()}x{trigger_kind}"
+                if trigger_kind
+                else None
+            )
 
             # Порог = break-even winrate + запас.
             # BE winrate = 1 / (1 + RR): минимальный винрейт при котором сетап в 0.
@@ -84,7 +147,13 @@ class AILive:
             else:
                 effective_threshold = float(self.cfg.min_p_tp)
 
-            if closed >= int(self.cfg.min_closed_per_symbol) and p_tp < effective_threshold:
+            if (
+                self.cfg.trigger_calibration_enabled
+                and
+                trigger_kind
+                and closed >= int(self.cfg.min_closed_per_trigger)
+                and p_tp < effective_threshold
+            ):
                 return {
                     "signal": "AI_REJECT",
                     "reason": (
@@ -92,6 +161,19 @@ class AILive:
                         f" (RR={rr_numeric_f:.2f}, n={closed})"
                     ),
                     "ai_p_tp": round(p_tp, 3),
+                    "ai_trigger_p_tp": round(p_tp, 3),
+                    "ai_trigger_stats_closed": closed,
+                    "ai_symbol_p_tp": round(
+                        float(aggregate["p_tp"]),
+                        3,
+                    ),
+                    "ai_symbol_stats_closed": int(
+                        aggregate["closed"]
+                    ),
+                    "ai_calibration_scope": "symbol_trigger",
+                    "ai_calibration_key": (
+                        f"{str(symbol).upper()}x{trigger_kind}"
+                    ),
                 }
 
             return sig

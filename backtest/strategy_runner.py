@@ -30,9 +30,11 @@ import numpy as np
 import pandas as pd
 
 from core.narrative_scoring import (
+    FACTOR_CONTRACT_LEGACY,
     FACTOR_VECTOR_SCHEMA,
     FACTOR_WEIGHTS,
     build_factor_vector,
+    resolve_factor_contract,
 )
 
 from .attribution import (
@@ -569,12 +571,17 @@ class NarrativeBacktestConfig:
     max_setups_per_symbol_day: int = 3
     post_loss_cooldown: pd.Timedelta = pd.Timedelta(minutes=60)
     rejection_block_entry_enabled: bool = False
+    # Research-only OOS permission for the live H1 RB detector. This is
+    # intentionally independent from the retired M15 RB switch above.
+    rejection_block_h1_oos_enabled: bool = False
     orderblock_entry_enabled: bool = True
     orderblock_touch_atr_k: float = 0.15
     orderblock_touch_min_abs: float = 0.0005
     orderblock_max_age_bars: int = 80
     htf_score_margin: int = 2
-    fvg_regime_max_age_bars: int = 24
+    fvg_regime_max_age_bars: int = 0
+    fvg_event_invalidation_mode: str = "none"
+    factor_contract: str = FACTOR_CONTRACT_LEGACY
     release_commit: Optional[str] = None
     release_manifest_sha256: Optional[str] = None
     environment_lock_sha256: Optional[str] = None
@@ -607,12 +614,15 @@ class NarrativeBacktestConfig:
         max_setups_per_symbol_day: int = 3,
         post_loss_cooldown: Any = "60min",
         rejection_block_entry_enabled: bool = False,
+        rejection_block_h1_oos_enabled: bool = False,
         orderblock_entry_enabled: bool = True,
         orderblock_touch_atr_k: float = 0.15,
         orderblock_touch_min_abs: float = 0.0005,
         orderblock_max_age_bars: int = 80,
         htf_score_margin: int = 2,
-        fvg_regime_max_age_bars: int = 24,
+        fvg_regime_max_age_bars: int = 0,
+        fvg_event_invalidation_mode: str = "none",
+        factor_contract: str = FACTOR_CONTRACT_LEGACY,
         release_commit: Optional[str] = None,
         release_manifest_sha256: Optional[str] = None,
         environment_lock_sha256: Optional[str] = None,
@@ -704,6 +714,19 @@ class NarrativeBacktestConfig:
             raise StrategyBacktestError(
                 "max_setups_per_symbol_day must be positive"
             )
+        normalized_fvg_event_mode = str(
+            fvg_event_invalidation_mode
+        ).strip().lower()
+        if normalized_fvg_event_mode not in {
+            "none",
+            "zone_break",
+            "structure_change",
+            "zone_or_structure",
+        }:
+            raise StrategyBacktestError(
+                "fvg_event_invalidation_mode must be none, zone_break, "
+                "structure_change, or zone_or_structure"
+            )
         numeric_settings = {
             "vol_max_r": float(vol_max_r),
             "em_tp_ratio": float(em_tp_ratio),
@@ -790,6 +813,9 @@ class NarrativeBacktestConfig:
             rejection_block_entry_enabled=bool(
                 rejection_block_entry_enabled
             ),
+            rejection_block_h1_oos_enabled=bool(
+                rejection_block_h1_oos_enabled
+            ),
             orderblock_entry_enabled=bool(orderblock_entry_enabled),
             orderblock_touch_atr_k=numeric_settings[
                 "orderblock_touch_atr_k"
@@ -800,6 +826,10 @@ class NarrativeBacktestConfig:
             orderblock_max_age_bars=int(orderblock_max_age_bars),
             htf_score_margin=max(1, int(htf_score_margin)),
             fvg_regime_max_age_bars=max(0, int(fvg_regime_max_age_bars)),
+            fvg_event_invalidation_mode=(
+                normalized_fvg_event_mode
+            ),
+            factor_contract=resolve_factor_contract(factor_contract)["name"],
             release_commit=str(release_commit).strip() if release_commit else None,
             release_manifest_sha256=normalized_release_manifest,
             environment_lock_sha256=normalized_environment_lock,
@@ -837,12 +867,19 @@ class NarrativeBacktestConfig:
                 "rejection_block_entry_enabled": (
                     self.rejection_block_entry_enabled
                 ),
+                "rejection_block_h1_oos_enabled": (
+                    self.rejection_block_h1_oos_enabled
+                ),
                 "orderblock_entry_enabled": self.orderblock_entry_enabled,
                 "orderblock_touch_atr_k": self.orderblock_touch_atr_k,
                 "orderblock_touch_min_abs": self.orderblock_touch_min_abs,
                 "orderblock_max_age_bars": self.orderblock_max_age_bars,
                 "htf_score_margin": self.htf_score_margin,
                 "fvg_regime_max_age_bars": self.fvg_regime_max_age_bars,
+                "fvg_event_invalidation_mode": (
+                    self.fvg_event_invalidation_mode
+                ),
+                "factor_contract": self.factor_contract,
             },
             "release_commit": self.release_commit,
             "release_manifest_sha256": self.release_manifest_sha256,
@@ -1130,16 +1167,26 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.rejection_block_entry_enabled = (
         config.rejection_block_entry_enabled
     )
+    strategy.rejection_block_h1_entry_enabled = (
+        config.rejection_block_h1_oos_enabled
+    )
     strategy.orderblock_entry_enabled = config.orderblock_entry_enabled
     strategy.orderblock_touch_atr_k = config.orderblock_touch_atr_k
     strategy.orderblock_touch_min_abs = config.orderblock_touch_min_abs
     strategy.orderblock_max_age_bars = config.orderblock_max_age_bars
     strategy.htf_score_margin = config.htf_score_margin
     strategy.fvg_regime_max_age_bars = config.fvg_regime_max_age_bars
+    strategy.fvg_event_invalidation_mode = (
+        config.fvg_event_invalidation_mode
+    )
+    strategy.factor_contract = config.factor_contract
     expected = {
         "risk_per_trade": config.risk_fraction,
         "rejection_block_entry_enabled": (
             config.rejection_block_entry_enabled
+        ),
+        "rejection_block_h1_entry_enabled": (
+            config.rejection_block_h1_oos_enabled
         ),
         "orderblock_entry_enabled": config.orderblock_entry_enabled,
         "orderblock_touch_atr_k": config.orderblock_touch_atr_k,
@@ -1147,6 +1194,10 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
         "orderblock_max_age_bars": config.orderblock_max_age_bars,
         "htf_score_margin": config.htf_score_margin,
         "fvg_regime_max_age_bars": config.fvg_regime_max_age_bars,
+        "fvg_event_invalidation_mode": (
+            config.fvg_event_invalidation_mode
+        ),
+        "factor_contract": config.factor_contract,
     }
     mismatches = {
         name: (getattr(strategy, name, None), value)
@@ -1389,6 +1440,7 @@ def _validate_factor_vector(
     *,
     status: str,
     required: bool,
+    factor_contract: Optional[str] = None,
 ) -> None:
     vector = signal.get("factor_vector")
     if not isinstance(vector, Mapping):
@@ -1403,6 +1455,7 @@ def _validate_factor_vector(
         for row in raw_factors
         if isinstance(row, Mapping)
     ]
+    contract = resolve_factor_contract(factor_contract)
     if required:
         actual_key_list = [str(row.get("key")) for row in factors]
         actual_keys = set(actual_key_list)
@@ -1414,9 +1467,12 @@ def _validate_factor_vector(
             or actual_keys != set(FACTOR_WEIGHTS)
         ):
             raise StrategyBacktestError(
-                "factor vector must contain exactly five unique configured "
-                "factors"
+                f"factor vector must contain exactly {len(FACTOR_WEIGHTS)} "
+                "unique configured factors"
             )
+        # ``configured_weight`` is the definition's own weight and stays
+        # constant across contracts; the arm is carried by
+        # ``effective_weight``, which is what actually scores.
         configured = {
             str(row.get("key")): row.get("configured_weight")
             for row in factors
@@ -1424,6 +1480,25 @@ def _validate_factor_vector(
         if configured != FACTOR_WEIGHTS:
             raise StrategyBacktestError(
                 "factor vector configured weights do not match production"
+            )
+        effective = {
+            str(row.get("key")): float(row.get("effective_weight") or 0.0)
+            for row in factors
+        }
+        expected_effective = {
+            key: float(value) for key, value in contract["weights"].items()
+        }
+        if effective != expected_effective:
+            raise StrategyBacktestError(
+                "factor vector effective weights do not match the "
+                f"{contract['name']} contract"
+            )
+        if bool(vector.get("fvg_margin_enabled", True)) != contract[
+            "fvg_margin_enabled"
+        ]:
+            raise StrategyBacktestError(
+                "factor vector FVG margin rule does not match the "
+                f"{contract['name']} contract"
             )
     score_long = sum(
         float(row.get("long_contribution") or 0.0)
@@ -1458,6 +1533,8 @@ def _validate_factor_vector(
                 },
                 base_margin=int(vector["base_margin"]),
                 fvg_side=str(vector.get("fvg_side") or "NEUTRAL"),
+                weights=contract["weights"],
+                fvg_margin_enabled=contract["fvg_margin_enabled"],
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StrategyBacktestError(
@@ -1701,6 +1778,7 @@ def _generate_candidates(
                     required=(
                         config.profile == "production-deterministic"
                     ),
+                    factor_contract=config.factor_contract,
                 )
                 counters[f"signal_{status.lower()}"] += 1
                 if status == "ENTER":

@@ -124,10 +124,16 @@ def test_place_limit_leg_uses_specified_expiry_and_return(monkeypatch):
     executor._risk_per_lot = (
         lambda symbol, side, entry, stop, *, info: 300.0
     )
+    now_utc = datetime.now(timezone.utc).timestamp()
+    server_offset = 3 * 60 * 60
     monkeypatch.setattr(
         mt5_executor.mt5,
         "symbol_info_tick",
-        lambda symbol: SimpleNamespace(bid=1.1048, ask=1.1050),
+        lambda symbol: SimpleNamespace(
+            bid=1.1048,
+            ask=1.1050,
+            time_msc=int((now_utc + server_offset) * 1000),
+        ),
     )
     sent = {}
 
@@ -142,7 +148,7 @@ def test_place_limit_leg_uses_specified_expiry_and_return(monkeypatch):
         )
 
     monkeypatch.setattr(mt5_executor, "_send_request", fake_send)
-    expiry = datetime.now(timezone.utc).timestamp() + 900
+    expiry = now_utc + 900
     result = executor.place_limit_leg(
         "EURUSD",
         side="LONG",
@@ -159,8 +165,106 @@ def test_place_limit_leg_uses_specified_expiry_and_return(monkeypatch):
     assert sent["type"] == 2
     assert sent["type_time"] == 2
     assert sent["type_filling"] == 2
-    assert sent["expiration"] == int(expiry)
+    assert sent["expiration"] == int(expiry) + server_offset
     assert result["ticket"] == 7001
+    assert result["expires_at"] == expiry
+    assert result["broker_expiration"] == int(expiry) + server_offset
+    assert result["server_utc_offset_sec"] == server_offset
+
+
+def test_place_limit_leg_rejects_unprovable_server_clock_before_send(
+    monkeypatch,
+):
+    _install_constants(monkeypatch)
+    executor = _executor()
+    executor._get_symbol_info = lambda symbol: _info()
+    executor._risk_per_lot = (
+        lambda symbol, side, entry, stop, *, info: 300.0
+    )
+    now_utc = datetime.now(timezone.utc).timestamp()
+    monkeypatch.setattr(
+        mt5_executor.mt5,
+        "symbol_info_tick",
+        lambda symbol: SimpleNamespace(
+            bid=1.1048,
+            ask=1.1050,
+            time_msc=int((now_utc + 3 * 60 * 60 + 7 * 60) * 1000),
+        ),
+    )
+    sends = []
+    monkeypatch.setattr(
+        mt5_executor,
+        "_send_request",
+        lambda request: sends.append(request),
+    )
+
+    with pytest.raises(
+        mt5_executor.PendingOrderRejected,
+        match="Cannot prove MT5 server-clock offset",
+    ) as caught:
+        executor.place_limit_leg(
+            "EURUSD",
+            side="LONG",
+            volume=0.10,
+            limit_price=1.1000,
+            stop_price=1.0950,
+            tp_price=1.1100,
+            expires_at=now_utc + 900,
+            comment="FBPL:abc:T1",
+            risk_budget_amount=100.0,
+        )
+
+    assert caught.value.submitted is False
+    assert sends == []
+
+
+def test_explicit_invalid_expiration_is_definitive_broker_rejection(
+    monkeypatch,
+):
+    _install_constants(monkeypatch)
+    executor = _executor()
+    executor._get_symbol_info = lambda symbol: _info()
+    executor._risk_per_lot = (
+        lambda symbol, side, entry, stop, *, info: 300.0
+    )
+    now_utc = datetime.now(timezone.utc).timestamp()
+    monkeypatch.setattr(
+        mt5_executor.mt5,
+        "symbol_info_tick",
+        lambda symbol: SimpleNamespace(
+            bid=1.1048,
+            ask=1.1050,
+            time_msc=int((now_utc + 3 * 60 * 60) * 1000),
+        ),
+    )
+    monkeypatch.setattr(
+        mt5_executor,
+        "_send_request",
+        lambda request: SimpleNamespace(
+            retcode=10022,
+            comment="Invalid expiration",
+        ),
+    )
+
+    with pytest.raises(
+        mt5_executor.PendingOrderRejected,
+        match="retcode=10022",
+    ) as caught:
+        executor.place_limit_leg(
+            "EURUSD",
+            side="LONG",
+            volume=0.10,
+            limit_price=1.1000,
+            stop_price=1.0950,
+            tp_price=1.1100,
+            expires_at=now_utc + 900,
+            comment="FBPL:abc:T1",
+            risk_budget_amount=100.0,
+        )
+
+    assert caught.value.submitted is True
+    assert caught.value.retcode == 10022
+    assert caught.value.broker_comment == "Invalid expiration"
 
 
 def test_place_limit_leg_rejects_non_retest_side_of_market(monkeypatch):

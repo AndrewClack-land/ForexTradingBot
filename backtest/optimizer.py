@@ -107,6 +107,8 @@ def _feature_names(symbols: Sequence[str]) -> tuple[str, ...]:
             *(f"symbol:{symbol}" for symbol in normalized_symbols[1:]),
             *(f"trigger:{trigger}" for trigger in _TRIGGERS[1:]),
             "fvg_alignment",
+            "fvg_age_log_scaled",
+            "fvg_age_missing",
             "vol_r_scaled",
             "vol_r_missing",
             "tp1_em_ratio_scaled",
@@ -161,6 +163,10 @@ def _feature_vector(
         row,
         "vol_tp1_em_ratio",
     )
+    fvg_age, fvg_age_missing = _raw_number(row, "fvg_age_bars")
+    fvg_age_log_scaled = (
+        math.log1p(max(0.0, fvg_age)) / math.log1p(300.0)
+    )
     values: dict[str, float] = {
         **{
             f"factor_alignment:{definition.key}": float(
@@ -176,6 +182,8 @@ def _feature_vector(
         },
         "side:LONG": float(side == "LONG"),
         "fvg_alignment": fvg_alignment,
+        "fvg_age_log_scaled": fvg_age_log_scaled,
+        "fvg_age_missing": float(fvg_age_missing),
         "vol_r_scaled": (vol_r - vol_mean) / vol_scale,
         "vol_r_missing": float(vol_missing),
         "tp1_em_ratio_scaled": (

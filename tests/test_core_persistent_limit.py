@@ -20,6 +20,7 @@ from core.persistent_limit import (
     PendingLimitPlan,
     PendingLimitState,
 )
+from executors.mt5_executor import PendingOrderRejected
 
 
 NOW = 2_000_000_000.0
@@ -125,6 +126,20 @@ class PlacementExecutor:
             "deal": 0,
             "risk_amount": 30.0,
         }
+
+
+class DefinitiveRejectExecutor(PlacementExecutor):
+    def place_limit_leg(self, symbol, **request):
+        current = self.core.pending_limits[symbol]
+        assert self.snapshots[-1][symbol] == current.to_dict()
+        self.calls.append((symbol, dict(request)))
+        raise PendingOrderRejected(
+            "MT5 pending order rejected "
+            "(retcode=10022, comment='Invalid expiration')",
+            retcode=10022,
+            broker_comment="Invalid expiration",
+            submitted=True,
+        )
 
 
 class ReconcileExecutor:
@@ -307,6 +322,48 @@ def test_arm_persists_exact_intent_before_every_broker_placement(monkeypatch):
     assert core._trigger_signatures["EURUSD"] == {
         "LONG|pivot|EURUSD|closed-M15"
     }
+
+
+def test_definitive_rejection_is_failed_and_retired_without_ttl_wait(
+    monkeypatch,
+):
+    executor = DefinitiveRejectExecutor()
+    core = _core(executor)
+    snapshots = []
+    core._save_pending_limit_state = lambda: snapshots.append(
+        {
+            symbol: plan.to_dict()
+            for symbol, plan in core.pending_limits.items()
+        }
+    )
+    executor.core = core
+    executor.snapshots = snapshots
+    monkeypatch.setattr(main, "PARTIAL_TP_MODE", "split")
+    monkeypatch.setattr(main.time, "time", lambda: NOW + 1.0)
+
+    with pytest.raises(PendingOrderRejected, match="retcode=10022"):
+        core._arm_pending_limit(
+            "EURUSD",
+            _signal(),
+            trigger_signature="LONG|pivot|EURUSD|closed-M15",
+            expires_at=NOW + 900.0,
+            shadow_plan_id=PLAN_ID,
+            observed_at=datetime.fromtimestamp(NOW, tz=timezone.utc),
+        )
+
+    failed = core.pending_limits["EURUSD"]
+    assert failed.state is PendingLimitState.FAILED
+    assert failed.reason.startswith("definitive pending rejection: ")
+    assert failed.legs[0].submission_attempted
+    assert failed.working_order_tickets == ()
+
+    core.mt5_executor = ReconcileExecutor(
+        live_orders=[],
+        fills={},
+        positions=[],
+    )
+    core._manage_pending_limits()
+    assert core.pending_limits == {}
 
 
 def test_partial_fill_cancels_siblings_then_materializes_active_trade(monkeypatch):

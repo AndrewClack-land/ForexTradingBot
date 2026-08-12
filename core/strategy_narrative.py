@@ -17,7 +17,10 @@ from core.fxpro_quote_pressure import (
     detect_fxpro_quote_pressure_rejection,
 )
 from core.htf_context import HtfContext
-from core.narrative_scoring import build_factor_vector
+from core.narrative_scoring import (
+    build_factor_vector,
+    resolve_factor_contract,
+)
 from core.pivot_trigger import mark_pivots
 
 try:
@@ -100,8 +103,14 @@ ORDERBLOCK_TOUCH_MIN_ABS = float(getattr(_cfg, "ORDERBLOCK_TOUCH_MIN_ABS", 0.000
 ORDERBLOCK_MAX_AGE_BARS = int(getattr(_cfg, "ORDERBLOCK_MAX_AGE_BARS", 240))
 HTF_SCORE_MARGIN = int(getattr(_cfg, "HTF_SCORE_MARGIN", 1))
 FVG_REGIME_MAX_AGE_BARS = max(
-    0, int(getattr(_cfg, "FVG_REGIME_MAX_AGE_BARS", 24))
+    0, int(getattr(_cfg, "FVG_REGIME_MAX_AGE_BARS", 0))
 )
+FVG_EVENT_INVALIDATION_MODE = str(
+    getattr(_cfg, "FVG_EVENT_INVALIDATION_MODE", "none")
+).strip().lower()
+FACTOR_CONTRACT = str(
+    getattr(_cfg, "FACTOR_CONTRACT", "v1-fvg-margin")
+).strip()
 
 Side = Literal["LONG", "SHORT", "NEUTRAL"]
 
@@ -396,6 +405,15 @@ class NarrativeStrategy:
         self.fvg_atr_period = 200
         # Ceiling on how old the latched IMFVG signal may be. 0 = unbounded.
         self.fvg_regime_max_age_bars = int(FVG_REGIME_MAX_AGE_BARS)
+        # Research-only event invalidation. Time never makes a signal eligible;
+        # age is exported as a ranking feature below.
+        self.fvg_event_invalidation_mode = FVG_EVENT_INVALIDATION_MODE
+        self._last_fvg_regime_meta: Dict[str, Any] = {
+            "side": "NEUTRAL",
+            "signal_age_bars": None,
+            "invalidated": False,
+            "invalidation_reason": None,
+        }
 
         self.use_prev_candle_stop_floor = True
 
@@ -404,11 +422,21 @@ class NarrativeStrategy:
         self.orderblock_touch_min_abs = float(ORDERBLOCK_TOUCH_MIN_ABS or 0.0005)
         self.orderblock_max_age_bars = int(ORDERBLOCK_MAX_AGE_BARS or 240)
         self.htf_score_margin = max(1, int(HTF_SCORE_MARGIN or 1))
+        # Named weight/margin contract. Validated eagerly so a typo fails at
+        # construction instead of silently scoring under the legacy weights.
+        self.factor_contract = resolve_factor_contract(FACTOR_CONTRACT)["name"]
 
         self._last_htf_context: Optional[HtfContext] = None
         self._last_factor_vector: Optional[Dict[str, Any]] = None
 
     # ================== HELPERS ==================
+
+    def _factor_contract(self) -> Dict[str, Any]:
+        """Resolve the active weight/margin contract for this instance."""
+
+        return resolve_factor_contract(
+            getattr(self, "factor_contract", None)
+        )
 
     @staticmethod
     def _atr(df: pd.DataFrame, period: int = 14) -> float:
@@ -453,6 +481,15 @@ class NarrativeStrategy:
               текущий close < high[3] → режим SHORT (os=0)
         Режим защёлкивается до противоположного сигнала.
         """
+        self._last_fvg_regime_meta = {
+            "side": "NEUTRAL",
+            "signal_age_bars": None,
+            "invalidated": False,
+            "invalidation_reason": None,
+            "event_invalidation_mode": str(
+                getattr(self, "fvg_event_invalidation_mode", "none")
+            ),
+        }
         if df_1H is None or df_1H.empty or len(df_1H) < 6:
             return "NEUTRAL", "FVG: недостаточно данных 1H"
 
@@ -468,6 +505,11 @@ class NarrativeStrategy:
 
         os_state: Optional[int] = None
         last_sig_ago = -1
+        last_sig_idx: Optional[int] = None
+        last_zone_low: Optional[float] = None
+        last_zone_high: Optional[float] = None
+        signal_count = 0
+        opposite_transition_seen = False
         for i in range(3, n):
             bull = (
                 low[i - 3] > high[i - 1]
@@ -482,22 +524,151 @@ class NarrativeStrategy:
                 and (low[i - 1] - high[i - 3]) > min_width
             )
             if bull:
+                if os_state is not None and os_state != 1:
+                    opposite_transition_seen = True
                 os_state = 1
                 last_sig_ago = n - 1 - i
+                last_sig_idx = i
+                last_zone_low = float(high[i - 1])
+                last_zone_high = float(low[i - 3])
+                signal_count += 1
             elif bear:
+                if os_state is not None and os_state != 0:
+                    opposite_transition_seen = True
                 os_state = 0
                 last_sig_ago = n - 1 - i
+                last_sig_idx = i
+                last_zone_low = float(high[i - 3])
+                last_zone_high = float(low[i - 1])
+                signal_count += 1
 
-        if os_state is None:
+        if os_state is None or last_sig_idx is None:
             return "NEUTRAL", "FVG: сигналов IMFVG на 1H не найдено"
         side: Side = "LONG" if os_state == 1 else "SHORT"
+        zone_low = float(min(last_zone_low, last_zone_high))
+        zone_high = float(max(last_zone_low, last_zone_high))
+        raw_time = w.index[last_sig_idx]
+        signal_time = (
+            raw_time.isoformat()
+            if hasattr(raw_time, "isoformat")
+            else str(raw_time)
+        )
 
-        # The regime latches until the opposite signal appears, so an old gap
-        # can keep raising the opposing side's margin for days. Past the
-        # configured ceiling the regime expires to NEUTRAL instead of being
-        # carried forward; both margins then fall back to the base margin.
+        mode = str(
+            getattr(self, "fvg_event_invalidation_mode", "none")
+        ).strip().lower()
+        if mode not in {
+            "none",
+            "zone_break",
+            "structure_change",
+            "zone_or_structure",
+        }:
+            mode = "none"
+
+        invalidations: list[tuple[int, str, float]] = []
+        if mode in {"zone_break", "zone_or_structure"}:
+            for i in range(last_sig_idx + 1, n):
+                fully_broken = (
+                    close[i] <= zone_low
+                    if side == "LONG"
+                    else close[i] >= zone_high
+                )
+                if fully_broken:
+                    invalidations.append(
+                        (
+                            i,
+                            "full_zone_break",
+                            zone_low if side == "LONG" else zone_high,
+                        )
+                    )
+                    break
+
+        if mode in {"structure_change", "zone_or_structure"}:
+            swing_level: Optional[float] = None
+            # A 3-bar swing at i-1 only becomes known on bar i. A later close
+            # through that confirmed post-signal swing is a causal structure
+            # change; no future bar is inspected to define the pivot.
+            for i in range(max(last_sig_idx + 2, 2), n):
+                pivot = i - 1
+                if pivot > last_sig_idx:
+                    if side == "LONG" and (
+                        low[pivot] < low[pivot - 1]
+                        and low[pivot] < low[i]
+                    ):
+                        swing_level = float(low[pivot])
+                    elif side == "SHORT" and (
+                        high[pivot] > high[pivot - 1]
+                        and high[pivot] > high[i]
+                    ):
+                        swing_level = float(high[pivot])
+                if swing_level is None:
+                    continue
+                structure_broken = (
+                    close[i] < swing_level
+                    if side == "LONG"
+                    else close[i] > swing_level
+                )
+                if structure_broken:
+                    invalidations.append(
+                        (i, "structure_change", swing_level)
+                    )
+                    break
+
+        invalidation = min(
+            invalidations,
+            key=lambda item: (
+                item[0],
+                0 if item[1] == "full_zone_break" else 1,
+            ),
+            default=None,
+        )
+        self._last_fvg_regime_meta = {
+            "side": side,
+            "signal_age_bars": int(last_sig_ago),
+            "signal_index": int(last_sig_idx),
+            "signal_time": signal_time,
+            "zone_low": zone_low,
+            "zone_high": zone_high,
+            "signal_count": int(signal_count),
+            "opposite_transition_seen": bool(
+                opposite_transition_seen
+            ),
+            "invalidated": invalidation is not None,
+            "invalidation_reason": (
+                invalidation[1] if invalidation is not None else None
+            ),
+            "invalidation_level": (
+                float(invalidation[2])
+                if invalidation is not None
+                else None
+            ),
+            "invalidation_age_bars": (
+                int(n - 1 - invalidation[0])
+                if invalidation is not None
+                else None
+            ),
+            "event_invalidation_mode": mode,
+        }
+
+        if invalidation is not None:
+            reason = (
+                "полное пробитие зоны"
+                if invalidation[1] == "full_zone_break"
+                else "смена структуры"
+            )
+            return "NEUTRAL", (
+                f"FVG-режим инвалидирован событием: {reason} "
+                f"@{float(invalidation[2]):.5f}"
+            )
+
+        # Non-zero age expiry is retained for explicit sensitivity runs only.
+        # Production uses zero (time-unbounded); age is exported for ranking.
         max_age = int(self.fvg_regime_max_age_bars)
         if max_age > 0 and last_sig_ago > max_age:
+            self._last_fvg_regime_meta["invalidated"] = True
+            self._last_fvg_regime_meta[
+                "invalidation_reason"
+            ] = "time_expiry_research"
             return "NEUTRAL", (
                 f"FVG-режим истёк (IMFVG 1H, сигнал {last_sig_ago} барами "
                 f"ранее > лимита {max_age})"
@@ -684,22 +855,48 @@ class NarrativeStrategy:
         if zone_snippets:
             parts.append("; ".join(zone_snippets))
 
+        # FVG regime (1H). Under the legacy contract it only tightens the
+        # margin against its own direction; under the FVG-vote contract it is a
+        # +1 directional vote and the margins stay symmetric. It is computed
+        # before the no-vote early return so the frozen factor vector carries
+        # the same rows on both paths.
+        fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
+        fvg_meta = getattr(self, "_last_fvg_regime_meta", {}) or {}
+        votes["fvg_regime_1h"] = {
+            "side": fvg_side,
+            "present": fvg_side in {"LONG", "SHORT"},
+            "evidence": {
+                "signal_age_bars": fvg_meta.get("signal_age_bars"),
+                "signal_time": fvg_meta.get("signal_time"),
+                "zone_low": fvg_meta.get("zone_low"),
+                "zone_high": fvg_meta.get("zone_high"),
+                "signal_count": fvg_meta.get("signal_count"),
+                "invalidated": bool(fvg_meta.get("invalidated")),
+                "invalidation_reason": fvg_meta.get("invalidation_reason"),
+            },
+        }
+
+        contract = self._factor_contract()
+        base_margin = int(getattr(self, "htf_score_margin", 1))
+
         if not parts:
             self._last_factor_vector = build_factor_vector(
                 votes,
-                base_margin=int(getattr(self, "htf_score_margin", 1)),
+                base_margin=base_margin,
+                fvg_side=fvg_side,
+                weights=contract["weights"],
+                fvg_margin_enabled=contract["fvg_margin_enabled"],
             )
             return "NEUTRAL", "HTF: ни одна модель ансамбля не дала голоса"
 
-        # FVG regime (1H) tightens the required margin against its direction
-        fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
         parts.append(fvg_text)
 
-        base_margin = int(getattr(self, "htf_score_margin", 1))
         factor_vector = build_factor_vector(
             votes,
             base_margin=base_margin,
             fvg_side=fvg_side,
+            weights=contract["weights"],
+            fvg_margin_enabled=contract["fvg_margin_enabled"],
         )
         self._last_factor_vector = factor_vector
         score_long = factor_vector["score_long"]
@@ -1461,6 +1658,116 @@ class NarrativeStrategy:
 
     # ================== MAIN SIGNAL ==================
 
+    def _build_signal_payload(
+        self,
+        *,
+        entry: CandidateEntry,
+        side_bias: Side,
+        narrative_text: str,
+        factor_vector: Optional[Dict[str, Any]],
+        fvg_side: Side,
+        fvg_text: str,
+        df_15M: pd.DataFrame,
+        df_1H: pd.DataFrame,
+        df_4H: pd.DataFrame,
+        symbol: str,
+    ) -> Dict[str, Any]:
+        """Materialize one trigger with the exact production geometry."""
+
+        if not getattr(entry, "lock_entry_range", False):
+            entry = self._build_entry_range(entry, df_15M, side_bias)
+
+        if side_bias == "LONG":
+            entry_for_risk = float(
+                entry.entry_max
+                if entry.entry_max is not None
+                else entry.entry_price
+            )
+        else:
+            entry_for_risk = float(
+                entry.entry_min
+                if entry.entry_min is not None
+                else entry.entry_price
+            )
+
+        stop, tp_prices = self.calc_stop_and_tps(
+            entry_for_risk,
+            entry.side,
+            df_1H,
+            df_4H,
+            custom_stop=getattr(entry, "stop_override", None),
+            symbol=symbol,
+        )
+        weighted_rr = sum(
+            ratio * rr
+            for ratio, rr in zip(
+                (0.50, 0.30, 0.20),
+                self.tp_rr_levels,
+            )
+        )
+        rr_text = (
+            f"TP 1R/2R/3R (weighted 1:{weighted_rr:.2f}; "
+            f"AI floor 1:{float(self.rr_min):.2f})"
+        )
+        payload: Dict[str, Any] = {
+            "signal": "ENTER",
+            "side": entry.side,
+            "entry_min": (
+                round(float(entry.entry_min), 6)
+                if entry.entry_min is not None
+                else None
+            ),
+            "entry_max": (
+                round(float(entry.entry_max), 6)
+                if entry.entry_max is not None
+                else None
+            ),
+            "entry_price": round(float(entry_for_risk), 6),
+            "stop_price": round(float(stop), 6),
+            "tp_price": round(float(tp_prices[-1]), 6),
+            "tp_prices": [round(float(value), 6) for value in tp_prices],
+            "rr": rr_text,
+            "weighted_rr_numeric": float(weighted_rr),
+            "rr_numeric": float(self.rr_min),
+            "risk_percent": f"{self.risk_per_trade * 100:.2f}%",
+            "tf": "15M",
+            "setup_tf": entry.tf,
+            "narrative": narrative_text,
+            "factor_vector": factor_vector,
+            "vc": fvg_text,
+            "fvg_regime": fvg_side,
+            "trigger_reason": entry.reason,
+            "trigger_kind": entry.trigger_kind,
+            "trigger_event_id": entry.trigger_event_id,
+            "trigger_meta": entry.trigger_meta,
+            "m1_localized": False,
+        }
+        fvg_meta = dict(
+            getattr(self, "_last_fvg_regime_meta", {}) or {}
+        )
+        # Age is context for train-fitted ranking only. It is never consulted
+        # by trigger eligibility or the live production waterfall.
+        payload["fvg_age_bars"] = fvg_meta.get("signal_age_bars")
+        payload["fvg_signal_time"] = fvg_meta.get("signal_time")
+        payload["fvg_zone_low"] = fvg_meta.get("zone_low")
+        payload["fvg_zone_high"] = fvg_meta.get("zone_high")
+        payload["fvg_event_invalidation_mode"] = fvg_meta.get(
+            "event_invalidation_mode"
+        )
+        payload["fvg_invalidation_reason"] = fvg_meta.get(
+            "invalidation_reason"
+        )
+        if entry.zone_low is not None and entry.zone_high is not None:
+            payload["zone_low"] = round(
+                float(min(entry.zone_low, entry.zone_high)),
+                6,
+            )
+            payload["zone_high"] = round(
+                float(max(entry.zone_low, entry.zone_high)),
+                6,
+            )
+        return payload
+
     def generate_signal(self, data: Dict[str, pd.DataFrame], symbol: str = "") -> Dict[str, Any]:
         df_4H = data.get("4H")
         df_1H = data.get("1H")
@@ -1516,74 +1823,146 @@ class NarrativeStrategy:
                 "factor_vector": factor_vector,
             }
 
-        # build entry range (фиксированная 15M локализация)
-        if not getattr(entry, "lock_entry_range", False):
-            entry = self._build_entry_range(entry, df_15M, side_bias)
-
-        # risk entry: LONG uses entry_max, SHORT uses entry_min
-        if side_bias == "LONG":
-            entry_for_risk = float(entry.entry_max if entry.entry_max is not None else entry.entry_price)
-        else:
-            entry_for_risk = float(entry.entry_min if entry.entry_min is not None else entry.entry_price)
-
-        stop, tp_prices = self.calc_stop_and_tps(
-            entry_for_risk,
-            entry.side,
-            df_1H,
-            df_4H,
-            custom_stop=getattr(entry, "stop_override", None),
+        return self._build_signal_payload(
+            entry=entry,
+            side_bias=side_bias,
+            narrative_text=narrative_text,
+            factor_vector=factor_vector,
+            fvg_side=fvg_side,
+            fvg_text=fvg_text,
+            df_15M=df_15M,
+            df_1H=df_1H,
+            df_4H=df_4H,
             symbol=symbol,
         )
-        weighted_rr = sum(
-            ratio * rr
-            for ratio, rr in zip((0.50, 0.30, 0.20), self.tp_rr_levels)
+
+    def generate_candidate_signals(
+        self,
+        data: Dict[str, pd.DataFrame],
+        symbol: str = "",
+    ) -> List[Dict[str, Any]]:
+        """Return every simultaneous production trigger for shadow research.
+
+        This method is deliberately separate from ``generate_signal``. The
+        latter keeps its historical short-circuit, so a lower-priority
+        detector failure can never affect the live winner. Callers must treat
+        this population as diagnostic until paired OOS arbitration proves a
+        replacement policy.
+        """
+
+        self._last_candidate_errors: List[Dict[str, Any]] = []
+        df_4H = data.get("4H")
+        df_1H = data.get("1H")
+        df_15M = data.get("15M")
+        if any(frame is None or frame.empty for frame in (df_4H, df_1H, df_15M)):
+            return []
+
+        side_bias, narrative_text = self.calc_narrative(
+            df_4H,
+            df_1H,
+            df_15M,
         )
-        rr_text = (
-            f"TP 1R/2R/3R (weighted 1:{weighted_rr:.2f}; "
-            f"AI floor 1:{float(self.rr_min):.2f})"
+        if side_bias == "NEUTRAL":
+            return []
+        factor_vector = self._last_factor_vector
+        ctx = self._last_htf_context
+        fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
+
+        detectors = (
+            (
+                1,
+                "rejection_block_h1",
+                lambda: (
+                    self.trigger_h1_rejection_block(df_1H, side_bias)
+                    if self.rejection_block_h1_entry_enabled
+                    else None
+                ),
+            ),
+            (
+                2,
+                "fxpro_cluster_rejection_15m",
+                lambda: self.trigger_15m_cluster_rejection(
+                    df_15M,
+                    side_bias,
+                    data.get("FXPRO_CLUSTER_REJECTION_15M"),
+                    symbol=symbol,
+                ),
+            ),
+            (
+                3,
+                "fxpro_quote_pressure_rejection_15m",
+                lambda: self.trigger_15m_quote_pressure_rejection(
+                    df_15M,
+                    side_bias,
+                    data.get("FXPRO_QUOTE_PRESSURE_15M"),
+                    symbol=symbol,
+                ),
+            ),
+            (
+                4,
+                "pivot_reclaim",
+                lambda: self.trigger_h1_pivot_reclaim_on_15m(
+                    df_1H,
+                    df_15M,
+                    side_bias,
+                ),
+            ),
+            (
+                5,
+                "orderblock_1h",
+                lambda: self.trigger_orderblock_touch(
+                    df_1H,
+                    ctx,
+                    side_bias,
+                ),
+            ),
         )
 
-        payload: Dict[str, Any] = {
-            "signal": "ENTER",
-            "side": entry.side,
+        detected: List[Tuple[int, str, CandidateEntry]] = []
+        for priority, detector_name, detector in detectors:
+            try:
+                entry = detector()
+            except Exception as exc:
+                self._last_candidate_errors.append(
+                    {
+                        "stage": "detector",
+                        "priority": priority,
+                        "detector": detector_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            if entry is not None:
+                detected.append((priority, detector_name, entry))
 
-            "entry_min": round(float(entry.entry_min), 6) if entry.entry_min is not None else None,
-            "entry_max": round(float(entry.entry_max), 6) if entry.entry_max is not None else None,
-
-            # compat
-            "entry_price": round(float(entry_for_risk), 6),
-            "stop_price": round(float(stop), 6),
-
-            # compat
-            "tp_price": round(float(tp_prices[-1]), 6),
-            "tp_prices": [round(float(x), 6) for x in tp_prices],  # 3 TPs
-
-            "rr": rr_text,
-            "weighted_rr_numeric": float(weighted_rr),
-            # Kept conservative for the AI probability gate; weighted payoff is
-            # exposed separately above instead of pretending TP2 is still 1.5R.
-            "rr_numeric": float(self.rr_min),
-
-            "risk_percent": f"{self.risk_per_trade * 100:.2f}%",
-
-            # IMPORTANT: show what timeframe we localized on
-            "tf": "15M",
-            "setup_tf": entry.tf,
-
-            "narrative": narrative_text,
-            "factor_vector": factor_vector,
-            # журнал сделок пишет колонку vc — теперь здесь FVG-режим 1H
-            "vc": fvg_text,
-            "fvg_regime": fvg_side,
-            "trigger_reason": entry.reason,
-            "trigger_kind": entry.trigger_kind,
-            "trigger_event_id": entry.trigger_event_id,
-            "trigger_meta": entry.trigger_meta,
-            "m1_localized": False,
-        }
-
-        if entry.zone_low is not None and entry.zone_high is not None:
-            payload["zone_low"] = round(float(min(entry.zone_low, entry.zone_high)), 6)
-            payload["zone_high"] = round(float(max(entry.zone_low, entry.zone_high)), 6)
-
-        return payload
+        population: List[Dict[str, Any]] = []
+        for priority, detector_name, entry in detected:
+            try:
+                payload = self._build_signal_payload(
+                    entry=entry,
+                    side_bias=side_bias,
+                    narrative_text=narrative_text,
+                    factor_vector=factor_vector,
+                    fvg_side=fvg_side,
+                    fvg_text=fvg_text,
+                    df_15M=df_15M,
+                    df_1H=df_1H,
+                    df_4H=df_4H,
+                    symbol=symbol,
+                )
+            except Exception as exc:
+                self._last_candidate_errors.append(
+                    {
+                        "stage": "geometry",
+                        "priority": priority,
+                        "detector": detector_name,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            payload["shadow_candidate_rank"] = len(population) + 1
+            payload["production_priority"] = priority
+            payload["shadow_candidate_source"] = detector_name
+            payload["shadow_only"] = True
+            population.append(payload)
+        return population

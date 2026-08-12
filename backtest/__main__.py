@@ -10,6 +10,11 @@ import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
+from core.narrative_scoring import (
+    FACTOR_CONTRACT_FVG_VOTE,
+    FACTOR_CONTRACT_LEGACY,
+)
+
 from .data import DataValidationError, HistoricalDataset
 from .lse_ingest import (
     DEFAULT_BAR_TIMEZONE,
@@ -204,12 +209,36 @@ def _build_parser() -> argparse.ArgumentParser:
     strategy_run.add_argument(
         "--fvg-regime-max-age-bars",
         type=int,
-        default=24,
+        default=0,
         help=(
             "maximum age, in closed H1 bars, of the latched IMFVG signal that "
             "defines the 1H FVG regime; past it the regime expires to NEUTRAL "
             "and both score margins fall back to the base margin. 0 restores "
             "the previous unbounded latch"
+        ),
+    )
+    strategy_run.add_argument(
+        "--fvg-event-invalidation-mode",
+        choices=(
+            "none",
+            "zone_break",
+            "structure_change",
+            "zone_or_structure",
+        ),
+        default="none",
+        help="research-only event invalidation for the latched H1 FVG regime",
+    )
+    strategy_run.add_argument(
+        "--factor-contract",
+        choices=(FACTOR_CONTRACT_LEGACY, FACTOR_CONTRACT_FVG_VOTE),
+        default=FACTOR_CONTRACT_LEGACY,
+        help=(
+            "factor weight/margin contract. "
+            f"{FACTOR_CONTRACT_LEGACY} is the live contract: five votes "
+            "[2, 2, 1, 1, 1] with the 1H FVG regime raising only the opposing "
+            f"margin. {FACTOR_CONTRACT_FVG_VOTE} is the challenger: H1 P/D "
+            "2->1, Order Block 1H 1->2, FVG regime promoted to a +1 vote with "
+            "symmetric margins. A challenger run is a non-parity research arm"
         ),
     )
     strategy_run.add_argument(
@@ -242,7 +271,7 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_v2 = subparsers.add_parser(
         "optimize-v2",
         help=(
-            "regenerate all M15 LONG/SHORT trigger opportunities, fit "
+            "regenerate all supported LONG/SHORT trigger opportunities, fit "
             "train-only factor weights, and replay frozen OOS folds"
         ),
     )
@@ -261,6 +290,24 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0.01,
     )
     optimize_v2.add_argument("--output", required=True)
+    optimize_v2.add_argument(
+        "--cost-profile",
+        help=(
+            "versioned fx-cost-profile-v1 JSON; estimated-net audit and "
+            "realized setup costs are computed without changing gross "
+            "candidate ranking unless --cost-ranking-mode=net is explicit"
+        ),
+    )
+    optimize_v2.add_argument(
+        "--cost-ranking-mode",
+        choices=("gross", "net"),
+        default="gross",
+        help=(
+            "candidate arbitration basis (default: gross); net requires "
+            "cost-profile created_at_utc and measured_through_utc no later "
+            "than every OOS fold test_start"
+        ),
+    )
     optimize_v2.add_argument(
         "--profile",
         choices=("signal-quality", "production-deterministic"),
@@ -313,6 +360,19 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_v2.add_argument(
         "--enable-rejection-block-entry",
         action="store_true",
+        help=(
+            "research-only: enable the retired M15 rejection-block family; "
+            "does not enable RB H1"
+        ),
+    )
+    optimize_v2.add_argument(
+        "--enable-rejection-block-h1-oos",
+        action="store_true",
+        help=(
+            "research-only: allow live-parity H1 rejection-block "
+            "opportunities into OOS replay; independent of the retired "
+            "M15 --enable-rejection-block-entry switch"
+        ),
     )
     optimize_v2.add_argument(
         "--disable-orderblock-entry",
@@ -331,13 +391,24 @@ def _build_parser() -> argparse.ArgumentParser:
     optimize_v2.add_argument(
         "--fvg-regime-max-age-bars",
         type=int,
-        default=24,
+        default=0,
         help=(
             "maximum age, in closed H1 bars, of the latched IMFVG signal that "
             "defines the 1H FVG regime; past it the regime expires to NEUTRAL "
             "and both score margins fall back to the base margin. 0 restores "
             "the previous unbounded latch"
         ),
+    )
+    optimize_v2.add_argument(
+        "--fvg-event-invalidation-mode",
+        choices=(
+            "none",
+            "zone_break",
+            "structure_change",
+            "zone_or_structure",
+        ),
+        default="none",
+        help="research-only event invalidation for the latched H1 FVG regime",
     )
     optimize_v2.add_argument(
         "--cluster-proxy-data",
@@ -682,6 +753,8 @@ def _strategy_run(args: argparse.Namespace) -> int:
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
         fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
+        fvg_event_invalidation_mode=args.fvg_event_invalidation_mode,
+        factor_contract=args.factor_contract,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
@@ -756,9 +829,10 @@ def _strategy_run(args: argparse.Namespace) -> int:
 
 
 def _counterfactual_run(args: argparse.Namespace) -> int:
-    """Run the all-M15 replacement-weight optimizer in an isolated release."""
+    """Run the multi-trigger replacement-weight optimizer in isolation."""
 
     from .counterfactual import run_counterfactual_backtest
+    from .cost_model import CostProfile
     from .fxpro_cluster_data import FxProClusterEventDataset
     from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
 
@@ -828,10 +902,14 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         rejection_block_entry_enabled=(
             args.enable_rejection_block_entry
         ),
+        rejection_block_h1_oos_enabled=(
+            args.enable_rejection_block_h1_oos
+        ),
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
         fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
+        fvg_event_invalidation_mode=args.fvg_event_invalidation_mode,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,
@@ -844,6 +922,11 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
     quote_pressure = (
         FxProQuotePressureEventDataset.load(Path(args.quote_pressure_data))
         if args.quote_pressure_data
+        else None
+    )
+    cost_profile = (
+        CostProfile.load(Path(args.cost_profile))
+        if args.cost_profile
         else None
     )
     candle_tolerance: dict[str, int] = {}
@@ -900,6 +983,8 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         decision_latency=args.decision_latency,
         ridge_alpha=args.ridge_alpha,
         min_train_opportunities=args.min_train_opportunities,
+        cost_profile=cost_profile,
+        cost_ranking_mode=args.cost_ranking_mode,
         progress=print_progress,
     )
     report = result.write(args.output)
@@ -966,6 +1051,20 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
             "sealed and loaded"
             if quote_pressure is not None
             else "DATA_UNAVAILABLE (no OHLCV/tick-volume proxy)"
+        )
+    )
+    print(
+        "  Transaction costs: "
+        + (
+            f"profile {cost_profile.profile_id} "
+            f"({cost_profile.profile_sha256[:12]}); "
+            f"ranking={args.cost_ranking_mode}; "
+            f"use={result.summary['cost_ranking']['profile_use']}"
+            if cost_profile is not None
+            else (
+                f"ranking={args.cost_ranking_mode}; "
+                "GROSS ONLY (no --cost-profile)"
+            )
         )
     )
     return 0

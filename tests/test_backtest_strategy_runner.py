@@ -181,8 +181,8 @@ def test_runner_emits_structured_factor_attribution_without_changing_trade(
         strategy_factory=_AlwaysEnter,
     )
 
-    assert len(result.candidate_factors) == 5
-    assert len(result.setup_factors) == 5
+    assert len(result.candidate_factors) == 6
+    assert len(result.setup_factors) == 6
     by_factor = {
         row["factor_key"]: row
         for row in result.setup_factors
@@ -190,6 +190,9 @@ def test_runner_emits_structured_factor_attribution_without_changing_trade(
     assert by_factor["h1_premium_discount"]["relation"] == "ALIGNED"
     assert by_factor["false_breakout_4h"]["relation"] == "OPPOSED"
     assert by_factor["order_block_1h"]["relation"] == "ABSENT"
+    # The FVG regime is carried as an explicit row under both contracts; the
+    # live contract scores it at weight 0 and moves the margin instead.
+    assert by_factor["fvg_regime_1h"]["configured_weight"] == 0
     assert by_factor["true_breakout_15m"]["net_r"] == pytest.approx(0.9)
     coverage = result.summary["factor_attribution"]
     assert coverage["complete_candidate_vectors"] is True

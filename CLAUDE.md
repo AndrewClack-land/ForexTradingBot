@@ -232,8 +232,13 @@ Important distinctions:
 - The former five-day dealing-range overlay is removed.
 - Volatility is decision-time context and an execution gate, not a `+1`
   directional vote.
-- FVG is not a vote. An H1 FVG against a direction increases that direction's
-  required score margin by `+1`.
+- FVG is not a vote under the live contract. An H1 FVG against a direction
+  increases that direction's required score margin by `+1`. Note that the
+  margin form and a `+1` vote are not equivalent: against `fvg_side=LONG` both
+  require `score_short >= score_long + 3`, but the vote form would relax the
+  aligned direction to `score_long >= score_short + 1`. The margin rule can
+  only brake the opposing entry, never accelerate the aligned one, which is the
+  conservative choice for a latched factor that never abstains.
 - The production base score margin is exactly `2` unless a separately approved
   strategy change says otherwise:
   `margin_long = 2 + int(fvg_side == "SHORT")` and
@@ -248,6 +253,41 @@ Important distinctions:
   disabled by default in the backtest. The permissive fallback currently
   present in `config.py`/`core/strategy_narrative.py` is not authorization to
   enable it. Do not confuse the trigger with the active RB1H score factor.
+
+### Factor contracts and the six-row vector
+
+`FACTOR_VECTOR_SCHEMA` is `narrative-factor-vector/v2`. The vector carries six
+rows: the five directional votes above plus an explicit `fvg_regime_1h` row.
+Both named contracts share this one layout so a challenger run stays paired
+with its baseline through the same simulator and report schemas.
+
+| Contract | Weights (PD/FB4H/TB15M/OB1H/RB1H/FVG) | FVG margin rule |
+| --- | --- | --- |
+| `v1-fvg-margin` (live default) | `2, 2, 1, 1, 1, 0` | active |
+| `v2-fvg-vote` (challenger) | `1, 2, 1, 2, 1, 1` | disabled |
+
+`core/narrative_scoring.py:FACTOR_CONTRACTS` is the single authority; the
+weight override and the margin rule are mutually exclusive by construction,
+because enabling both would move the threshold by two points for a factor that
+never abstains. `resolve_factor_contract` fails closed on an unknown name.
+
+Non-negotiable rules:
+
+- `FACTOR_DEFINITIONS[*].configured_weight` always describes the **live**
+  contract. A challenger is expressed only as an `effective_weight` override,
+  so a frozen vector records which arm produced it;
+- `FACTOR_CONTRACT` defaults to `v1-fvg-margin` in `config.py`. The challenger
+  is a research arm and must not reach live trading before a frozen paired OOS
+  comparison is reviewed. Selecting it in a `backtest run` marks a non-parity
+  sensitivity experiment exactly like `--sessions ALL` does;
+- `optimize-v2` exposes no contract switch and pins `v1-fvg-margin`, because
+  its fit is regularized toward the live weights. `REFERENCE_WEIGHTS` and
+  `WEIGHT_SUM` therefore stay `[2, 2, 1, 1, 1, 0]` and `7`. The zero-weight FVG
+  row still participates as a fittable dimension;
+- `rescore_factor_vector` must carry `fvg_margin_enabled` from the frozen
+  vector; a challenger vector must never silently regain the margin penalty;
+- frozen v1 weight models and shadow models are five-dimensional and fail
+  closed against the v2 schema. Refit rather than reinterpret them.
 
 ## Current entry-trigger contract
 

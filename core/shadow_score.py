@@ -240,6 +240,7 @@ class LiveShadowScorer:
             # missing-indicator features fire instead of a fabricated zero.
             "vol_r": signal.get("vol_R"),
             "vol_tp1_em_ratio": ratio,
+            "fvg_age_bars": signal.get("fvg_age_bars"),
         }
         features = _feature_vector(
             row,

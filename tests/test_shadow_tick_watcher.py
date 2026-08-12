@@ -282,6 +282,138 @@ def test_raw_scan_is_promoted_to_eligible_on_the_same_minute_scan(tmp_path) -> N
         watcher.close()
 
 
+def test_server_local_quote_clock_is_audited_but_history_stays_utc(
+    tmp_path,
+) -> None:
+    server_shift_msc = 3 * 60 * 60 * 1000
+    activation_quote = QuoteTick(
+        msc(0) + server_shift_msc,
+        bid=101.3,
+        ask=101.5,
+    )
+    history_touch = QuoteTick(msc(1_000), bid=100.3, ask=100.5)
+    feed = FakeFeed(
+        [history_touch],
+        activation_quote=activation_quote,
+    )
+    watcher = ShadowTickWatcher(
+        mt5=facade(feed),
+        db_path=tmp_path / 'server-clock.db',
+    )
+    try:
+        spec = plan()
+        spec = ShadowPlanSpec(
+            **{
+                **spec.__dict__,
+                'activation_source_tick_msc': activation_quote.time_msc,
+            }
+        )
+        assert watcher.register_plan(spec, activation_quote=activation_quote)
+        watcher.poll_once(now_utc=at(6_000))
+
+        row = watcher.get_plan('plan-1')
+        assert row is not None
+        assert row['activation_tick_msc'] == msc(0)
+        assert row['activation_source_tick_msc'] == msc(0) + server_shift_msc
+        assert row['first_strict_touch_msc'] == msc(1_000)
+        assert row['tick_count'] == 2
+        assert feed.calls
+        assert feed.calls[0][1] == msc(0) + 1
+        assert feed.calls[-1][2] == msc(5_000) - 1
+        with sqlite3.connect(watcher.db_path) as connection:
+            assert connection.execute(
+                'SELECT COUNT(*) FROM tick_batches'
+            ).fetchone()[0] == 1
+    finally:
+        watcher.close()
+
+
+def test_scan_uses_observation_clock_and_preserves_raw_source_timestamp(
+    tmp_path,
+) -> None:
+    server_shift_msc = 3 * 60 * 60 * 1000
+    watcher = ShadowTickWatcher(
+        mt5=facade(FakeFeed()),
+        db_path=tmp_path / 'scan-clock.db',
+    )
+    try:
+        assert watcher.register_plan(plan())
+        quote = QuoteTick(
+            msc(1_000) + server_shift_msc,
+            bid=100.3,
+            ask=100.5,
+        )
+        assert watcher.record_scan(
+            'plan-1',
+            quote,
+            observed_at_utc=at(1_000),
+            candidate_matches=True,
+            policy_executable=True,
+            disposition='ELIGIBLE_60S_SCAN',
+        )
+
+        with sqlite3.connect(watcher.db_path) as connection:
+            causal_msc, source_msc = connection.execute(
+                """
+                SELECT tick_msc, source_tick_msc
+                FROM scan_observations WHERE plan_id = ?
+                """,
+                ('plan-1',),
+            ).fetchone()
+        assert causal_msc == msc(1_000)
+        assert source_msc == quote.time_msc
+        row = watcher.get_plan('plan-1')
+        assert row is not None
+        assert row['first_scan_touch_msc'] == msc(1_000)
+        assert row['first_policy_touch_msc'] == msc(1_000)
+    finally:
+        watcher.close()
+
+
+def test_schema_v1_clock_domain_rows_migrate_to_explicit_unknown(tmp_path) -> None:
+    db_path = tmp_path / 'legacy-clock.db'
+    first = ShadowTickWatcher(mt5=facade(FakeFeed()), db_path=db_path)
+    try:
+        assert first.register_plan(plan())
+    finally:
+        first.close()
+
+    shifted = msc(0) + 3 * 60 * 60 * 1000
+    with sqlite3.connect(db_path) as connection:
+        connection.execute(
+            "UPDATE shadow_meta SET value = '1' WHERE key = 'schema_version'"
+        )
+        connection.execute(
+            """
+            UPDATE plans
+            SET activation_tick_msc = ?, covered_through_msc = ?,
+                finalized = 1, data_complete = 1,
+                missed_by_cadence = 0, missed_by_policy = 0,
+                recoverable_by_limit = 0,
+                result_class = 'NO_STRICT_TICK_TOUCH'
+            WHERE plan_id = 'plan-1'
+            """,
+            (shifted, shifted),
+        )
+        connection.commit()
+
+    migrated = ShadowTickWatcher(mt5=facade(FakeFeed()), db_path=db_path)
+    try:
+        row = migrated.get_plan('plan-1')
+        assert row is not None
+        assert row['activation_source_tick_msc'] == shifted
+        assert row['finalized'] == 1
+        assert row['data_complete'] == 0
+        assert row['result_class'] == 'UNKNOWN_CLOCK_DOMAIN'
+        assert row['missed_by_cadence'] is None
+        assert row['missed_by_policy'] is None
+        assert row['recoverable_by_limit'] is None
+        assert migrated.summary()['unknown_coverage'] == 1
+        assert migrated.summary()['unknown_clock_domain'] == 1
+    finally:
+        migrated.close()
+
+
 def test_gap_and_stop_on_same_tick_is_not_limit_recoverable(tmp_path) -> None:
     quote = QuoteTick(msc(1_000), bid=98.5, ask=98.7)
     watcher = ShadowTickWatcher(

@@ -5,7 +5,11 @@ import json
 
 import pandas as pd
 
-from backtest.optimizer import build_shadow_scores
+from backtest.optimizer import (
+    _feature_names,
+    _feature_vector,
+    build_shadow_scores,
+)
 from core.narrative_scoring import build_factor_vector
 
 
@@ -50,6 +54,39 @@ def _setup(
         "vol_r": 20.0,
         "factor_vector": _vector("LONG"),
     }
+
+
+def test_fvg_age_is_a_ranking_feature_with_explicit_missingness():
+    names = _feature_names(("EURUSD",))
+    kwargs = {
+        "names": names,
+        "vol_mean": 0.0,
+        "vol_scale": 1.0,
+        "ratio_mean": 0.0,
+        "ratio_scale": 1.0,
+    }
+    base = {
+        "side": "LONG",
+        "symbol": "EURUSD",
+        "trigger_kind": "h1_pivot_reclaim_15m",
+        "factor_vector": {"fvg_side": "LONG", "factors": {}},
+    }
+    fresh = _feature_vector(
+        {**base, "fvg_age_bars": 0},
+        **kwargs,
+    )
+    old = _feature_vector(
+        {**base, "fvg_age_bars": 120},
+        **kwargs,
+    )
+    missing = _feature_vector(base, **kwargs)
+    age_index = names.index("fvg_age_log_scaled")
+    missing_index = names.index("fvg_age_missing")
+
+    assert fresh[age_index] == 0.0
+    assert old[age_index] > fresh[age_index]
+    assert fresh[missing_index] == 0.0
+    assert missing[missing_index] == 1.0
 
 
 def _periods():

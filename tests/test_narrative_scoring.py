@@ -5,9 +5,12 @@ import json
 import pytest
 
 from core.narrative_scoring import (
+    FACTOR_CONTRACT_FVG_VOTE,
+    FACTOR_CONTRACT_LEGACY,
     FACTOR_VECTOR_SCHEMA,
     build_factor_vector,
     rescore_factor_vector,
+    resolve_factor_contract,
 )
 
 
@@ -180,3 +183,104 @@ def test_neutral_tie_and_strict_json_serialization():
         for row in vector["factors"]
     )
     json.dumps(vector, allow_nan=False)
+
+
+def _contract_votes(fvg_side: str):
+    """H1 P/D and the FVG regime disagree; nothing else votes."""
+
+    return {
+        "h1_premium_discount": {"present": True, "side": "LONG"},
+        "fvg_regime_1h": {
+            "present": fvg_side in {"LONG", "SHORT"},
+            "side": fvg_side,
+        },
+    }
+
+
+def test_legacy_contract_keeps_the_fvg_regime_out_of_the_score():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_LEGACY)
+    vector = build_factor_vector(
+        _contract_votes("SHORT"),
+        base_margin=2,
+        fvg_side="SHORT",
+        weights=contract["weights"],
+        fvg_margin_enabled=contract["fvg_margin_enabled"],
+    )
+
+    rows = {row["key"]: row for row in vector["factors"]}
+    # The regime is recorded but contributes nothing to either score.
+    assert rows["fvg_regime_1h"]["vote_side"] == "SHORT"
+    assert rows["fvg_regime_1h"]["effective_weight"] == 0
+    assert vector["score_long"] == 2
+    assert vector["score_short"] == 0
+    # It brakes the opposing side by raising that margin instead.
+    assert vector["margin_long"] == 3
+    assert vector["margin_short"] == 2
+    assert vector["bias"] == "NEUTRAL"
+
+
+def test_fvg_vote_contract_scores_the_regime_and_keeps_margins_symmetric():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_FVG_VOTE)
+    vector = build_factor_vector(
+        _contract_votes("SHORT"),
+        base_margin=2,
+        fvg_side="SHORT",
+        weights=contract["weights"],
+        fvg_margin_enabled=contract["fvg_margin_enabled"],
+    )
+
+    rows = {row["key"]: row for row in vector["factors"]}
+    assert rows["fvg_regime_1h"]["effective_weight"] == 1
+    # H1 P/D drops to 1, so a disagreeing regime now cancels it exactly.
+    assert rows["h1_premium_discount"]["effective_weight"] == 1
+    assert vector["score_long"] == 1
+    assert vector["score_short"] == 1
+    assert vector["margin_long"] == vector["margin_short"] == 2
+    assert vector["fvg_margin_enabled"] is False
+    assert vector["bias"] == "NEUTRAL"
+
+
+def test_challenger_weights_are_the_agreed_contract():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_FVG_VOTE)
+
+    assert contract["weights"] == {
+        "h1_premium_discount": 1,
+        "false_breakout_4h": 2,
+        "true_breakout_15m": 1,
+        "order_block_1h": 2,
+        "rejection_block_1h": 1,
+        "fvg_regime_1h": 1,
+    }
+    legacy = resolve_factor_contract(FACTOR_CONTRACT_LEGACY)["weights"]
+    assert legacy == {
+        "h1_premium_discount": 2,
+        "false_breakout_4h": 2,
+        "true_breakout_15m": 1,
+        "order_block_1h": 1,
+        "rejection_block_1h": 1,
+        "fvg_regime_1h": 0,
+    }
+
+
+def test_unknown_factor_contract_fails_closed():
+    with pytest.raises(ValueError, match="unknown factor contract"):
+        resolve_factor_contract("v3-guesswork")
+
+
+def test_rescore_preserves_the_margin_rule_of_the_frozen_vector():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_FVG_VOTE)
+    vector = build_factor_vector(
+        _contract_votes("SHORT"),
+        base_margin=2,
+        fvg_side="SHORT",
+        weights=contract["weights"],
+        fvg_margin_enabled=contract["fvg_margin_enabled"],
+    )
+
+    rescored = rescore_factor_vector(vector, weights=contract["weights"])
+
+    # A frozen challenger vector must not silently regain the margin penalty.
+    assert rescored["fvg_margin_enabled"] is False
+    assert rescored["margin_long"] == rescored["margin_short"] == 2
+    assert rescored["score_long"] == vector["score_long"]
+    assert rescored["score_short"] == vector["score_short"]

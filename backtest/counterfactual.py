@@ -29,6 +29,14 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import pandas as pd
 
+from core.narrative_scoring import FACTOR_CONTRACT_LEGACY
+
+from .cost_model import (
+    CostModelError,
+    CostProfile,
+    apply_costs_to_setups,
+    estimate_cost_r,
+)
 from .data import HistoricalDataset
 from .fxpro_cluster_data import FxProClusterEventDataset
 from .fxpro_quote_pressure_data import FxProQuotePressureEventDataset
@@ -67,7 +75,7 @@ from .weight_optimizer import (
 )
 
 
-COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v3"
+COUNTERFACTUAL_SCHEMA = "narrative-counterfactual-wfo/v4"
 TRIGGER_MANIFEST = (
     "rejection_block_15m",
     "rejection_block_1h",
@@ -81,6 +89,7 @@ _TRIGGER_PRIORITY = {
 }
 _PRIMARY_POLICY = "stop-first"
 _DECISION_CADENCE = pd.Timedelta(minutes=15)
+_COST_RANKING_MODES = frozenset({"gross", "net"})
 _METRIC_FIELDS = (
     "setups_total",
     "setups_closed",
@@ -106,6 +115,21 @@ _METRIC_FIELDS = (
     "tp3_reach_rate",
     "moved_to_be_rate",
     "ambiguous_bars",
+)
+_COST_SETUP_FIELDS = (
+    "gross_net_r",
+    "gross_pnl_amount",
+    "cost_profile_id",
+    "cost_profile_sha256",
+    "cost_symbol",
+    "cost_status",
+    "spread_cost_r",
+    "slippage_cost_r",
+    "commission_cost_r",
+    "swap_cost_r",
+    "rollover_units",
+    "transaction_cost_r",
+    "net_after_cost_r",
 )
 _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
     "decision_events.csv": (
@@ -141,6 +165,10 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "gate_reason",
         "factor_vector",
         "fvg_regime",
+        "fvg_age_bars",
+        "fvg_signal_time",
+        "fvg_event_invalidation_mode",
+        "fvg_invalidation_reason",
         "vol_r",
         "vol_regime",
         "vol_em_1d",
@@ -251,6 +279,12 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "trigger_kind",
         "model_id",
         "model_status",
+        "expected_gross_r",
+        "estimated_cost_r",
+        "expected_net_r",
+        "ranking_basis",
+        "cost_profile_id",
+        "cost_profile_sha256",
         "score",
         "rank",
         "hard_score_threshold_applied",
@@ -259,7 +293,10 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "selection_status",
     ),
     "executions.csv": tuple(_EMPTY_CSV_FIELDS["executions"]),
-    "setups.csv": tuple(_EMPTY_CSV_FIELDS["setups"]),
+    "setups.csv": (
+        *tuple(_EMPTY_CSV_FIELDS["setups"]),
+        *_COST_SETUP_FIELDS,
+    ),
     "legs.csv": tuple(_EMPTY_CSV_FIELDS["legs"]),
     "folds.csv": (
         "fold_index",
@@ -308,6 +345,12 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "trigger_kind",
         "model_id",
         "model_status",
+        "expected_gross_r",
+        "estimated_cost_r",
+        "expected_net_r",
+        "ranking_basis",
+        "cost_profile_id",
+        "cost_profile_sha256",
         "score",
         "rank",
         "hard_score_threshold_applied",
@@ -316,7 +359,10 @@ _REPORT_FIELDS: Mapping[str, tuple[str, ...]] = {
         "selection_status",
     ),
     "baseline_executions.csv": tuple(_EMPTY_CSV_FIELDS["executions"]),
-    "baseline_setups.csv": tuple(_EMPTY_CSV_FIELDS["setups"]),
+    "baseline_setups.csv": (
+        *tuple(_EMPTY_CSV_FIELDS["setups"]),
+        *_COST_SETUP_FIELDS,
+    ),
     "baseline_legs.csv": tuple(_EMPTY_CSV_FIELDS["legs"]),
     "baseline_folds.csv": (
         "fold_index",
@@ -363,6 +409,14 @@ class _Opportunity:
             "gate_reason": self.gate_reason,
             "factor_vector": self.signal.get("factor_vector"),
             "fvg_regime": self.signal.get("fvg_regime"),
+            "fvg_age_bars": self.signal.get("fvg_age_bars"),
+            "fvg_signal_time": self.signal.get("fvg_signal_time"),
+            "fvg_event_invalidation_mode": self.signal.get(
+                "fvg_event_invalidation_mode"
+            ),
+            "fvg_invalidation_reason": self.signal.get(
+                "fvg_invalidation_reason"
+            ),
             "vol_r": self.signal.get("vol_R"),
             "vol_regime": self.signal.get("vol_regime"),
             "vol_em_1d": self.signal.get("vol_em_1d"),
@@ -590,6 +644,78 @@ def _normalized_decision_latency(value: Any) -> pd.Timedelta:
             "cadence; otherwise this is a stale-signal strategy"
         )
     return latency
+
+
+def _normalized_cost_ranking_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    if mode not in _COST_RANKING_MODES:
+        raise StrategyBacktestError(
+            "cost_ranking_mode must be one of: gross, net"
+        )
+    return mode
+
+
+def _cost_ranking_audit(
+    *,
+    cost_profile: Optional[CostProfile],
+    periods: Sequence[_Period],
+    mode: Any,
+) -> dict[str, Any]:
+    normalized_mode = _normalized_cost_ranking_mode(mode)
+    if cost_profile is None:
+        if normalized_mode == "net":
+            raise StrategyBacktestError(
+                "net cost ranking requires a --cost-profile with "
+                "point-in-time provenance"
+            )
+        return {
+            "mode": normalized_mode,
+            "ranking_basis": "predicted_gross_r",
+            "profile_use": "NO_COST_PROFILE_GROSS_ONLY",
+            "cost_profile_present": False,
+            "estimated_net_candidate_audit_computed": False,
+            "realized_costs_applied": False,
+            "point_in_time": None,
+        }
+    try:
+        point_in_time = cost_profile.point_in_time_audit(
+            [period.test_start for period in periods]
+        )
+    except CostModelError as exc:
+        raise StrategyBacktestError(
+            f"cannot audit cost-profile provenance: {exc}"
+        ) from exc
+    causal = bool(
+        point_in_time["causal_for_all_fold_test_starts"]
+    )
+    if normalized_mode == "net" and not causal:
+        issues = ", ".join(point_in_time["issues"])
+        raise StrategyBacktestError(
+            "net cost ranking requires created_at_utc and "
+            "measured_through_utc to be no later than every fold "
+            f"test_start; profile {cost_profile.profile_id} failed: {issues}"
+        )
+    if normalized_mode == "net":
+        profile_use = "POINT_IN_TIME_PROFILE_NET_RANKING"
+    elif causal:
+        profile_use = "POINT_IN_TIME_PROFILE_GROSS_RANKING"
+    else:
+        profile_use = "STATIC_STRESS_SCENARIO_NOT_POINT_IN_TIME"
+    return {
+        "mode": normalized_mode,
+        "ranking_basis": (
+            "expected_net_r"
+            if normalized_mode == "net"
+            else "predicted_gross_r"
+        ),
+        "profile_use": profile_use,
+        "cost_profile_present": True,
+        "cost_profile_id": cost_profile.profile_id,
+        "cost_profile_sha256": cost_profile.profile_sha256,
+        "estimated_net_candidate_audit_computed": True,
+        "realized_costs_applied": True,
+        "point_in_time": point_in_time,
+    }
 
 
 def _decision_event_id(
@@ -832,6 +958,10 @@ def _generate_symbol_universe(
     right = int(closes.searchsorted(range_end, side="left"))
     total = max(0, right - left)
     strategy = _configure_strategy(strategy_factory(), config)
+    # The v2 fit is regularized toward the legacy weights, so its population
+    # must be frozen under the legacy contract regardless of the FACTOR_CONTRACT
+    # environment default. optimize-v2 exposes no contract switch.
+    strategy.factor_contract = FACTOR_CONTRACT_LEGACY
     # Counterfactual detection must not inherit production trigger switches.
     # Operationally disabled families are still labelled, then remain blocked
     # in OOS replay unless the research command explicitly enables them.
@@ -1011,11 +1141,15 @@ def _generate_symbol_universe(
                     "rejection_block_15m is included in counterfactual "
                     "training but disabled for OOS execution"
                 )
-            elif trigger_kind == "rejection_block_1h":
+            elif (
+                trigger_kind == "rejection_block_1h"
+                and not config.rejection_block_h1_oos_enabled
+            ):
                 gate = "BLOCK_TRIGGER_DISABLED"
                 reason = (
                     "rejection_block_1h is included for paired attribution "
-                    "but disabled for OOS execution until its gate is passed"
+                    "but disabled for OOS execution unless the explicit "
+                    "research-only H1 RB gate is enabled"
                 )
             elif (
                 trigger_kind == "order_block_1h"
@@ -1315,7 +1449,15 @@ def _select_oos_candidates(
     opportunity_by_id: Mapping[str, _Opportunity],
     periods: Sequence[_Period],
     arm: str = "optimized_weights",
+    cost_profile: Optional[CostProfile] = None,
+    cost_ranking_mode: str = "gross",
 ) -> tuple[list[_Candidate], list[dict[str, Any]]]:
+    ranking_audit = _cost_ranking_audit(
+        cost_profile=cost_profile,
+        periods=periods,
+        mode=cost_ranking_mode,
+    )
+    ranking_basis = str(ranking_audit["ranking_basis"])
     by_decision: dict[
         tuple[int, str, str],
         list[tuple[Mapping[str, Any], _Opportunity]],
@@ -1371,6 +1513,20 @@ def _select_oos_candidates(
                     "trigger_kind": None,
                     "model_id": candidates[0][0].get("model_id"),
                     "model_status": model_status,
+                    "expected_gross_r": None,
+                    "estimated_cost_r": None,
+                    "expected_net_r": None,
+                    "ranking_basis": ranking_basis,
+                    "cost_profile_id": (
+                        cost_profile.profile_id
+                        if cost_profile is not None
+                        else None
+                    ),
+                    "cost_profile_sha256": (
+                        cost_profile.profile_sha256
+                        if cost_profile is not None
+                        else None
+                    ),
                     "score": None,
                     "hard_score_threshold_applied": False,
                     "eligible_pool": "none",
@@ -1379,16 +1535,70 @@ def _select_oos_candidates(
                 }
             )
             continue
-        def rank(
-            item: tuple[Mapping[str, Any], _Opportunity],
-        ) -> tuple[float, int, str]:
-            prediction, opportunity = item
+
+        ranking_by_opportunity: dict[str, dict[str, Any]] = {}
+        for prediction, opportunity in candidates:
             raw_score = prediction.get("predicted_opportunity_r")
             if raw_score is None:
                 raise StrategyBacktestError(
                     f"fold {fold_index}: FIT model emitted no prediction"
                 )
-            score = float(raw_score or 0.0)
+            gross = float(raw_score)
+            if not math.isfinite(gross):
+                raise StrategyBacktestError(
+                    f"fold {fold_index}: non-finite optimizer prediction"
+                )
+            estimated_cost: Optional[float] = None
+            expected_net: Optional[float] = None
+            ranking_score = gross
+            if cost_profile is not None:
+                try:
+                    estimate = estimate_cost_r(
+                        cost_profile,
+                        symbol=opportunity.symbol,
+                        side=str(opportunity.signal.get("side") or ""),
+                        entry_price=opportunity.signal.get("entry_price"),
+                        stop_price=opportunity.signal.get("stop_price"),
+                        # Future holding time is unknown at decision time.
+                        # Rollover is handled only in realized evaluation.
+                        rollover_unit_count=0.0,
+                    )
+                except CostModelError as exc:
+                    raise StrategyBacktestError(
+                        f"{opportunity.opportunity_id}: cannot estimate "
+                        f"causal entry friction: {exc}"
+                    ) from exc
+                estimated_cost = float(estimate.total_cost_r)
+                expected_net = gross - estimated_cost
+                if ranking_basis == "expected_net_r":
+                    ranking_score = expected_net
+            ranking_by_opportunity[opportunity.opportunity_id] = {
+                "expected_gross_r": gross,
+                "estimated_cost_r": estimated_cost,
+                "expected_net_r": expected_net,
+                "ranking_score": ranking_score,
+                "ranking_basis": ranking_basis,
+                "cost_profile_id": (
+                    cost_profile.profile_id
+                    if cost_profile is not None
+                    else None
+                ),
+                "cost_profile_sha256": (
+                    cost_profile.profile_sha256
+                    if cost_profile is not None
+                    else None
+                ),
+            }
+
+        def rank(
+            item: tuple[Mapping[str, Any], _Opportunity],
+        ) -> tuple[float, int, str]:
+            _, opportunity = item
+            score = float(
+                ranking_by_opportunity[opportunity.opportunity_id][
+                    "ranking_score"
+                ]
+            )
             return (
                 -score,
                 _TRIGGER_PRIORITY.get(opportunity.trigger_kind, 999),
@@ -1402,13 +1612,20 @@ def _select_oos_candidates(
         ):
             replay_id: Optional[str] = None
             signal = dict(opportunity.signal)
+            ranking = ranking_by_opportunity[opportunity.opportunity_id]
             signal["optimizer_model_id"] = prediction.get("model_id")
             signal["optimizer_model_status"] = prediction.get(
                 "model_status"
             )
-            signal["optimizer_score"] = prediction.get(
-                "predicted_opportunity_r"
-            )
+            signal["expected_gross_r"] = ranking["expected_gross_r"]
+            signal["estimated_cost_r"] = ranking["estimated_cost_r"]
+            signal["expected_net_r"] = ranking["expected_net_r"]
+            signal["optimizer_score"] = ranking["ranking_score"]
+            signal["optimizer_ranking_basis"] = ranking["ranking_basis"]
+            signal["cost_profile_id"] = ranking["cost_profile_id"]
+            signal["cost_profile_sha256"] = ranking[
+                "cost_profile_sha256"
+            ]
             signal["optimizer_rank"] = rank_index
             signal["replay_arm"] = arm
             selection_status = "SKIPPED_PRE_GATE"
@@ -1449,6 +1666,14 @@ def _select_oos_candidates(
                     "trigger_kind": opportunity.trigger_kind,
                     "model_id": prediction.get("model_id"),
                     "model_status": prediction.get("model_status"),
+                    "expected_gross_r": ranking["expected_gross_r"],
+                    "estimated_cost_r": ranking["estimated_cost_r"],
+                    "expected_net_r": ranking["expected_net_r"],
+                    "ranking_basis": ranking["ranking_basis"],
+                    "cost_profile_id": ranking["cost_profile_id"],
+                    "cost_profile_sha256": ranking[
+                        "cost_profile_sha256"
+                    ],
                     "score": signal.get("optimizer_score"),
                     "rank": rank_index,
                     "hard_score_threshold_applied": False,
@@ -1541,6 +1766,7 @@ def _run_selected_replay(
     config: NarrativeBacktestConfig,
     progress: Optional[Callable[[Mapping[str, Any]], None]],
     arm: str = "optimized_weights",
+    cost_profile: Optional[CostProfile] = None,
 ) -> tuple[
     list[dict[str, Any]],
     list[dict[str, Any]],
@@ -1577,6 +1803,17 @@ def _run_selected_replay(
             all_setups.extend(setups)
             all_legs.extend(legs)
             all_executions.extend(executions)
+
+    if cost_profile is not None:
+        try:
+            all_setups = apply_costs_to_setups(
+                all_setups,
+                cost_profile,
+            )
+        except CostModelError as exc:
+            raise StrategyBacktestError(
+                f"{arm}: cannot apply realized transaction costs: {exc}"
+            ) from exc
 
     fold_rows: list[dict[str, Any]] = []
     for policy in config.intrabar_policies:
@@ -1635,6 +1872,18 @@ def _paired_metric_deltas(
     return output
 
 
+def _gross_metrics_for(
+    rows: Sequence[Mapping[str, Any]],
+) -> Optional[dict[str, Any]]:
+    if not rows or not all("gross_net_r" in row for row in rows):
+        return None
+    gross_rows = [
+        {**dict(row), "net_r": row["gross_net_r"]}
+        for row in rows
+    ]
+    return _metrics_for(gross_rows)
+
+
 def run_counterfactual_backtest(
     dataset: HistoricalDataset,
     config: NarrativeBacktestConfig,
@@ -1646,10 +1895,13 @@ def run_counterfactual_backtest(
     strategy_factory: StrategyFactory = _default_strategy_factory,
     ridge_alpha: float = DEFAULT_RIDGE_ALPHA,
     min_train_opportunities: int = DEFAULT_MIN_TRAIN_OPPORTUNITIES,
+    cost_profile: Optional[CostProfile] = None,
+    cost_ranking_mode: str = "gross",
     progress: Optional[Callable[[Mapping[str, Any]], None]] = None,
 ) -> CounterfactualBacktestResult:
     """Build all-side opportunities, fit train-only weights, replay frozen OOS."""
 
+    cost_ranking_mode = _normalized_cost_ranking_mode(cost_ranking_mode)
     if _PRIMARY_POLICY not in config.intrabar_policies:
         raise StrategyBacktestError(
             "Counterfactual optimizer requires stop-first as the primary "
@@ -1670,6 +1922,17 @@ def run_counterfactual_backtest(
         raise StrategyBacktestError(
             f"Symbols are absent from snapshot: {', '.join(unknown)}"
         )
+    if cost_profile is not None:
+        missing_cost_symbols = [
+            symbol
+            for symbol in config.symbols
+            if symbol not in cost_profile.symbols
+        ]
+        if missing_cost_symbols:
+            raise StrategyBacktestError(
+                "cost profile is incomplete for configured symbols: "
+                + ", ".join(missing_cost_symbols)
+            )
     coverage_start, coverage_end = infer_common_strategy_range(
         dataset,
         config.symbols,
@@ -1688,6 +1951,67 @@ def run_counterfactual_backtest(
             "cluster candle tolerance overrides require --cluster-proxy-data"
         )
     periods = _periods(config)
+    cost_ranking_audit = _cost_ranking_audit(
+        cost_profile=cost_profile,
+        periods=periods,
+        mode=cost_ranking_mode,
+    )
+    profile_use = str(cost_ranking_audit["profile_use"])
+    if cost_profile is None:
+        selection_cost_semantics = (
+            "candidate rank uses predicted gross R; no transaction-cost "
+            "profile is available"
+        )
+        cost_semantics = "gross-only; no cost profile supplied"
+        cost_warning = (
+            "This is a gross OHLCV research replay. Spread, commission, "
+            "swap, slippage and historical tick ordering are unavailable."
+        )
+    elif profile_use == "STATIC_STRESS_SCENARIO_NOT_POINT_IN_TIME":
+        selection_cost_semantics = (
+            "candidate rank remains predicted gross R; expected net R is "
+            "audit-only because the supplied profile is not point-in-time"
+        )
+        cost_semantics = (
+            "STATIC STRESS SCENARIO / NOT POINT-IN-TIME: ranking remains "
+            "gross; entry friction is estimated for candidate audit and "
+            "realized setup metrics include signed rollover"
+        )
+        cost_warning = (
+            "The supplied cost profile is a STATIC STRESS SCENARIO, NOT "
+            "POINT-IN-TIME for every OOS fold. It does not alter candidate "
+            "ranking; estimated-net audit and realized post-hoc costs still "
+            "use its versioned assumptions."
+        )
+    elif cost_ranking_mode == "net":
+        selection_cost_semantics = (
+            "candidate rank uses predicted gross R minus point-in-time entry "
+            "spread, two-sided slippage and commission; future rollover is "
+            "not used"
+        )
+        cost_semantics = (
+            "point-in-time profile drives explicit net ranking using entry "
+            "friction only; realized evaluation also applies signed rollover"
+        )
+        cost_warning = (
+            "A point-in-time versioned cost profile is applied to candidate "
+            "ranking and setup-level metrics, but historical bid/ask and "
+            "tick ordering remain unavailable."
+        )
+    else:
+        selection_cost_semantics = (
+            "candidate rank remains predicted gross R; expected net R is "
+            "computed only as a point-in-time audit"
+        )
+        cost_semantics = (
+            "point-in-time cost profile is audit-only for ranking; realized "
+            "setup metrics include entry friction and signed rollover"
+        )
+        cost_warning = (
+            "A point-in-time versioned cost profile is applied post-hoc to "
+            "setup metrics; candidate ranking remains gross by explicit "
+            "default."
+        )
     prepared_by_symbol = {
         symbol: _prepare_symbol(dataset, symbol)
         for symbol in config.symbols
@@ -1789,6 +2113,8 @@ def run_counterfactual_backtest(
         opportunity_by_id=opportunity_by_id,
         periods=periods,
         arm="optimized_weights",
+        cost_profile=cost_profile,
+        cost_ranking_mode=cost_ranking_mode,
     )
     setups, legs, executions, fold_rows = _run_selected_replay(
         selected=selected,
@@ -1797,6 +2123,7 @@ def run_counterfactual_backtest(
         config=config,
         progress=progress,
         arm="optimized_weights",
+        cost_profile=cost_profile,
     )
     baseline = _build_paired_baseline_scores(optimizer)
     baseline_selected, baseline_selection_rows = _select_oos_candidates(
@@ -1804,6 +2131,8 @@ def run_counterfactual_backtest(
         opportunity_by_id=opportunity_by_id,
         periods=periods,
         arm="paired_fixed_weight_baseline",
+        cost_profile=cost_profile,
+        cost_ranking_mode=cost_ranking_mode,
     )
     optimized_support = {
         (row["fold_index"], row["opportunity_id"])
@@ -1831,6 +2160,7 @@ def run_counterfactual_backtest(
         config=config,
         progress=progress,
         arm="paired_fixed_weight_baseline",
+        cost_profile=cost_profile,
     )
 
     primary_setups = [
@@ -1843,6 +2173,10 @@ def run_counterfactual_backtest(
     ]
     optimized_metrics = _metrics_for(primary_setups)
     baseline_metrics = _metrics_for(baseline_primary_setups)
+    optimized_gross_metrics = _gross_metrics_for(primary_setups)
+    baseline_gross_metrics = _gross_metrics_for(
+        baseline_primary_setups
+    )
     force_exit_counts = Counter(
         str(row.get("forced_exit_reason"))
         for row in primary_setups
@@ -1855,6 +2189,8 @@ def run_counterfactual_backtest(
         enabled_triggers.append("order_block_1h")
     if config.rejection_block_entry_enabled:
         enabled_triggers.append("rejection_block_15m")
+    if config.rejection_block_h1_oos_enabled:
+        enabled_triggers.append("rejection_block_1h")
     if cluster_proxy is not None:
         enabled_triggers.append("fxpro_cluster_rejection_15m")
     if quote_pressure is not None:
@@ -1875,6 +2211,9 @@ def run_counterfactual_backtest(
             "min_train_opportunities": int(min_train_opportunities),
             "trigger_manifest": list(TRIGGER_MANIFEST),
             "enabled_trigger_manifest": enabled_triggers,
+            "rejection_block_h1_oos_enabled": (
+                config.rejection_block_h1_oos_enabled
+            ),
             "turtle_soup_enabled": False,
             "score_threshold": None,
             "primary_label_policy": _PRIMARY_POLICY,
@@ -1889,6 +2228,7 @@ def run_counterfactual_backtest(
                 "common_oos_support_only": True,
                 "same_execution_simulator": True,
             },
+            "cost_ranking": cost_ranking_audit,
         },
         "cluster_proxy_manifest_sha256": (
             cluster_proxy.manifest_sha256
@@ -1899,6 +2239,11 @@ def run_counterfactual_backtest(
         "quote_pressure_manifest_sha256": (
             quote_pressure.manifest_sha256
             if quote_pressure is not None
+            else None
+        ),
+        "transaction_cost_profile": (
+            cost_profile.to_dict()
+            if cost_profile is not None
             else None
         ),
     }
@@ -1939,16 +2284,45 @@ def run_counterfactual_backtest(
             for row in selection_rows
         ),
         "oos_primary_metrics": optimized_metrics,
+        "oos_primary_gross_metrics": optimized_gross_metrics,
+        "cost_ranking": cost_ranking_audit,
+        "transaction_cost_profile": (
+            {
+                "profile_id": cost_profile.profile_id,
+                "profile_sha256": cost_profile.profile_sha256,
+                "measured_from": cost_profile.measured_from,
+                "created_at_utc": (
+                    cost_profile.created_at_utc.isoformat()
+                ),
+                "measured_through_utc": (
+                    cost_profile.measured_through_utc.isoformat()
+                    if cost_profile.measured_through_utc is not None
+                    else None
+                ),
+                "candidate_ranking_mode": cost_ranking_mode,
+                "profile_use": profile_use,
+                "point_in_time": cost_ranking_audit["point_in_time"],
+                "ranking_entry_friction_only": (
+                    cost_ranking_mode == "net"
+                ),
+                "estimated_net_candidate_audit_computed": True,
+                "realized_evaluation_includes_rollover": True,
+            }
+            if cost_profile is not None
+            else None
+        ),
         "paired_fixed_weight_baseline": {
             **baseline["summary"],
             "oos_selected_candidates": len(baseline_selected),
             "oos_primary_metrics": baseline_metrics,
+            "oos_primary_gross_metrics": baseline_gross_metrics,
         },
         "paired_comparison": {
             "support": "same FIT folds and gate-eligible opportunities",
             "difference": "factor_weights_only",
             "same_execution_simulator": True,
             "same_risk_model": True,
+            "same_cost_profile": True,
             "same_selected_candidate_support": True,
             "optimized_minus_baseline": _paired_metric_deltas(
                 optimized_metrics,
@@ -1973,6 +2347,12 @@ def run_counterfactual_backtest(
         "supported_trigger_manifest": list(TRIGGER_MANIFEST),
         "enabled_trigger_manifest": enabled_triggers,
         "generated_trigger_manifest": generated_triggers,
+        "rejection_block_h1_oos": {
+            "enabled": config.rejection_block_h1_oos_enabled,
+            "detector": "live_parity_rejection_block_1h",
+            "research_only": True,
+            "independent_from_rejection_block_15m": True,
+        },
         "turtle_soup_called": False,
         "fxpro_cluster_rejection": {
             "enabled": cluster_proxy is not None,
@@ -2037,7 +2417,9 @@ def run_counterfactual_backtest(
                 "entry_ttl + max_holding, with exit_time before train_end"
             ),
             "selection": (
-                "continuous frozen OOS score; no score threshold; all "
+                "continuous frozen OOS score; "
+                + selection_cost_semantics
+                + "; no score threshold; all "
                 "pre-gate-eligible alternatives from one M15 decision are "
                 "considered simultaneously; earliest executable M1 fill wins "
                 "and frozen score/rank breaks only same-timestamp fill ties; "
@@ -2058,20 +2440,23 @@ def run_counterfactual_backtest(
             ),
             "oos_metrics": (
                 "integrated replay is authoritative; optimizer label metrics "
-                "exclude outcomes whose exit is not known before test_end"
+                "exclude outcomes whose exit is not known before test_end; "
+                "a supplied cost profile is applied after replay using actual "
+                "holding time, so the daily-loss guard remains a gross-state "
+                "simulation and reported setup/fold metrics become net"
             ),
             "fold_boundaries": (
                 "entries and open positions carry across artificial OOS fold "
                 "boundaries; only Friday, max holding, stop/target, or final "
                 "dataset end closes exposure"
             ),
-            "costs_applied": False,
+            "costs_applied": cost_profile is not None,
+            "cost_semantics": (
+                cost_semantics
+            ),
         },
         "warnings": [
-            (
-                "This is a gross OHLCV research replay. Spread, commission, "
-                "swap, slippage and historical tick ordering are unavailable."
-            ),
+            cost_warning,
             (
                 "FxPro Cluster Rejection is DATA_UNAVAILABLE unless a sealed "
                 "Quantower/FxPro cluster-proxy sidecar is supplied. Historical "
@@ -2300,6 +2685,10 @@ def write_counterfactual_report(
                 "dataset_manifest_sha256"
             ],
             "config_sha256": result.summary["config_sha256"],
+            "cost_ranking": result.summary["cost_ranking"],
+            "transaction_cost_profile": result.summary[
+                "transaction_cost_profile"
+            ],
             "files": files,
         }
         (staging / "manifest.json").write_bytes(_json_bytes(manifest))

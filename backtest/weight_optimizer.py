@@ -50,6 +50,8 @@ from core.narrative_scoring import FACTOR_DEFINITIONS, FACTOR_VECTOR_SCHEMA
 
 
 WEIGHT_OPTIMIZER_SCHEMA = "counterfactual-factor-weight-optimizer/v1"
+# The fit shrinks toward the live contract, so this follows the definitions'
+# configured weights and stays [2, 2, 1, 1, 1] with a zero-weight FVG row.
 REFERENCE_WEIGHTS = {
     definition.key: float(definition.configured_weight)
     for definition in FACTOR_DEFINITIONS

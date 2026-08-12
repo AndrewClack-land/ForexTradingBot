@@ -8,6 +8,8 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import Future, ThreadPoolExecutor
+import copy
 from dataclasses import replace as dataclass_replace
 from pathlib import Path
 from datetime import datetime, date, time as dt_time, timedelta, timezone
@@ -42,6 +44,13 @@ from config import (
     SHADOW_TICK_WATCHER_POLL_SEC,
     SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC,
     SHADOW_TICK_WATCHER_DB_PATH,
+    SHADOW_CANDIDATE_LEDGER_ENABLED,
+    SHADOW_CANDIDATE_LEDGER_DB_PATH,
+    SHADOW_CANDIDATE_COST_PROFILE_PATH,
+    SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH,
+    EXECUTION_QUALITY_FILTER_ENABLED,
+    EXECUTION_QUALITY_PROFILE_PATH,
+    NEWS_CALENDAR_PATH,
     MT5_BRIDGE_SYMBOLS,
     MT5_BRIDGE_TIMEFRAMES,
     MT5_BRIDGE_LOOKBACK_DAYS,
@@ -90,10 +99,16 @@ from core.mt5_guard import install as _install_mt5_guard
 # call with a shared lock (tick loop, DataCacheLoop and MT5Bridge all use it).
 _install_mt5_guard()
 
+from backtest.cost_model import CostProfile
 from backtest.fxpro_cluster_data import FxProClusterEventDataset
 from core.data_cache import DataCache
 from core.data_feed import DataFeed
 from core.fxpro_dom import FxProDomRecorder
+from core.execution_quality import (
+    ExecutionQualityProfile,
+    PointInTimeNewsCalendar,
+    assess_execution_quality,
+)
 from core.fxpro_tick_cluster import (
     FxProTickClusterRecorder,
     TickClusterSymbol,
@@ -104,7 +119,7 @@ from core.strategy_narrative import NarrativeStrategy, ActiveTrade
 from bot.telegram_bot import TelegramBot
 from core.m1.config import AIConfig
 from core.m1.store import TradeStore
-from core.m1.ai_live import AILive
+from core.m1.ai_live import AILive, primary_idea_trigger_kind
 from core.state_store import save_active_trades, load_active_trades
 from core.vol_regime import VolContext, build_vol_context, entry_gate
 from core.profiler import TickProfiler
@@ -126,9 +141,18 @@ from core.shadow_tick_watcher import (
     ShadowTickWatcher,
     stable_plan_id,
 )
+from core.shadow_candidate_ledger import (
+    ShadowCandidateLedger,
+    trigger_signature as shadow_trigger_signature,
+)
+from core.shadow_candidate_ranker import (
+    PortfolioCorrelationProfile,
+    build_shadow_rankings,
+)
 from executors.mt5_executor import (
     MT5Executor,
     MT5Settings,
+    PendingOrderRejected,
     RiskCapacityError,
 )
 from mt5_bridge.mt5_native_bridge import MT5NativeBridge, parse_symbol_spec, parse_timeframes
@@ -150,6 +174,7 @@ _PENDING_CONFLICT_CLOSE_RESOLVED_REASON = (
     + "; emergency auto-close exposure absent; manual recovery required"
 )
 _PENDING_CONFLICT_ABSENCE_GRACE_SEC = 30.0
+_PENDING_DEFINITIVE_REJECTION_PREFIX = "definitive pending rejection: "
 
 
 def _compute_tp_volumes(total_volume: float, n_tps: int, step: float = 0.01) -> List[float]:
@@ -351,6 +376,110 @@ class Core:
                 self.shadow_tick_watcher = None
                 print(f"[Shadow Tick] watcher unavailable (fail-open): {exc}")
 
+        self.shadow_candidate_ledger: Optional[
+            ShadowCandidateLedger
+        ] = None
+        self._shadow_candidate_executor: Optional[
+            ThreadPoolExecutor
+        ] = None
+        self._shadow_candidate_future: Optional[Future[None]] = None
+        self._shadow_candidate_dropped_jobs = 0
+        self.shadow_candidate_cost_profile: Optional[CostProfile] = None
+        self.shadow_candidate_correlation_profile: Optional[
+            PortfolioCorrelationProfile
+        ] = None
+        if SHADOW_CANDIDATE_LEDGER_ENABLED:
+            try:
+                self.shadow_candidate_ledger = ShadowCandidateLedger(
+                    SHADOW_CANDIDATE_LEDGER_DB_PATH
+                )
+                self._shadow_candidate_executor = ThreadPoolExecutor(
+                    max_workers=1,
+                    thread_name_prefix="shadow-candidates",
+                )
+                print(
+                    "[Shadow Candidates] diagnostic ledger started "
+                    f"(db={SHADOW_CANDIDATE_LEDGER_DB_PATH})"
+                )
+            except Exception as exc:
+                self.shadow_candidate_ledger = None
+                self._shadow_candidate_executor = None
+                print(
+                    "[Shadow Candidates] ledger unavailable "
+                    f"(fail-open): {exc}"
+                )
+            if SHADOW_CANDIDATE_COST_PROFILE_PATH is not None:
+                try:
+                    self.shadow_candidate_cost_profile = CostProfile.load(
+                        SHADOW_CANDIDATE_COST_PROFILE_PATH
+                    )
+                    print(
+                        "[Shadow Candidates] cost profile loaded: "
+                        f"{self.shadow_candidate_cost_profile.profile_id}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Shadow Candidates] cost profile unavailable "
+                        f"(ranking disabled, capture continues): {exc}"
+                    )
+            if SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH is not None:
+                try:
+                    self.shadow_candidate_correlation_profile = (
+                        PortfolioCorrelationProfile.load(
+                            SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH
+                        )
+                    )
+                    print(
+                        "[Shadow Candidates] correlation profile loaded: "
+                        f"{self.shadow_candidate_correlation_profile.profile_id}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Shadow Candidates] correlation profile unavailable "
+                        f"(ranking disabled, capture continues): {exc}"
+                    )
+
+        self.execution_quality_profile: Optional[
+            ExecutionQualityProfile
+        ] = None
+        self.news_calendar: Optional[PointInTimeNewsCalendar] = None
+        if EXECUTION_QUALITY_FILTER_ENABLED:
+            if EXECUTION_QUALITY_PROFILE_PATH is None:
+                print(
+                    "[Execution Quality] enabled without profile; "
+                    "new entries fail closed"
+                )
+            else:
+                try:
+                    self.execution_quality_profile = (
+                        ExecutionQualityProfile.load(
+                            EXECUTION_QUALITY_PROFILE_PATH
+                        )
+                    )
+                    print(
+                        "[Execution Quality] profile loaded: "
+                        f"{self.execution_quality_profile.profile_id}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Execution Quality] profile unavailable; "
+                        f"new entries fail closed: {exc}"
+                    )
+            if NEWS_CALENDAR_PATH is not None:
+                try:
+                    self.news_calendar = PointInTimeNewsCalendar.load(
+                        NEWS_CALENDAR_PATH
+                    )
+                    print(
+                        "[Execution Quality] point-in-time news calendar "
+                        f"loaded: {self.news_calendar.calendar_id}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Execution Quality] news calendar unavailable; "
+                        f"news-enabled profile fails closed: {exc}"
+                    )
+
         print(
             "[Persistent LIMIT] "
             f"{'enabled' if PERSISTENT_LIMIT_ENABLED else 'disabled'} "
@@ -488,6 +617,19 @@ class Core:
         return self.fxpro_cluster_dataset
 
     def close(self) -> None:
+        candidate_executor = getattr(
+            self, "_shadow_candidate_executor", None
+        )
+        if candidate_executor is not None:
+            candidate_executor.shutdown(
+                wait=True,
+                cancel_futures=False,
+            )
+        candidate_ledger = getattr(
+            self, "shadow_candidate_ledger", None
+        )
+        if candidate_ledger is not None:
+            candidate_ledger.close()
         watcher = getattr(self, "shadow_tick_watcher", None)
         if watcher is not None:
             watcher.close()
@@ -498,6 +640,164 @@ class Core:
             recorder = getattr(self, attribute, None)
             if recorder is not None:
                 recorder.stop()
+
+    @staticmethod
+    def _write_shadow_candidate_batch(
+        ledger: ShadowCandidateLedger,
+        strategy: NarrativeStrategy,
+        jobs: Tuple[Dict[str, Any], ...],
+        outcomes: Dict[str, Dict[str, Any]],
+        scorer: Optional[LiveShadowScorer],
+        cost_profile: Optional[CostProfile],
+        correlation_profile: Optional[PortfolioCorrelationProfile],
+    ) -> None:
+        """Evaluate lower-priority candidates after live decisions are final.
+
+        This runs on a cloned strategy in a single diagnostic worker. No value
+        is returned to Core, so its population cannot select or veto an order.
+        """
+
+        for job in jobs:
+            symbol = str(job["symbol"])
+            try:
+                candidates = strategy.generate_candidate_signals(
+                    job["strategy_data"],
+                    symbol=symbol,
+                )
+                for candidate in candidates:
+                    candidate["shadow_trigger_signature"] = (
+                        shadow_trigger_signature(candidate)
+                    )
+                errors = list(
+                    getattr(strategy, "_last_candidate_errors", [])
+                    or []
+                )
+                outcome = dict(outcomes.get(symbol) or {})
+                ranking_model_id: Optional[str] = None
+                rankings: List[Dict[str, Any]] = []
+                if (
+                    scorer is not None
+                    and cost_profile is not None
+                    and correlation_profile is not None
+                ):
+                    ranking_model_id, rankings = build_shadow_rankings(
+                        symbol=symbol,
+                        candidates=candidates,
+                        observed_at_utc=job["observed_at_utc"],
+                        decision_bar_close=job["decision_bar_close"],
+                        scorer=scorer,
+                        cost_profile=cost_profile,
+                        correlation_profile=correlation_profile,
+                        active_exposures=dict(
+                            job.get("active_exposures") or {}
+                        ),
+                    )
+                    for candidate, ranking in zip(
+                        candidates,
+                        rankings,
+                    ):
+                        candidate["shadow_ranking_status"] = ranking[
+                            "ranking_status"
+                        ]
+                        candidate["shadow_expected_gross_r"] = ranking[
+                            "expected_gross_r"
+                        ]
+                        candidate["shadow_estimated_cost_r"] = ranking[
+                            "estimated_cost_r"
+                        ]
+                        candidate["shadow_expected_net_r"] = ranking[
+                            "expected_net_r"
+                        ]
+                        candidate["shadow_correlation_penalty_r"] = (
+                            ranking["correlation_penalty_r"]
+                        )
+                        candidate["shadow_portfolio_score"] = ranking[
+                            "ranking_score"
+                        ]
+                scan_id = ledger.record_scan(
+                    deployment_id=str(job["deployment_id"]),
+                    symbol=symbol,
+                    observed_at_utc=job["observed_at_utc"],
+                    decision_bar_close=job["decision_bar_close"],
+                    production_signal=job["production_signal"],
+                    candidates=candidates,
+                    detector_errors=errors,
+                    downstream_disposition=str(
+                        outcome.get("signal") or ""
+                    )
+                    or None,
+                    downstream_details=outcome,
+                )
+                if (
+                    scan_id is not None
+                    and ranking_model_id is not None
+                    and rankings
+                ):
+                    ledger.record_ranking(
+                        scan_id,
+                        rankings,
+                        model_id=ranking_model_id,
+                    )
+            except Exception as exc:
+                # Diagnostic work is deliberately fail-open.
+                print(
+                    f"[Shadow Candidates] {symbol} batch failed "
+                    f"(execution unaffected): {exc}"
+                )
+
+    def _submit_shadow_candidate_jobs(
+        self,
+        jobs: List[Dict[str, Any]],
+        outcomes: Dict[str, dict],
+    ) -> None:
+        ledger = getattr(self, "shadow_candidate_ledger", None)
+        executor = getattr(self, "_shadow_candidate_executor", None)
+        if (
+            not jobs
+            or ledger is None
+            or not ledger.enabled
+            or executor is None
+        ):
+            return
+        previous = getattr(self, "_shadow_candidate_future", None)
+        if previous is not None and not previous.done():
+            self._shadow_candidate_dropped_jobs += len(jobs)
+            dropped = self._shadow_candidate_dropped_jobs
+            if dropped == len(jobs) or dropped % 100 == 0:
+                print(
+                    "[Shadow Candidates] worker backlog; "
+                    f"dropped_jobs={dropped}"
+                )
+            return
+        strategy_snapshot = copy.copy(self.strategy)
+        outcome_snapshot = {
+            symbol: dict(outcomes.get(symbol) or {})
+            for symbol in {str(job["symbol"]) for job in jobs}
+        }
+        try:
+            self._shadow_candidate_future = executor.submit(
+                self._write_shadow_candidate_batch,
+                ledger,
+                strategy_snapshot,
+                tuple(jobs),
+                outcome_snapshot,
+                getattr(self, "shadow_scorer", None),
+                getattr(
+                    self,
+                    "shadow_candidate_cost_profile",
+                    None,
+                ),
+                getattr(
+                    self,
+                    "shadow_candidate_correlation_profile",
+                    None,
+                ),
+            )
+        except Exception as exc:
+            print(
+                "[Shadow Candidates] submit failed "
+                f"(execution unaffected): {exc}"
+            )
 
     def _try_create_executor(self) -> bool:
         """Create the MT5 executor. Safe to call repeatedly — used both at startup
@@ -682,8 +982,6 @@ class Core:
     def _record_shadow_scan_raw(
         self,
         symbol: str,
-        *,
-        observed_at: datetime,
     ) -> Optional[QuoteTick]:
         """Record the quote visible to the actual 60-second loop.
 
@@ -697,11 +995,12 @@ class Core:
         quote = self._capture_quote(symbol)
         if quote is None:
             return None
+        quote_observed_at = datetime.now(timezone.utc)
         for plan_id in watcher.active_plan_ids(symbol):
             watcher.record_scan(
                 plan_id,
                 quote,
-                observed_at_utc=observed_at,
+                observed_at_utc=quote_observed_at,
                 candidate_matches=False,
                 policy_executable=False,
                 disposition="RAW_60S_SCAN",
@@ -715,22 +1014,23 @@ class Core:
         *,
         trigger_signature: str,
         data: Optional[Dict[str, Any]],
-        observed_at: datetime,
-    ) -> Tuple[Optional[str], Optional[QuoteTick], float]:
+    ) -> Tuple[Optional[str], Optional[QuoteTick], float, datetime]:
         """Register one fully filtered candidate without influencing it."""
-        expires_at = (
-            observed_at + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
-        ).timestamp()
         watcher = getattr(self, "shadow_tick_watcher", None)
         # Activation must be captured after every policy gate has passed.
         # Reusing the quote from the start of the symbol scan would count ticks
         # that happened before the entry decision actually existed.
         quote = self._capture_quote(symbol)
+        activation_observed_at = datetime.now(timezone.utc)
+        expires_at = (
+            activation_observed_at
+            + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
+        ).timestamp()
         if watcher is None or not watcher.enabled:
-            return None, quote, expires_at
+            return None, quote, expires_at, activation_observed_at
 
         if quote is None:
-            return None, None, expires_at
+            return None, None, expires_at, activation_observed_at
         decision_time = self._closed_m15_decision_time(data)
         deployment_id = (
             os.getenv("DEPLOYMENT_ID", "").strip()
@@ -775,8 +1075,11 @@ class Core:
             entry_max=max(lower, upper),
             planned_entry=planned,
             stop_price=float(sig.get("stop_price") or 0.0),
-            activated_at_utc=observed_at,
-            activation_tick_msc=int(quote.time_msc),
+            activated_at_utc=activation_observed_at,
+            activation_tick_msc=int(
+                activation_observed_at.timestamp() * 1000
+            ),
+            activation_source_tick_msc=int(quote.time_msc),
             expires_at_utc=datetime.fromtimestamp(
                 expires_at, tz=timezone.utc
             ),
@@ -804,12 +1107,12 @@ class Core:
         watcher.record_scan(
             plan_id,
             quote,
-            observed_at_utc=observed_at,
+            observed_at_utc=activation_observed_at,
             candidate_matches=True,
             policy_executable=True,
             disposition="ELIGIBLE_60S_SCAN",
         )
-        return plan_id, quote, expires_at
+        return plan_id, quote, expires_at, activation_observed_at
 
     def _arm_pending_limit(
         self,
@@ -981,6 +1284,34 @@ class Core:
                 # fill and cancel every still-working remainder.
                 if int(result.get("deal") or 0) > 0:
                     break
+        except PendingOrderRejected as exc:
+            current = self.pending_limits.get(symbol, plan)
+            accepted_broker_evidence = bool(
+                current.has_fills
+                or any(
+                    leg.broker_order_ticket is not None
+                    for leg in current.legs
+                )
+            )
+            target = (
+                PendingLimitState.CANCELLING
+                if accepted_broker_evidence
+                else PendingLimitState.FAILED
+            )
+            current = current.transition(
+                target,
+                now=max(time.time(), current.updated_at),
+                reason=(
+                    _PENDING_DEFINITIVE_REJECTION_PREFIX + str(exc)
+                ),
+            )
+            self.pending_limits[symbol] = current
+            self._save_pending_limit_state()
+            print(
+                f"[Persistent LIMIT] {symbol} definitively rejected; "
+                f"state={current.state.value}, retcode={exc.retcode}"
+            )
+            raise
         except Exception:
             current = self.pending_limits.get(symbol, plan)
             if any(
@@ -2033,6 +2364,13 @@ class Core:
                     ticket = int(leg.broker_order_ticket or 0)
                     if ticket <= 0:
                         if leg.submission_attempted:
+                            if (
+                                plan.state == PendingLimitState.FAILED
+                                or str(plan.reason or "").startswith(
+                                    _PENDING_DEFINITIVE_REJECTION_PREFIX
+                                )
+                            ):
+                                continue
                             if now < float(plan.expires_at) + 30.0:
                                 all_resolved = False
                             # After server-side expiry plus publication grace,
@@ -2360,7 +2698,13 @@ class Core:
                         )
                         self.pending_limits[symbol] = plan
                         self._save_pending_limit_state()
-                    if watcher is not None:
+                    definitive_rejection = bool(
+                        plan.state == PendingLimitState.FAILED
+                        and str(plan.reason or "").startswith(
+                            _PENDING_DEFINITIVE_REJECTION_PREFIX
+                        )
+                    )
+                    if watcher is not None and not definitive_rejection:
                         if plan.state == PendingLimitState.EXPIRED:
                             terminal_msc = int(
                                 float(plan.expires_at) * 1000
@@ -2370,7 +2714,12 @@ class Core:
                             and cancel_reason is not None
                             and "path crossed" in cancel_reason
                         ):
-                            terminal_msc = int(quote.time_msc)
+                            # ``symbol_info_tick.time_msc`` can be broker-server
+                            # local while history queries are UTC.  The cancel
+                            # decision happened now, so its causal horizon is
+                            # the UTC management observation, not the raw quote
+                            # timestamp.
+                            terminal_msc = int(now * 1000)
                         else:
                             terminal_msc = int(time.time() * 1000)
                         watcher.record_terminal(
@@ -3490,7 +3839,14 @@ class Core:
                 )
             if outcome in {"TP", "SL"}:
                 try:
-                    self.ai_store.update_on_close(symbol, outcome, rr_numeric=self._trade_rr(trade))
+                    self.ai_store.update_on_close(
+                        symbol,
+                        outcome,
+                        rr_numeric=self._trade_rr(trade),
+                        trigger_kind=(
+                            primary_idea_trigger_kind(trade) or None
+                        ),
+                    )
                 except Exception:
                     traceback.print_exc()
 
@@ -3723,6 +4079,62 @@ class Core:
         sig["info"] = reason
         print(f"[VolRegime] {symbol} entry blocked: {reason}")
         return sig
+
+    def _apply_execution_quality_filter(
+        self,
+        symbol: str,
+        sig: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        if (
+            not EXECUTION_QUALITY_FILTER_ENABLED
+            or not isinstance(sig, dict)
+            or sig.get("signal") != "ENTER"
+        ):
+            return sig
+        new_sig = dict(sig)
+        profile = getattr(self, "execution_quality_profile", None)
+        executor = getattr(self, "mt5_executor", None)
+        if profile is None or executor is None:
+            new_sig["signal"] = "WAIT_EXECUTION_QUALITY_DATA"
+            new_sig["info"] = (
+                "Execution-quality filter is enabled but its profile or "
+                "causal broker quote source is unavailable"
+            )
+            return new_sig
+        source_symbol = self.universe.get(symbol, symbol)
+        try:
+            quote = executor.get_current_quote(source_symbol)
+            if quote is None:
+                raise ValueError("broker bid/ask quote unavailable")
+            assessment = assess_execution_quality(
+                profile,
+                symbol=symbol,
+                signal=new_sig,
+                bid=quote.get("bid"),
+                ask=quote.get("ask"),
+                observed_at_utc=datetime.now(timezone.utc),
+                news_calendar=getattr(self, "news_calendar", None),
+            )
+            assessment["quote_time_msc"] = quote.get("time_msc")
+        except Exception as exc:
+            new_sig["signal"] = "WAIT_EXECUTION_QUALITY_DATA"
+            new_sig["info"] = (
+                f"Execution-quality evidence unavailable: {exc}"
+            )
+            return new_sig
+        new_sig["execution_quality"] = assessment
+        if assessment.get("allowed"):
+            return new_sig
+        reason = str(assessment.get("reason") or "DATA_UNAVAILABLE")
+        new_sig["signal"] = {
+            "SPREAD": "SKIP_SPREAD",
+            "ROLLOVER": "WAIT_ROLLOVER",
+            "NEWS": "WAIT_NEWS",
+            "NEWS_DATA_UNAVAILABLE": "WAIT_NEWS_DATA",
+        }.get(reason, "WAIT_EXECUTION_QUALITY_DATA")
+        new_sig["info"] = f"Execution-quality block: {reason}"
+        print(f"[Execution Quality] {symbol} entry blocked: {reason}")
+        return new_sig
 
     def _attach_shadow_score(
         self, symbol: str, sig: Dict[str, Any]
@@ -4288,6 +4700,7 @@ class Core:
 
     def get_signals(self) -> Dict[str, dict]:
         results: Dict[str, dict] = {}
+        shadow_candidate_jobs: List[Dict[str, Any]] = []
         symbols = self._get_symbols()
         t_start = time.time()
         prof = self.profiler
@@ -4322,11 +4735,7 @@ class Core:
         dirty = False
 
         for symbol in symbols:
-            observed_at = datetime.now(timezone.utc)
-            self._record_shadow_scan_raw(
-                symbol,
-                observed_at=observed_at,
-            )
+            self._record_shadow_scan_raw(symbol)
             pending_plan = self.pending_limits.get(symbol)
             if (
                 pending_plan is not None
@@ -4717,6 +5126,39 @@ class Core:
                 strategy_data = self._strategy_view(data, symbol=symbol)
                 with prof.section("strategy"):
                     raw_sig = self.strategy.generate_signal(strategy_data, symbol=symbol)
+                candidate_ledger = getattr(
+                    self, "shadow_candidate_ledger", None
+                )
+                if (
+                    candidate_ledger is not None
+                    and candidate_ledger.enabled
+                ):
+                    shadow_candidate_jobs.append({
+                        "deployment_id": (
+                            os.getenv("DEPLOYMENT_ID", "").strip()
+                            or os.getenv(
+                                "STRATEGY_VERSION", "unversioned"
+                            ).strip()
+                            or "unversioned"
+                        ),
+                        "symbol": symbol,
+                        "observed_at_utc": datetime.now(timezone.utc),
+                        "decision_bar_close": (
+                            self._closed_m15_decision_time(data)
+                        ),
+                        # The dict is immutable to the diagnostic worker.
+                        "production_signal": dict(raw_sig),
+                        # DataFrames are closed/as-of views and are only read.
+                        "strategy_data": dict(strategy_data),
+                        # Frozen portfolio state at this causal decision. The
+                        # worker can score concentration but cannot change it.
+                        "active_exposures": {
+                            active_symbol: str(active_trade.side)
+                            for active_symbol, active_trade
+                            in self.active_trades.items()
+                            if active_trade is not None
+                        },
+                    })
                 if DEBUG_RAW_SIGNALS and raw_sig.get("signal") != "NO_TRIGGER":
                     print(f"[RAW_SIG] {symbol} {raw_sig}")
                 with prof.section("ai_filter"):
@@ -4730,6 +5172,7 @@ class Core:
                 sig = self._apply_global_filters(symbol, sig)
                 sig = self._apply_session_filter(symbol, sig)
                 sig = self._apply_vol_regime_filter(symbol, sig, strategy_data)
+                sig = self._apply_execution_quality_filter(symbol, sig)
                 sig = self._attach_shadow_score(symbol, sig)
 
                 if sig.get("signal") == "ENTER":
@@ -4746,17 +5189,16 @@ class Core:
                         self._log_signal(symbol, sig)
                         continue
 
-                    candidate_observed_at = datetime.now(timezone.utc)
                     (
                         shadow_plan_id,
                         entry_quote,
                         pending_expires_at,
+                        pending_observed_at,
                     ) = self._register_shadow_candidate(
                         symbol,
                         sig,
                         trigger_signature=trig_sig,
                         data=data,
-                        observed_at=candidate_observed_at,
                     )
                     if shadow_plan_id:
                         sig.setdefault("setup_id", shadow_plan_id)
@@ -4842,7 +5284,7 @@ class Core:
                                         trigger_signature=trig_sig,
                                         expires_at=pending_expires_at,
                                         shadow_plan_id=shadow_plan_id,
-                                        observed_at=candidate_observed_at,
+                                        observed_at=pending_observed_at,
                                     )
                             except RiskCapacityError as exc:
                                 sig["signal"] = "WAIT_RISK_ENTRY"
@@ -4852,6 +5294,38 @@ class Core:
                                     sig["risk_adjustment"] = adjustment
                                 results[symbol] = sig
                                 self._log_signal(symbol, sig)
+                                continue
+                            except PendingOrderRejected as exc:
+                                retained = self.pending_limits.get(symbol)
+                                cancelling = bool(
+                                    retained is not None
+                                    and retained.state
+                                    == PendingLimitState.CANCELLING
+                                )
+                                sig["signal"] = (
+                                    "WAIT_PENDING_RECONCILE"
+                                    if cancelling
+                                    else "WAIT_LIMIT_REJECTED"
+                                )
+                                sig["execution_error"] = str(exc)
+                                sig["info"] = (
+                                    "Broker synchronously rejected the "
+                                    "pending order; no hidden order is "
+                                    "possible"
+                                )
+                                if retained is not None:
+                                    sig["pending_limit"] = {
+                                        "plan_id": retained.plan_id,
+                                        "state": retained.state.value,
+                                        "created_at": retained.created_at,
+                                        "expires_at": retained.expires_at,
+                                    }
+                                results[symbol] = sig
+                                self._log_signal(symbol, sig)
+                                print(
+                                    f"[Core] Persistent LIMIT rejected for "
+                                    f"{symbol}: {exc}"
+                                )
                                 continue
                             except Exception as exc:
                                 retained = self.pending_limits.get(symbol)
@@ -4920,8 +5394,11 @@ class Core:
                                 watcher.record_terminal(
                                     shadow_plan_id,
                                     "INVALIDATED",
-                                    at_utc=candidate_observed_at,
-                                    tick_msc=entry_quote.time_msc,
+                                    at_utc=pending_observed_at,
+                                    tick_msc=int(
+                                        pending_observed_at.timestamp()
+                                        * 1000
+                                    ),
                                     reason=sig["info"],
                                     inclusive=True,
                                 )
@@ -5000,6 +5477,13 @@ class Core:
         if dirty:
             with prof.section("save_state"):
                 save_active_trades(self.active_trades, AI_DATA_DIR / "active_trades.json")
+
+        # Submit only after every live order decision and durable trade-state
+        # write in this cycle. The worker's result is never read by Core.
+        self._submit_shadow_candidate_jobs(
+            shadow_candidate_jobs,
+            results,
+        )
 
         prof.dump(prefix="[Profiler:core]")
         return results
