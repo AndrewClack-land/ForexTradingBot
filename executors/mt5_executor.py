@@ -1063,6 +1063,22 @@ class MT5Executor:
             "risk_capital_base": order_result["risk_capital_base"],
             "risk_pct": order_result["risk_pct"],
             "comment": comment or "Signal",
+            # Execution-quality telemetry. Absent for paths that do not go
+            # through a market send (e.g. a filled pending order), so readers
+            # must treat a missing key as "not measured", never as zero.
+            **{
+                key: order_result[key]
+                for key in (
+                    "request_price",
+                    "request_bid",
+                    "request_ask",
+                    "request_spread",
+                    "request_time_msc",
+                    "slippage_price",
+                    "slippage_pips",
+                )
+                if key in order_result
+            },
         }
 
     def execute_split_entry(
@@ -1253,6 +1269,22 @@ class MT5Executor:
                 "tp": tp,
                 "tp_index": i + 1,
                 "comment": leg_comment,
+                # Split is the production path, so realized slippage has to be
+                # carried per leg here as well; measuring only the monitor path
+                # would capture nothing in live trading.
+                **{
+                    key: order_result[key]
+                    for key in (
+                        "request_price",
+                        "request_bid",
+                        "request_ask",
+                        "request_spread",
+                        "request_time_msc",
+                        "slippage_price",
+                        "slippage_pips",
+                    )
+                    if key in order_result
+                },
             })
             risk_used_amount += float(order_result["risk_amount"])
             self.logger.info(
@@ -2459,9 +2491,18 @@ class MT5Executor:
                         symbol, volume, filled_volume,
                     )
                 filled_risk = sizing.risk_per_lot * filled_volume
+                fill_price = float(result.price)
+                # Request-time quote, persisted so realized slippage can be
+                # measured rather than assumed. Cost stress showed the edge
+                # breaks even near 0.6 pip per side, and this quantity was
+                # never recorded, so that threshold has stayed untestable.
+                # Signed so a positive value always means a worse fill.
+                slippage_price = (
+                    fill_price - price if is_buy else price - fill_price
+                )
                 return {
                     "ticket": int(result.order),
-                    "price": float(result.price),   # actual broker fill price
+                    "price": fill_price,   # actual broker fill price
                     "deal": int(result.deal),
                     "volume": filled_volume,
                     "stop_price": float(stop_price),
@@ -2470,6 +2511,17 @@ class MT5Executor:
                     "risk_capital_base": sizing.limit.capital_base,
                     "risk_pct": sizing.limit.fraction,
                     "partial_fill": result.retcode != mt5.TRADE_RETCODE_DONE,
+                    "request_price": float(price),
+                    "request_bid": float(tick.bid),
+                    "request_ask": float(tick.ask),
+                    "request_spread": float(current_spread),
+                    "request_time_msc": int(
+                        getattr(tick, "time_msc", 0) or 0
+                    ),
+                    "slippage_price": float(slippage_price),
+                    "slippage_pips": float(
+                        slippage_price / self._pip_size(symbol)
+                    ),
                 }
             last_result = result
             if result.retcode != unsupported_code:
