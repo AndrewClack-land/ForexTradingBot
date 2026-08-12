@@ -375,6 +375,15 @@ HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 # trading before a frozen paired OOS comparison is reviewed.
 FACTOR_CONTRACT = os.getenv("FACTOR_CONTRACT", "v1-fvg-margin").strip()
 
+# Hard veto on entries whose direction opposes the 1H FVG regime. The score
+# margin only makes such an entry more expensive; the veto refuses it. Paired
+# WFO 2020-2026 measured the opposed population as outright unprofitable while
+# the aligned population carried the whole edge, but the result is sensitive to
+# execution slippage, which has never been measured. Off by default.
+FVG_VETO_ENABLED = os.getenv("FVG_VETO_ENABLED", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+
 # Optional research ceiling on the IMFVG regime. Paired WFO showed that 24 H1
 # bars added trades but reduced net R and PF, so production remains unbounded.
 # Non-zero values are retained only for explicit sensitivity experiments.

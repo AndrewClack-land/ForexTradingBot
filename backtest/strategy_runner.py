@@ -582,6 +582,7 @@ class NarrativeBacktestConfig:
     fvg_regime_max_age_bars: int = 0
     fvg_event_invalidation_mode: str = "none"
     factor_contract: str = FACTOR_CONTRACT_LEGACY
+    fvg_veto_enabled: bool = False
     release_commit: Optional[str] = None
     release_manifest_sha256: Optional[str] = None
     environment_lock_sha256: Optional[str] = None
@@ -623,6 +624,7 @@ class NarrativeBacktestConfig:
         fvg_regime_max_age_bars: int = 0,
         fvg_event_invalidation_mode: str = "none",
         factor_contract: str = FACTOR_CONTRACT_LEGACY,
+        fvg_veto_enabled: bool = False,
         release_commit: Optional[str] = None,
         release_manifest_sha256: Optional[str] = None,
         environment_lock_sha256: Optional[str] = None,
@@ -830,6 +832,7 @@ class NarrativeBacktestConfig:
                 normalized_fvg_event_mode
             ),
             factor_contract=resolve_factor_contract(factor_contract)["name"],
+            fvg_veto_enabled=bool(fvg_veto_enabled),
             release_commit=str(release_commit).strip() if release_commit else None,
             release_manifest_sha256=normalized_release_manifest,
             environment_lock_sha256=normalized_environment_lock,
@@ -880,6 +883,7 @@ class NarrativeBacktestConfig:
                     self.fvg_event_invalidation_mode
                 ),
                 "factor_contract": self.factor_contract,
+                "fvg_veto_enabled": self.fvg_veto_enabled,
             },
             "release_commit": self.release_commit,
             "release_manifest_sha256": self.release_manifest_sha256,
@@ -1180,6 +1184,7 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
         config.fvg_event_invalidation_mode
     )
     strategy.factor_contract = config.factor_contract
+    strategy.fvg_veto_enabled = config.fvg_veto_enabled
     expected = {
         "risk_per_trade": config.risk_fraction,
         "rejection_block_entry_enabled": (
@@ -1198,6 +1203,7 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
             config.fvg_event_invalidation_mode
         ),
         "factor_contract": config.factor_contract,
+        "fvg_veto_enabled": config.fvg_veto_enabled,
     }
     mismatches = {
         name: (getattr(strategy, name, None), value)

@@ -111,6 +111,7 @@ FVG_EVENT_INVALIDATION_MODE = str(
 FACTOR_CONTRACT = str(
     getattr(_cfg, "FACTOR_CONTRACT", "v1-fvg-margin")
 ).strip()
+FVG_VETO_ENABLED = bool(getattr(_cfg, "FVG_VETO_ENABLED", False))
 
 Side = Literal["LONG", "SHORT", "NEUTRAL"]
 
@@ -425,6 +426,9 @@ class NarrativeStrategy:
         # Named weight/margin contract. Validated eagerly so a typo fails at
         # construction instead of silently scoring under the legacy weights.
         self.factor_contract = resolve_factor_contract(FACTOR_CONTRACT)["name"]
+        # Hard veto on entries opposing the 1H FVG regime. Off by default: it
+        # removes entries the live strategy currently takes.
+        self.fvg_veto_enabled = bool(FVG_VETO_ENABLED)
 
         self._last_htf_context: Optional[HtfContext] = None
         self._last_factor_vector: Optional[Dict[str, Any]] = None
@@ -1790,6 +1794,24 @@ class NarrativeStrategy:
         # EMA-M15 и Volume-Confirmation фильтры удалены: направление и строгость
         # bias регулирует FVG-режим 1H внутри calc_narrative.
         fvg_side, fvg_text = self.calc_fvg_regime_1h(df_1H)
+
+        # Optional hard veto on entries that oppose the 1H FVG regime. The
+        # score-margin rule only makes such an entry more expensive; the veto
+        # refuses it outright. Paired WFO on the sealed 2020-2026 snapshot
+        # measured the opposed population as outright unprofitable, while the
+        # aligned population carried the whole edge. Research-gated: this
+        # removes entries the live strategy currently takes.
+        if self.fvg_veto_enabled and fvg_side in {"LONG", "SHORT"}:
+            if fvg_side != side_bias:
+                return {
+                    "signal": "NO_TREND",
+                    "narrative": narrative_text,
+                    "vc": fvg_text,
+                    "info": (
+                        f"FVG-вето: bias {side_bias} против режима {fvg_side}"
+                    ),
+                    "factor_vector": factor_vector,
+                }
 
         entry = (
             self.trigger_h1_rejection_block(df_1H, side_bias)

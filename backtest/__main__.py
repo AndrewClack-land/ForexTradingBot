@@ -242,6 +242,15 @@ def _build_parser() -> argparse.ArgumentParser:
         ),
     )
     strategy_run.add_argument(
+        "--fvg-veto",
+        action="store_true",
+        help=(
+            "refuse any entry whose direction opposes the 1H FVG regime. The "
+            "score margin only makes such an entry more expensive; this veto "
+            "removes it. A run using this flag is a non-parity research arm"
+        ),
+    )
+    strategy_run.add_argument(
         "--release-commit-file",
         help=(
             "file containing the exact strategy Git commit "
@@ -755,6 +764,7 @@ def _strategy_run(args: argparse.Namespace) -> int:
         fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
         fvg_event_invalidation_mode=args.fvg_event_invalidation_mode,
         factor_contract=args.factor_contract,
+        fvg_veto_enabled=args.fvg_veto,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,

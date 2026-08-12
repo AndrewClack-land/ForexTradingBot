@@ -284,3 +284,48 @@ def test_rescore_preserves_the_margin_rule_of_the_frozen_vector():
     assert rescored["margin_long"] == rescored["margin_short"] == 2
     assert rescored["score_long"] == vector["score_long"]
     assert rescored["score_short"] == vector["score_short"]
+
+
+def _veto_stub(bias: str, fvg_side: str):
+    """Real generate_signal, stubbed collaborators, so only the veto is tested."""
+    import pandas as pd
+
+    from core.strategy_narrative import NarrativeStrategy
+
+    strat = NarrativeStrategy.__new__(NarrativeStrategy)
+    strat.fvg_veto_enabled = True
+    strat._last_factor_vector = None
+    strat._last_htf_context = None
+    strat.rejection_block_h1_entry_enabled = False
+    strat.calc_narrative = lambda *a: (bias, "narrative")
+    strat.calc_fvg_regime_1h = lambda _df: (fvg_side, f"FVG {fvg_side}")
+    for name in (
+        "trigger_15m_cluster_rejection",
+        "trigger_15m_quote_pressure_rejection",
+        "trigger_h1_pivot_reclaim_on_15m",
+        "trigger_orderblock_touch",
+    ):
+        setattr(strat, name, lambda *a, **k: None)
+    frame = pd.DataFrame({"close": [1.0] * 5})
+    return strat.generate_signal({"4H": frame, "1H": frame, "15M": frame})
+
+
+def test_fvg_veto_blocks_only_the_opposing_direction():
+    opposed = _veto_stub(bias="LONG", fvg_side="SHORT")
+    assert opposed["signal"] == "NO_TREND"
+    assert "FVG-вето" in opposed["info"]
+
+    # Aligned: the veto must not fire, so the chain reaches the triggers and
+    # falls through to NO_TRIGGER instead of being refused up front.
+    aligned = _veto_stub(bias="SHORT", fvg_side="SHORT")
+    assert aligned["signal"] == "NO_TRIGGER"
+
+    # A neutral regime never vetoes either.
+    neutral = _veto_stub(bias="LONG", fvg_side="NEUTRAL")
+    assert neutral["signal"] == "NO_TRIGGER"
+
+
+def test_fvg_veto_is_off_by_default():
+    import config
+
+    assert config.FVG_VETO_ENABLED is False
