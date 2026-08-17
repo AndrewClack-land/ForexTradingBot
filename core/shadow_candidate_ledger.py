@@ -22,7 +22,46 @@ import time
 from typing import Any, Optional
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+
+_SCAN_V2_COLUMN_DEFINITIONS = (("watcher_plan_id", "TEXT"),)
+
+_QUALITY_COLUMN_DEFINITIONS = (
+    ("quality_model_id", "TEXT"),
+    ("quality_status", "TEXT"),
+    ("quality_tp_probability", "REAL"),
+    ("quality_tp_lcb", "REAL"),
+    ("quality_tp_ucb", "REAL"),
+    ("quality_expected_net_r", "REAL"),
+    ("quality_conservative_net_r", "REAL"),
+    ("quality_net_uncertainty_r", "REAL"),
+    ("quality_effective_n", "REAL"),
+    ("quality_backoff_path", "TEXT"),
+    ("quality_stop_atr_h1", "REAL"),
+    ("quality_feature_missing_json", "TEXT"),
+    ("quality_payload_json", "TEXT"),
+    ("quality_rank_score_r", "REAL"),
+    ("quality_rank_position", "INTEGER"),
+    ("quality_selected", "INTEGER"),
+)
+
+_QUALITY_PAYLOAD_FIELDS = (
+    "quality_status",
+    "quality_tp_probability",
+    "quality_tp_lcb",
+    "quality_tp_ucb",
+    "quality_expected_net_r",
+    "quality_conservative_net_r",
+    "quality_net_uncertainty_r",
+    "quality_effective_n",
+    "quality_backoff_path",
+    "quality_stop_atr_h1",
+    "quality_feature_missing",
+    "quality_rank_score_r",
+    "quality_rank_position",
+    "quality_selected",
+)
 
 
 def _digest(*parts: object) -> str:
@@ -37,9 +76,7 @@ def _aware_utc(value: datetime) -> datetime:
 
 
 def _utc_iso(value: datetime) -> str:
-    return _aware_utc(value).isoformat(timespec="milliseconds").replace(
-        "+00:00", "Z"
-    )
+    return _aware_utc(value).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _decision_day(
@@ -121,9 +158,7 @@ def _json_safe(value: Any) -> Any:
         return _utc_iso(value) if value.tzinfo is not None else value.isoformat()
     if isinstance(value, Mapping):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, Sequence) and not isinstance(
-        value, (str, bytes, bytearray)
-    ):
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [_json_safe(item) for item in value]
     item = getattr(value, "item", None)
     if callable(item):
@@ -160,6 +195,55 @@ def _optional_float(value: Any) -> Optional[float]:
     return parsed if math.isfinite(parsed) else None
 
 
+def _optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _optional_bool_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return 1
+        if normalized in {"false", "no", "0"}:
+            return 0
+        return None
+    return int(bool(value))
+
+
+def _optional_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _backoff_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    return _json(value)
+
+
+def _missing_features_json(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        items = [value] if value.strip() else []
+    elif isinstance(value, Sequence) and not isinstance(value, (bytes, bytearray)):
+        items = [str(item) for item in value]
+    else:
+        items = [str(value)]
+    return _json(items)
+
+
 class ShadowCandidateLedger:
     """Separate SQLite ledger that can never return an execution decision."""
 
@@ -178,10 +262,11 @@ class ShadowCandidateLedger:
         self._ensure_schema()
 
     def _ensure_schema(self) -> None:
+        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._conn.execute("PRAGMA synchronous=NORMAL")
+        self._conn.execute("PRAGMA foreign_keys=ON")
         with self._conn:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA synchronous=NORMAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
+            self._conn.execute("BEGIN IMMEDIATE")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS metadata (
@@ -193,14 +278,9 @@ class ShadowCandidateLedger:
             row = self._conn.execute(
                 "SELECT value FROM metadata WHERE key='schema_version'"
             ).fetchone()
-            if row is not None and int(row[0]) != SCHEMA_VERSION:
-                raise RuntimeError(
-                    f"unsupported candidate-ledger schema {row[0]}"
-                )
-            self._conn.execute(
-                "INSERT OR IGNORE INTO metadata(key,value) VALUES('schema_version',?)",
-                (str(SCHEMA_VERSION),),
-            )
+            stored_version = int(row[0]) if row is not None else None
+            if stored_version not in {None, 1, SCHEMA_VERSION}:
+                raise RuntimeError(f"unsupported candidate-ledger schema {row[0]}")
             self._conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS scans (
@@ -264,6 +344,7 @@ class ShadowCandidateLedger:
                 )
                 """
             )
+            self._ensure_v2_columns()
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_candidates_opportunity "
                 "ON candidates(opportunity_id)"
@@ -276,6 +357,45 @@ class ShadowCandidateLedger:
                 "CREATE INDEX IF NOT EXISTS idx_scans_symbol_time "
                 "ON scans(symbol, observed_at_utc)"
             )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_symbol_trigger_side "
+                "ON candidates(symbol, trigger_kind, side)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_quality_status "
+                "ON candidates(quality_status)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_candidates_quality_rank "
+                "ON candidates(scan_id, quality_rank_position)"
+            )
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_scans_watcher_plan "
+                "ON scans(watcher_plan_id)"
+            )
+            self._conn.execute(
+                "INSERT INTO metadata(key,value) VALUES('schema_version',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
+            )
+
+    def _ensure_v2_columns(self) -> None:
+        """Add v2 columns without rebuilding or rewriting v1 rows."""
+
+        table_columns = {
+            table: {
+                str(row[1]) for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for table in ("scans", "candidates")
+        }
+        for table, definitions in (
+            ("scans", _SCAN_V2_COLUMN_DEFINITIONS),
+            ("candidates", _QUALITY_COLUMN_DEFINITIONS),
+        ):
+            for name, sql_type in definitions:
+                if name in table_columns[table]:
+                    continue
+                self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {sql_type}")
 
     def _disable(self, exc: BaseException) -> None:
         self.enabled = False
@@ -314,9 +434,7 @@ class ShadowCandidateLedger:
             if not symbol_key:
                 raise ValueError("symbol is required")
             deployment = str(deployment_id).strip() or "unversioned"
-            scan_id = stable_candidate_scan_id(
-                deployment, symbol_key, observed
-            )
+            scan_id = stable_candidate_scan_id(deployment, symbol_key, observed)
             trading_day = _decision_day(decision, observed)
             raw_production = dict(production_signal or {})
             production_kind = str(raw_production.get("signal") or "")
@@ -336,6 +454,11 @@ class ShadowCandidateLedger:
             )
             observed_minute = observed.replace(second=0, microsecond=0)
             created_at = time.time()
+            watcher_plan_id = _optional_text(
+                downstream_details.get("setup_id")
+                if downstream_details is not None
+                else None
+            )
 
             prepared: list[tuple[Any, ...]] = []
             for ordinal, source_candidate in enumerate(candidates, start=1):
@@ -343,15 +466,11 @@ class ShadowCandidateLedger:
                 signature = str(
                     candidate.get("shadow_trigger_signature") or ""
                 ).strip() or trigger_signature(candidate)
-                event_id = stable_candidate_event_id(
-                    symbol_key, signature
-                )
+                event_id = stable_candidate_event_id(symbol_key, signature)
                 opportunity_id = stable_candidate_opportunity_id(
                     symbol_key, signature, trading_day
                 )
-                source = str(
-                    candidate.get("shadow_candidate_source") or ""
-                )
+                source = str(candidate.get("shadow_candidate_source") or "")
                 observation_id = _digest(
                     "candidate-observation-v1",
                     scan_id,
@@ -407,8 +526,9 @@ class ShadowCandidateLedger:
                         production_signal,production_trigger_signature,
                         production_opportunity_id,candidate_count,
                         detector_errors_json,downstream_disposition,
-                        downstream_details_json,created_at,updated_at
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                        downstream_details_json,watcher_plan_id,
+                        created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                     """,
                     (
                         scan_id,
@@ -426,6 +546,7 @@ class ShadowCandidateLedger:
                         _json(downstream_details)
                         if downstream_details is not None
                         else None,
+                        watcher_plan_id,
                         created_at,
                         created_at,
                     ),
@@ -527,6 +648,68 @@ class ShadowCandidateLedger:
             self._disable(exc)
             return False
 
+    def record_quality_ranking(
+        self,
+        scan_id: str,
+        rows: Sequence[Mapping[str, Any]],
+        model_id: str,
+    ) -> bool:
+        """Attach v2 quality diagnostics without touching legacy rankings."""
+
+        if not self.enabled:
+            return False
+        try:
+            quality_model_id = str(model_id).strip()
+            updates = []
+            for item in rows:
+                payload = {
+                    key: item.get(key) for key in _QUALITY_PAYLOAD_FIELDS if key in item
+                }
+                payload["quality_model_id"] = quality_model_id
+                updates.append(
+                    (
+                        quality_model_id,
+                        _optional_text(item.get("quality_status")),
+                        _optional_float(item.get("quality_tp_probability")),
+                        _optional_float(item.get("quality_tp_lcb")),
+                        _optional_float(item.get("quality_tp_ucb")),
+                        _optional_float(item.get("quality_expected_net_r")),
+                        _optional_float(item.get("quality_conservative_net_r")),
+                        _optional_float(item.get("quality_net_uncertainty_r")),
+                        _optional_float(item.get("quality_effective_n")),
+                        _backoff_text(item.get("quality_backoff_path")),
+                        _optional_float(item.get("quality_stop_atr_h1")),
+                        _missing_features_json(item.get("quality_feature_missing")),
+                        _json(payload),
+                        _optional_float(item.get("quality_rank_score_r")),
+                        _optional_int(item.get("quality_rank_position")),
+                        _optional_bool_int(item.get("quality_selected")),
+                        str(scan_id),
+                        str(item.get("opportunity_id") or ""),
+                    )
+                )
+            with self._lock, self._conn:
+                self._conn.executemany(
+                    """
+                    UPDATE candidates SET
+                        quality_model_id=?, quality_status=?,
+                        quality_tp_probability=?, quality_tp_lcb=?,
+                        quality_tp_ucb=?, quality_expected_net_r=?,
+                        quality_conservative_net_r=?,
+                        quality_net_uncertainty_r=?, quality_effective_n=?,
+                        quality_backoff_path=?, quality_stop_atr_h1=?,
+                        quality_feature_missing_json=?, quality_payload_json=?,
+                        quality_rank_score_r=?, quality_rank_position=?,
+                        quality_selected=?
+                    WHERE scan_id=? AND opportunity_id=?
+                    """,
+                    updates,
+                )
+            return True
+        except Exception as exc:
+            self._disable(exc)
+            return False
+
     def summary(self) -> dict[str, Any]:
         if not self.enabled:
             return {
@@ -534,9 +717,7 @@ class ShadowCandidateLedger:
                 "disabled_reason": self.disabled_reason,
             }
         with self._lock:
-            scans = self._conn.execute(
-                "SELECT COUNT(*) FROM scans"
-            ).fetchone()[0]
+            scans = self._conn.execute("SELECT COUNT(*) FROM scans").fetchone()[0]
             observations = self._conn.execute(
                 "SELECT COUNT(*) FROM candidates"
             ).fetchone()[0]
@@ -550,8 +731,7 @@ class ShadowCandidateLedger:
                 "SELECT COUNT(*) FROM scans WHERE candidate_count > 1"
             ).fetchone()[0]
             selected = self._conn.execute(
-                "SELECT COUNT(*) FROM candidates "
-                "WHERE selected_by_production=1"
+                "SELECT COUNT(*) FROM candidates WHERE selected_by_production=1"
             ).fetchone()[0]
         return {
             "enabled": True,

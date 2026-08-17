@@ -130,6 +130,17 @@ SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH = (
     if _SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH
     else None
 )
+# Optional hierarchical quality calibration. Consumers must keep it
+# diagnostic-only; the production waterfall remains authoritative.
+_SHADOW_QUALITY_PROFILE_PATH = os.getenv(
+    "SHADOW_QUALITY_PROFILE_PATH",
+    "",
+).strip()
+SHADOW_QUALITY_PROFILE_PATH = (
+    Path(_SHADOW_QUALITY_PROFILE_PATH)
+    if _SHADOW_QUALITY_PROFILE_PATH
+    else None
+)
 
 # Compensating execution-quality filters. Default OFF: enabling without a
 # complete versioned profile (and point-in-time calendar when news is enabled)

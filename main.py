@@ -48,6 +48,7 @@ from config import (
     SHADOW_CANDIDATE_LEDGER_DB_PATH,
     SHADOW_CANDIDATE_COST_PROFILE_PATH,
     SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH,
+    SHADOW_QUALITY_PROFILE_PATH,
     EXECUTION_QUALITY_FILTER_ENABLED,
     EXECUTION_QUALITY_PROFILE_PATH,
     NEWS_CALENDAR_PATH,
@@ -149,6 +150,11 @@ from core.shadow_candidate_ranker import (
     PortfolioCorrelationProfile,
     build_shadow_rankings,
 )
+from core.hierarchical_quality_score import (
+    HierarchicalQualityProfile,
+    LiveHierarchicalQualityScorer,
+)
+from core.quality_shadow_bridge import build_quality_ledger_rows
 from executors.mt5_executor import (
     MT5Executor,
     MT5Settings,
@@ -388,6 +394,9 @@ class Core:
         self.shadow_candidate_correlation_profile: Optional[
             PortfolioCorrelationProfile
         ] = None
+        self.shadow_quality_scorer: Optional[
+            LiveHierarchicalQualityScorer
+        ] = None
         if SHADOW_CANDIDATE_LEDGER_ENABLED:
             try:
                 self.shadow_candidate_ledger = ShadowCandidateLedger(
@@ -437,6 +446,26 @@ class Core:
                     print(
                         "[Shadow Candidates] correlation profile unavailable "
                         f"(ranking disabled, capture continues): {exc}"
+                    )
+            if SHADOW_QUALITY_PROFILE_PATH is not None:
+                try:
+                    self.shadow_quality_scorer = (
+                        LiveHierarchicalQualityScorer(
+                            HierarchicalQualityProfile.load(
+                                SHADOW_QUALITY_PROFILE_PATH
+                            )
+                        )
+                    )
+                    print(
+                        "[Shadow Candidates] quality profile loaded "
+                        "(diagnostic-only): "
+                        f"{self.shadow_quality_scorer.profile.profile_id}"
+                    )
+                except Exception as exc:
+                    print(
+                        "[Shadow Candidates] quality profile unavailable "
+                        f"(quality diagnostics disabled, capture "
+                        f"continues): {exc}"
                     )
 
         self.execution_quality_profile: Optional[
@@ -650,6 +679,7 @@ class Core:
         scorer: Optional[LiveShadowScorer],
         cost_profile: Optional[CostProfile],
         correlation_profile: Optional[PortfolioCorrelationProfile],
+        quality_scorer: Optional[LiveHierarchicalQualityScorer] = None,
     ) -> None:
         """Evaluate lower-priority candidates after live decisions are final.
 
@@ -738,6 +768,45 @@ class Core:
                         rankings,
                         model_id=ranking_model_id,
                     )
+                if (
+                    scan_id is not None
+                    and quality_scorer is not None
+                    and candidates
+                ):
+                    try:
+                        atr_h1: Optional[float] = None
+                        frame_1h = (
+                            job.get("strategy_data") or {}
+                        ).get("1H")
+                        if frame_1h is not None:
+                            raw_atr = float(
+                                NarrativeStrategy._atr(frame_1h, 14)
+                            )
+                            if math.isfinite(raw_atr) and raw_atr > 0.0:
+                                atr_h1 = raw_atr
+                        (
+                            quality_model_id,
+                            quality_rows,
+                        ) = build_quality_ledger_rows(
+                            symbol=symbol,
+                            candidates=candidates,
+                            observed_at_utc=job["observed_at_utc"],
+                            decision_bar_close=job["decision_bar_close"],
+                            scorer=quality_scorer,
+                            atr_h1_14=atr_h1,
+                        )
+                        ledger.record_quality_ranking(
+                            scan_id,
+                            quality_rows,
+                            model_id=quality_model_id,
+                        )
+                    except Exception as exc:
+                        # Quality diagnostics are fail-open on top of an
+                        # already fail-open batch: the scan row survives.
+                        print(
+                            f"[Shadow Candidates] {symbol} quality "
+                            f"scoring failed (execution unaffected): {exc}"
+                        )
             except Exception as exc:
                 # Diagnostic work is deliberately fail-open.
                 print(
@@ -792,6 +861,7 @@ class Core:
                     "shadow_candidate_correlation_profile",
                     None,
                 ),
+                getattr(self, "shadow_quality_scorer", None),
             )
         except Exception as exc:
             print(
