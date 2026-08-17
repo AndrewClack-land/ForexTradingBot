@@ -1168,6 +1168,13 @@ def _default_strategy_factory() -> Any:
 
 def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.risk_per_trade = config.risk_fraction
+    # The sealed research contract keeps exactly three 1R/2R/3R targets with
+    # 50/30/20 weights regardless of the live single-TP production flag.
+    # Migrating the backtest to the single-TP contract is a separate,
+    # explicitly approved change with its own frozen OOS evidence.
+    strategy.single_tp_mode = False
+    strategy.tp_rr_levels = [1.0, 2.0, 3.0]
+    strategy.rr_min = 1.5
     strategy.rejection_block_entry_enabled = (
         config.rejection_block_entry_enabled
     )
@@ -1187,6 +1194,9 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.fvg_veto_enabled = config.fvg_veto_enabled
     expected = {
         "risk_per_trade": config.risk_fraction,
+        "single_tp_mode": False,
+        "tp_rr_levels": [1.0, 2.0, 3.0],
+        "rr_min": 1.5,
         "rejection_block_entry_enabled": (
             config.rejection_block_entry_enabled
         ),

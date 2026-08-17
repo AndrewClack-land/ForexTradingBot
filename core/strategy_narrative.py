@@ -29,6 +29,10 @@ except Exception:
     _cfg = None
 
 ORDERBLOCK_ENTRY_ENABLED = bool(getattr(_cfg, "ORDERBLOCK_ENTRY_ENABLED", True))
+# Single-TP production contract. Absent config (e.g. the isolated backtest
+# release ships no config.py) falls back to the legacy three-target split.
+SINGLE_TP_MODE_ENABLED = bool(getattr(_cfg, "SINGLE_TP_MODE_ENABLED", False))
+SINGLE_TP_RR = float(getattr(_cfg, "SINGLE_TP_RR", 1.2))
 REJECTION_BLOCK_H1_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_H1_ENTRY_ENABLED", False)
 )
@@ -349,6 +353,17 @@ class NarrativeStrategy:
         # consistently reachable (the old fixed-% TP1 override made it swing
         # between 0.1R and 2.6R depending on stop width).
         self.tp_rr_levels = [1.0, 2.0, 3.0]
+
+        # Single-TP production contract: one aggregate target at
+        # 1:single_tp_rr for the whole position. The legacy split above stays
+        # in the code but inactive while this mode is on. The admission floor
+        # (rr_min) becomes the contract R/R itself — the dedicated rule for
+        # single-TP ideas — instead of the legacy multi-target 1.5 floor.
+        self.single_tp_mode = SINGLE_TP_MODE_ENABLED
+        self.single_tp_rr = SINGLE_TP_RR if SINGLE_TP_RR > 0 else 1.2
+        if self.single_tp_mode:
+            self.tp_rr_levels = [self.single_tp_rr]
+            self.rr_min = self.single_tp_rr
 
         # Turtle Soup (15M)
         self.ts_lookback_bars_15m = 20
@@ -1702,17 +1717,27 @@ class NarrativeStrategy:
             custom_stop=getattr(entry, "stop_override", None),
             symbol=symbol,
         )
-        weighted_rr = sum(
-            ratio * rr
-            for ratio, rr in zip(
-                (0.50, 0.30, 0.20),
-                self.tp_rr_levels,
+        if getattr(self, "single_tp_mode", False):
+            # One TP for the entire position: the aggregate R/R equals the
+            # single target's R/R by construction, and the same value is the
+            # dedicated admission floor for single-TP ideas.
+            weighted_rr = float(self.tp_rr_levels[0])
+            rr_text = (
+                f"TP 1:{weighted_rr:.2f} на весь объём "
+                f"(выделенное правило single-TP)"
             )
-        )
-        rr_text = (
-            f"TP 1R/2R/3R (weighted 1:{weighted_rr:.2f}; "
-            f"AI floor 1:{float(self.rr_min):.2f})"
-        )
+        else:
+            weighted_rr = sum(
+                ratio * rr
+                for ratio, rr in zip(
+                    (0.50, 0.30, 0.20),
+                    self.tp_rr_levels,
+                )
+            )
+            rr_text = (
+                f"TP 1R/2R/3R (weighted 1:{weighted_rr:.2f}; "
+                f"AI floor 1:{float(self.rr_min):.2f})"
+            )
         payload: Dict[str, Any] = {
             "signal": "ENTER",
             "side": entry.side,

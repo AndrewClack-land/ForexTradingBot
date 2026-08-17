@@ -97,12 +97,13 @@ class TelegramBot:
 
         stop = _fmt_price(symbol, float(sig["stop_price"]))
 
+        # Render exactly the TPs the signal carries: the single-TP contract
+        # sends one target for the whole position, the legacy split sends 3-4.
         tps = sig.get("tp_prices") or [sig.get("tp_price")]
         tps = [float(x) for x in tps if x is not None]
-        # show up to 4 tps if provided
-        while len(tps) < 3:
-            tps.append(tps[-1] if tps else float(sig.get("tp_price", sig["entry_price"])))
-        tps = tps[:4] if len(tps) >= 4 else tps[:3]
+        if not tps:
+            tps = [float(sig.get("tp_price", sig["entry_price"]))]
+        tps = tps[:4]
 
         lines = [
             f"{symbol} {arrow} {action}",
@@ -110,8 +111,11 @@ class TelegramBot:
             f"{entry_text}",
             "",
         ]
-        for i, tp in enumerate(tps, start=1):
-            lines.append(f"✅Тп {i}: {_fmt_price(symbol, tp)}")
+        if len(tps) == 1:
+            lines.append(f"✅Тп: {_fmt_price(symbol, tps[0])}")
+        else:
+            for i, tp in enumerate(tps, start=1):
+                lines.append(f"✅Тп {i}: {_fmt_price(symbol, tp)}")
         lines += ["", f"Стоп лос: {stop}"]
         return "\n".join(lines)
 
@@ -590,13 +594,18 @@ class TelegramBot:
             arrow, act = _side_to_text(r["side"])
             entry = _fmt_price(sym, r["entry"])
             stop = _fmt_price(sym, r["stop_current"])
-            tps = r.get("tp_prices") or []
-            tps = [float(x) for x in tps][:3]
-            while len(tps) < 3:
-                tps.append(tps[-1] if tps else float(r["entry"]))
-            tp1, tp2, tp3 = (_fmt_price(sym, tps[0]), _fmt_price(sym, tps[1]), _fmt_price(sym, tps[2]))
+            tps = [float(x) for x in (r.get("tp_prices") or [])][:4]
+            if not tps:
+                tps = [float(r["entry"])]
+            if len(tps) == 1:
+                tp_text = f"TP {_fmt_price(sym, tps[0])}"
+            else:
+                tp_text = " ".join(
+                    f"TP{i} {_fmt_price(sym, tp)}"
+                    for i, tp in enumerate(tps, start=1)
+                )
             lines.append(
-                f"{sym} {arrow} {act} | entry {entry} | stop {stop} | TP1 {tp1} TP2 {tp2} TP3 {tp3} | hit={r.get('tp_hit',0)}"
+                f"{sym} {arrow} {act} | entry {entry} | stop {stop} | {tp_text} | hit={r.get('tp_hit',0)}"
             )
 
         msg = "\n".join(lines)

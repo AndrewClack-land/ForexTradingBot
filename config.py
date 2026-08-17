@@ -509,6 +509,21 @@ EM_TP_MAX_RATIO = _env_float("EM_TP_MAX_RATIO", 1.0)
 # Recompute the vol context at most this often per symbol (RV moves slowly).
 VOL_REGIME_REFRESH_MIN = _env_int("VOL_REGIME_REFRESH_MIN") or 15
 
+# ================== SINGLE TP MODE ==================
+# Production TP contract since 2026-08-17: the whole position carries ONE
+# take-profit at an aggregate risk:reward of 1:SINGLE_TP_RR (e.g. $10 stop →
+# $12 target).  Signals in this mode are admitted under the dedicated
+# single-TP rule (the AI RR floor equals the contract R/R instead of the
+# legacy multi-target 1.5/1.3 floors) and Telegram shows a single TP line.
+# The legacy 1R/2R/3R 50/30/20 split stays in the code but inactive; set
+# SINGLE_TP_MODE_ENABLED=0 to fall back to it.  The sealed research backtest
+# keeps the legacy three-target contract regardless of this flag.
+SINGLE_TP_MODE_ENABLED = os.getenv(
+    "SINGLE_TP_MODE_ENABLED", "1"
+).strip().lower() in {"1", "true", "yes", "on"}
+_single_tp_rr = _env_float("SINGLE_TP_RR", 1.2)
+SINGLE_TP_RR = _single_tp_rr if _single_tp_rr > 0 else 1.2
+
 # ================== POSITION ADDING (PYRAMIDING) ==================
 # Stage extra entries into a working idea instead of one all-in setup.  All
 # split legs and all simultaneously risking entries share one fixed-capital
@@ -528,7 +543,13 @@ IDEA_MAX_RISK_PCT = min(
 )
 # An add-on needs the idea to have proven itself: price must be at least this
 # many R (of the previous entry) in profit before another entry is allowed.
-ADDON_MIN_PROGRESS_R = max(0.0, _env_float("ADDON_MIN_PROGRESS_R", 0.5))
+# Single-TP adaptation: with the whole position riding to 1:1.2 the add-on
+# window closes at ~0.6R (Kolachi rule below), so the legacy 0.5R minimum
+# would leave almost no room — the default drops to 0.25*SINGLE_TP_RR.
+ADDON_MIN_PROGRESS_R = max(0.0, _env_float(
+    "ADDON_MIN_PROGRESS_R",
+    round(0.25 * SINGLE_TP_RR, 4) if SINGLE_TP_MODE_ENABLED else 0.5,
+))
 # Kolachi pyramiding rule: past this share of the way from entry 1 to the final
 # TP the remaining reward no longer justifies a new entry's risk.
 ADDON_MAX_PROGRESS_PCT = min(max(_env_float("ADDON_MAX_PROGRESS_PCT", 0.5), 0.0), 1.0)
