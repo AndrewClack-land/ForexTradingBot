@@ -82,7 +82,13 @@ def test_official_request_contract_and_token_is_not_exposed() -> None:
         return _Response('[{"date":"2026-08-19","adjusted_close":100.5}]')
 
     token = "secret + token"
-    client = EodhdClient(token, timeout_seconds=7, opener=opener)
+    client = EodhdClient(
+        token,
+        timeout_seconds=7,
+        from_date=date(2015, 1, 1),
+        to_date=date(2026, 8, 19),
+        opener=opener,
+    )
     rows = client.fetch_daily("SPY")
 
     assert rows[0]["adjusted_close"] == 100.5
@@ -96,6 +102,8 @@ def test_official_request_contract_and_token_is_not_exposed() -> None:
         "fmt": ["json"],
         "period": ["d"],
         "order": ["a"],
+        "from": ["2015-01-01"],
+        "to": ["2026-08-19"],
     }
     assert timeout == 7
 
@@ -108,6 +116,21 @@ def test_official_request_contract_and_token_is_not_exposed() -> None:
         failing.fetch_daily("SPY")
     assert token not in str(caught.value)
     assert "secret+%2B+token" not in str(caught.value)
+
+
+def test_explicit_history_range_is_validated() -> None:
+    with pytest.raises(OrcaEodhdIngestError, match="to_date cannot precede"):
+        EodhdClient(
+            "token",
+            from_date=date(2026, 1, 2),
+            to_date=date(2026, 1, 1),
+        )
+
+    config = OrcaEodhdConfig(
+        output_path=Path("prices.parquet"),
+        history_start_date="2015-01-01",  # type: ignore[arg-type]
+    )
+    assert config.history_start_date == date(2015, 1, 1)
 
 
 def test_fetch_requires_every_exact_paper_symbol_in_order() -> None:
@@ -295,6 +318,7 @@ def test_systemd_artifacts_enforce_native_pipeline_contract() -> None:
     assert (
         "ORCA_EODHD_OUTPUT_PATH=/srv/forexbot-backtest/orca/prices.parquet"
     ) in environment
+    assert "ORCA_EODHD_START_DATE=2015-01-01" in environment
     assert "ORCA_EODHD_MIN_ALIGNED_ROWS=372" in environment
     assert "ORCA_EODHD_FFILL_LIMIT=5" in environment
     assert "ORCA_EODHD_AVAILABILITY_HOUR_UTC=12" in environment

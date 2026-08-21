@@ -33,6 +33,7 @@ from monitoring.orca_monitor import load_price_panel
 
 EODHD_ENDPOINT = "https://eodhd.com/api/eod"
 ORCA_EODHD_SCHEMA = "orca-eodhd-panel-v1"
+ORCA_EODHD_DEFAULT_START_DATE = date(2015, 1, 1)
 ORCA_PAPER_UNIVERSE = (
     "SPY",
     "QQQ",
@@ -82,6 +83,21 @@ def _positive_int(value: Any, *, name: str) -> int:
     return parsed
 
 
+def _calendar_date(value: Any, *, name: str) -> date:
+    if isinstance(value, datetime):
+        raise OrcaEodhdIngestError(f"{name} must be a calendar date")
+    if isinstance(value, date):
+        return value
+    raw = str(value or "").strip()
+    try:
+        parsed = date.fromisoformat(raw)
+    except ValueError as exc:
+        raise OrcaEodhdIngestError(f"{name} must be YYYY-MM-DD") from exc
+    if parsed.isoformat() != raw:
+        raise OrcaEodhdIngestError(f"{name} must be YYYY-MM-DD")
+    return parsed
+
+
 def _redact_secret(message: Any, secret: str) -> str:
     text = str(message)
     if not secret:
@@ -99,6 +115,7 @@ class OrcaEodhdConfig:
     ffill_limit: int = 5
     availability_hour_utc: int = 12
     timeout_seconds: float = 30.0
+    history_start_date: date = ORCA_EODHD_DEFAULT_START_DATE
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "output_path", Path(self.output_path))
@@ -122,6 +139,11 @@ class OrcaEodhdConfig:
         if not math.isfinite(timeout) or timeout <= 0.0:
             raise OrcaEodhdIngestError("timeout_seconds must be positive")
         object.__setattr__(self, "timeout_seconds", timeout)
+        object.__setattr__(
+            self,
+            "history_start_date",
+            _calendar_date(self.history_start_date, name="history_start_date"),
+        )
         if self.output_path.suffix.lower() not in {".csv", ".parquet", ".pq"}:
             raise OrcaEodhdIngestError("output_path must end in .csv, .parquet, or .pq")
 
@@ -134,6 +156,8 @@ class EodhdClient:
         api_token: str,
         *,
         timeout_seconds: float = 30.0,
+        from_date: Optional[date] = None,
+        to_date: Optional[date] = None,
         opener: Optional[Callable[..., Any]] = None,
     ) -> None:
         token = str(api_token or "").strip()
@@ -141,19 +165,36 @@ class EodhdClient:
             raise OrcaEodhdIngestError("EODHD_API_TOKEN is required")
         self._api_token = token
         self._timeout_seconds = float(timeout_seconds)
+        self._from_date = (
+            _calendar_date(from_date, name="from_date")
+            if from_date is not None
+            else None
+        )
+        self._to_date = (
+            _calendar_date(to_date, name="to_date") if to_date is not None else None
+        )
+        if (
+            self._from_date is not None
+            and self._to_date is not None
+            and self._to_date < self._from_date
+        ):
+            raise OrcaEodhdIngestError("to_date cannot precede from_date")
         self._opener = opener or urlopen
 
     def fetch_daily(self, ticker: str) -> list[Mapping[str, Any]]:
         if ticker not in ORCA_PAPER_UNIVERSE:
             raise OrcaEodhdIngestError(f"unsupported ORCA ticker {ticker!r}")
-        query = urlencode(
-            {
-                "api_token": self._api_token,
-                "fmt": "json",
-                "period": "d",
-                "order": "a",
-            }
-        )
+        parameters = {
+            "api_token": self._api_token,
+            "fmt": "json",
+            "period": "d",
+            "order": "a",
+        }
+        if self._from_date is not None:
+            parameters["from"] = self._from_date.isoformat()
+        if self._to_date is not None:
+            parameters["to"] = self._to_date.isoformat()
+        query = urlencode(parameters)
         url = f"{EODHD_ENDPOINT}/{ticker}.US?{query}"
         request = Request(
             url,
@@ -386,9 +427,13 @@ def refresh_eodhd_panel(
         as_of_utc or datetime.now(timezone.utc),
         name="as_of_utc",
     )
+    if config.history_start_date > as_of.date():
+        raise OrcaEodhdIngestError("history_start_date cannot follow as_of_utc")
     source = client or EodhdClient(
         api_token,
         timeout_seconds=config.timeout_seconds,
+        from_date=config.history_start_date,
+        to_date=as_of.date(),
     )
     responses = fetch_orca_universe(source)
     panel = build_aligned_eodhd_panel(
@@ -407,6 +452,8 @@ def refresh_eodhd_panel(
         "aligned_rows": len(panel),
         "available_from_utc": panel.index[0].isoformat(),
         "available_through_utc": panel.index[-1].isoformat(),
+        "requested_from": config.history_start_date.isoformat(),
+        "requested_to": as_of.date().isoformat(),
     }
 
 
@@ -441,6 +488,13 @@ def _parser() -> argparse.ArgumentParser:
         type=float,
         default=float(os.getenv("ORCA_EODHD_TIMEOUT_SECONDS", "30")),
     )
+    parser.add_argument(
+        "--history-start-date",
+        default=os.getenv(
+            "ORCA_EODHD_START_DATE",
+            ORCA_EODHD_DEFAULT_START_DATE.isoformat(),
+        ),
+    )
     return parser
 
 
@@ -454,6 +508,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             ffill_limit=arguments.ffill_limit,
             availability_hour_utc=arguments.availability_hour_utc,
             timeout_seconds=arguments.timeout_seconds,
+            history_start_date=arguments.history_start_date,
         )
         result = refresh_eodhd_panel(api_token=token, config=config)
     except Exception as exc:
@@ -477,6 +532,7 @@ if __name__ == "__main__":  # pragma: no cover - CLI wrapper
 
 __all__ = [
     "EODHD_ENDPOINT",
+    "ORCA_EODHD_DEFAULT_START_DATE",
     "ORCA_EODHD_SCHEMA",
     "ORCA_PAPER_UNIVERSE",
     "EodhdClient",
