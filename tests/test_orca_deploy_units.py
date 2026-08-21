@@ -33,7 +33,7 @@ def test_orca_units_fail_closed_on_missing_inputs() -> None:
     assert f"ConditionPathExists={PANEL}" in monitor
     assert f"ConditionPathExists={PANEL}" in prediction
     assert (
-        "ConditionPathExists=/srv/forexbot-backtest/orca/promoted/orca-rf.json"
+        "ConditionPathExists=/opt/forexbot-orca/models/orca-rf.json"
     ) in prediction
     assert "StateDirectory=forexbot-orca" in monitor
     assert "StateDirectory=forexbot-orca" in prediction

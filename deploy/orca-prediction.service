@@ -5,7 +5,7 @@ Wants=network-online.target
 Before=orca-monitor.service
 ConditionPathExists=/etc/forexbot-orca/orca-prediction.env
 ConditionPathExists=/srv/forexbot-backtest/orca/prices.parquet
-ConditionPathExists=/srv/forexbot-backtest/orca/promoted/orca-rf.json
+ConditionPathExists=/opt/forexbot-orca/models/orca-rf.json
 
 [Service]
 Type=oneshot

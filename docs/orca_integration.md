@@ -108,6 +108,8 @@ requirements-orca-runtime.txt:
 
 Real environment files live under /etc/forexbot-orca, outside the immutable
 application release. Do not enable the timers until an EODHD token, a complete
-panel, a manually promoted WFO artifact, the artifact SHA-256 and the full
-feature-registry SHA-256 are present. Missing or mismatched inputs are
-unavailable, never an implicit low-risk regime.
+panel, a manually promoted WFO artifact under the root-owned
+/opt/forexbot-orca/models directory, the artifact SHA-256 and the full
+feature-registry SHA-256 are present. The ingestor cannot write that model
+directory. Missing or mismatched inputs are unavailable, never an implicit
+low-risk regime.
