@@ -48,6 +48,8 @@ from config import (
     SHADOW_CANDIDATE_LEDGER_DB_PATH,
     SHADOW_CANDIDATE_COST_PROFILE_PATH,
     SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH,
+    SHADOW_RF_PROFILE_PATH,
+    SHADOW_RF_ORCA_SNAPSHOT_PATH,
     SHADOW_QUALITY_PROFILE_PATH,
     EXECUTION_QUALITY_FILTER_ENABLED,
     EXECUTION_QUALITY_PROFILE_PATH,
@@ -155,6 +157,8 @@ from core.hierarchical_quality_score import (
     LiveHierarchicalQualityScorer,
 )
 from core.quality_shadow_bridge import build_quality_ledger_rows
+from core.rf_candidate_contract import SINGLE_TP_TARGET_CONTRACT
+from core.rf_shadow_bridge import RFShadowBridge
 from executors.mt5_executor import (
     MT5Executor,
     MT5Settings,
@@ -397,6 +401,7 @@ class Core:
         self.shadow_quality_scorer: Optional[
             LiveHierarchicalQualityScorer
         ] = None
+        self.shadow_rf_bridge: Optional[RFShadowBridge] = None
         if SHADOW_CANDIDATE_LEDGER_ENABLED:
             try:
                 self.shadow_candidate_ledger = ShadowCandidateLedger(
@@ -447,6 +452,45 @@ class Core:
                         "[Shadow Candidates] correlation profile unavailable "
                         f"(ranking disabled, capture continues): {exc}"
                     )
+            if SHADOW_RF_PROFILE_PATH is not None:
+                if self.shadow_candidate_cost_profile is None:
+                    print(
+                        "[Shadow RF] profile configured without a valid cost "
+                        "profile; RF diagnostics unavailable"
+                    )
+                else:
+                    try:
+                        self.shadow_rf_bridge = RFShadowBridge.load(
+                            SHADOW_RF_PROFILE_PATH,
+                            cost_profile=self.shadow_candidate_cost_profile,
+                            expected_strategy_version=(
+                                os.getenv(
+                                    "STRATEGY_VERSION",
+                                    "unversioned",
+                                ).strip()
+                                or "unversioned"
+                            ),
+                            expected_factor_contract=(
+                                self.strategy.factor_contract
+                            ),
+                            expected_target_contract=(
+                                SINGLE_TP_TARGET_CONTRACT
+                            ),
+                            orca_snapshot_path=(
+                                SHADOW_RF_ORCA_SNAPSHOT_PATH
+                            ),
+                        )
+                        print(
+                            "[Shadow RF] diagnostic candidate scorer loaded: "
+                            f"{self.shadow_rf_bridge.model_id} "
+                            "(non-executing)"
+                        )
+                    except Exception as exc:
+                        self.shadow_rf_bridge = None
+                        print(
+                            "[Shadow RF] profile unavailable "
+                            f"(execution unaffected): {exc}"
+                        )
             if SHADOW_QUALITY_PROFILE_PATH is not None:
                 try:
                     self.shadow_quality_scorer = (
@@ -680,6 +724,7 @@ class Core:
         cost_profile: Optional[CostProfile],
         correlation_profile: Optional[PortfolioCorrelationProfile],
         quality_scorer: Optional[LiveHierarchicalQualityScorer] = None,
+        rf_bridge: Optional[RFShadowBridge] = None,
     ) -> None:
         """Evaluate lower-priority candidates after live decisions are final.
 
@@ -744,6 +789,22 @@ class Core:
                         candidate["shadow_portfolio_score"] = ranking[
                             "ranking_score"
                         ]
+                if rf_bridge is not None and candidates:
+                    try:
+                        candidates = rf_bridge.enrich_candidates(
+                            symbol=symbol,
+                            candidates=candidates,
+                            observed_at_utc=job["observed_at_utc"],
+                            decision_bar_close=job[
+                                "decision_bar_close"
+                            ],
+                            strategy_data=job.get("strategy_data"),
+                        )
+                    except Exception as exc:
+                        print(
+                            f"[Shadow RF] {symbol} scoring failed "
+                            f"(execution unaffected): {exc}"
+                        )
                 scan_id = ledger.record_scan(
                     deployment_id=str(job["deployment_id"]),
                     symbol=symbol,
@@ -862,6 +923,7 @@ class Core:
                     None,
                 ),
                 getattr(self, "shadow_quality_scorer", None),
+                getattr(self, "shadow_rf_bridge", None),
             )
         except Exception as exc:
             print(

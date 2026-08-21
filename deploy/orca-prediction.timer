@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh frozen ORCA prediction before the 12-hour monitor cycle
+
+[Timer]
+OnCalendar=*-*-* 00,12:30:00 UTC
+Persistent=true
+AccuracySec=1min
+RandomizedDelaySec=0
+Unit=orca-prediction.service
+
+[Install]
+WantedBy=timers.target

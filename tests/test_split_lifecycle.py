@@ -159,6 +159,8 @@ def test_delayed_deal_history_retries_then_moves_be_after_retrace(monkeypatch):
         close_info={201: [None, _tp_close(), _tp_close()]},
     )
     core = _core(executor, trade)
+    monkeypatch.setattr(core, "_is_friday_weekend_close", lambda: False)
+    monkeypatch.setattr(core, "_is_daily_flat_close", lambda: False)
     monkeypatch.setattr(main, "MOVE_BE_AFTER_TP1", True)
     monkeypatch.setattr(main, "save_active_trades", lambda *args, **kwargs: None)
 
@@ -182,6 +184,8 @@ def test_final_broker_exit_is_emitted_once(monkeypatch):
     trade = _trade(301)
     executor = FakeExecutor(open_ids=set(), close_info={301: _tp_close()})
     core = _core(executor, trade)
+    monkeypatch.setattr(core, "_is_friday_weekend_close", lambda: False)
+    monkeypatch.setattr(core, "_is_daily_flat_close", lambda: False)
     registered = []
     core._register_broker_close = lambda symbol, tr, sig: registered.append(symbol)
     core._log_signal = lambda *args, **kwargs: None

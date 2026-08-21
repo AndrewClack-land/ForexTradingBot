@@ -1,0 +1,296 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ORCA correlation monitor</title>
+  <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: #09111f;
+      --surface: #111c2e;
+      --surface-2: #16243a;
+      --text: #e9f0fa;
+      --muted: #9fb0c7;
+      --line: #263a55;
+      --positive: #2bc3a4;
+      --negative: #ff6b7a;
+      --warning: #f4bd55;
+      --accent: #7aa7ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at 25% 0%, #142746 0, var(--bg) 44%);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    header, main { width: min(1440px, calc(100% - 32px)); margin: 0 auto; }
+    header {
+      display: flex;
+      align-items: end;
+      justify-content: space-between;
+      gap: 24px;
+      padding: 24px 0 16px;
+      border-bottom: 1px solid var(--line);
+    }
+    h1 { margin: 0; font-size: clamp(22px, 3vw, 34px); font-weight: 600; }
+    h2 { margin: 0 0 12px; font-size: 16px; font-weight: 600; }
+    .subtitle, .updated { color: var(--muted); }
+    .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: end; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; }
+    select {
+      min-width: 148px;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: var(--surface-2);
+      color: var(--text);
+      padding: 8px 10px;
+    }
+    main { padding: 18px 0 36px; }
+    .metrics {
+      display: grid;
+      grid-template-columns: repeat(6, minmax(120px, 1fr));
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+    .metric, .panel {
+      background: color-mix(in srgb, var(--surface) 92%, transparent);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    .metric { padding: 12px; min-height: 82px; }
+    .metric span { display: block; color: var(--muted); font-size: 12px; }
+    .metric strong { display: block; margin-top: 6px; font-size: 20px; font-weight: 600; }
+    .layout { display: grid; grid-template-columns: minmax(0, 2fr) minmax(300px, 1fr); gap: 14px; }
+    .panel { padding: 14px; min-width: 0; }
+    #network { height: min(72vh, 760px); min-height: 500px; }
+    #spectrum { height: 310px; }
+    .facts { margin: 0; display: grid; grid-template-columns: 1fr auto; gap: 8px 16px; }
+    .facts dt { color: var(--muted); }
+    .facts dd { margin: 0; text-align: right; font-variant-numeric: tabular-nums; }
+    .note { color: var(--muted); font-size: 12px; margin: 12px 0 0; }
+    .error { color: var(--negative); padding: 20px 0; }
+    @media (max-width: 1000px) {
+      header { align-items: start; flex-direction: column; }
+      .metrics { grid-template-columns: repeat(3, 1fr); }
+      .layout { grid-template-columns: 1fr; }
+      #network { height: 620px; }
+    }
+    @media (max-width: 620px) {
+      header, main { width: min(100% - 20px, 1440px); }
+      .metrics { grid-template-columns: repeat(2, 1fr); }
+      #network { height: 500px; min-height: 420px; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>ORCA correlation monitor</h1>
+      <div class="subtitle">Signed cross-asset topology and causal regime context</div>
+    </div>
+    <div class="controls">
+      <label>Estimator
+        <select id="estimator"></select>
+      </label>
+      <label>|Correlation| threshold
+        <select id="threshold">
+          <option value="0.3">0.30</option>
+          <option value="0.5" selected>0.50</option>
+          <option value="0.7">0.70</option>
+        </select>
+      </label>
+      <div class="updated" id="updated">Loading...</div>
+    </div>
+  </header>
+  <main>
+    <div id="error" class="error" hidden></div>
+    <section class="metrics" aria-label="Current regime metrics">
+      <div class="metric"><span>Regime</span><strong id="regime">N/A</strong></div>
+      <div class="metric"><span>Risk mode</span><strong id="riskMode">N/A</strong></div>
+      <div class="metric"><span id="pRallyLabel">Rally model score</span><strong id="pRally">N/A</strong></div>
+      <div class="metric"><span id="pCrashLabel">Crash model score</span><strong id="pCrash">N/A</strong></div>
+      <div class="metric"><span>BCD-AUC (OOS)</span><strong id="bcdAuc">N/A</strong></div>
+      <div class="metric"><span>Absorption ratio AR1</span><strong id="ar1">N/A</strong></div>
+      <div class="metric"><span>Effective rank</span><strong id="effectiveRank">N/A</strong></div>
+    </section>
+    <div class="layout">
+      <section class="panel">
+        <h2>Three-dimensional signed correlation network</h2>
+        <div id="network" role="img" aria-label="3D correlation network"></div>
+        <p class="note">Coordinates are deterministic spectral layout coordinates, not economic axes. Node size is dominant-eigenvector centrality; green and red edges preserve correlation sign.</p>
+      </section>
+      <div>
+        <section class="panel">
+          <h2>Eigenvalue spectrum</h2>
+          <div id="spectrum" role="img" aria-label="Eigenvalue spectrum"></div>
+        </section>
+        <section class="panel" style="margin-top:14px">
+          <h2>Snapshot lineage</h2>
+          <dl class="facts">
+            <dt>Freshness</dt><dd id="freshness">N/A</dd>
+            <dt>Market as-of</dt><dd id="marketAsOf">N/A</dd>
+            <dt>Assets</dt><dd id="assetCount">N/A</dd>
+            <dt>Model</dt><dd id="modelId">N/A</dd>
+            <dt>Calibration</dt><dd id="calibration">N/A</dd>
+            <dt>Feature registry</dt><dd id="registry">N/A</dd>
+          </dl>
+        </section>
+      </div>
+    </div>
+  </main>
+  <script>
+    const state = { snapshot: null, refreshPending: false };
+    const NA = "N/A";
+    const fmtProb = value => Number.isFinite(value) ? `${(100 * value).toFixed(1)}%` : NA;
+    const fmt = (value, digits = 3) => Number.isFinite(value) ? Number(value).toFixed(digits) : NA;
+    const text = (id, value) => { document.getElementById(id).textContent = value ?? NA; };
+    const safeLabel = value => String(value ?? "").replace(/[<>&"]/g, "");
+
+    function showError(message) {
+      const target = document.getElementById("error");
+      target.textContent = message;
+      target.hidden = false;
+    }
+
+    function selectedNetwork() {
+      if (!state.snapshot) return null;
+      const name = document.getElementById("estimator").value;
+      return state.snapshot.networks.find(item => item.estimator === name) || state.snapshot.networks[0];
+    }
+
+    function draw() {
+      const network = selectedNetwork();
+      if (!network) return;
+      if (typeof window.Plotly === "undefined") {
+        showError("Plotly failed to load; snapshot metrics remain available.");
+        return;
+      }
+
+      const threshold = Number(document.getElementById("threshold").value);
+      const symbols = Array.isArray(network.symbols) ? network.symbols : [];
+      const coordinateMap = network.node_coordinates_3d || {};
+      const nodes = symbols.map((symbol, index) => {
+        const coordinate = coordinateMap[symbol];
+        const vectorRow = Array.isArray(network.eigenvectors?.[index]) ? network.eigenvectors[index] : [];
+        return {
+          symbol: String(symbol),
+          label: safeLabel(symbol),
+          x: Number(coordinate?.[0]),
+          y: Number(coordinate?.[1]),
+          z: Number(coordinate?.[2]),
+          centrality: Math.abs(Number(vectorRow[0]) || 0)
+        };
+      }).filter(node => [node.x, node.y, node.z].every(Number.isFinite));
+      const coordinates = new Map(nodes.map(item => [item.symbol, item]));
+      const edgeSets = network.signed_edges || {};
+      const thresholdKey = Object.keys(edgeSets).find(key => Math.abs(Number(key) - threshold) < 1e-9);
+      const edges = thresholdKey && Array.isArray(edgeSets[thresholdKey]) ? edgeSets[thresholdKey] : [];
+      const positive = { x: [], y: [], z: [] };
+      const negative = { x: [], y: [], z: [] };
+      edges.forEach(edge => {
+        const source = coordinates.get(String(edge.source));
+        const target = coordinates.get(String(edge.target));
+        if (!source || !target || Number(edge.absolute_correlation) < threshold) return;
+        const bucket = Number(edge.correlation) >= 0 ? positive : negative;
+        bucket.x.push(source.x, target.x, null);
+        bucket.y.push(source.y, target.y, null);
+        bucket.z.push(source.z, target.z, null);
+      });
+      const centrality = nodes.map(item => item.centrality);
+      const maximum = Math.max(...centrality, 1e-9);
+      const nodeSizes = centrality.map(value => 7 + 22 * Math.sqrt(value / maximum));
+      const traces = [
+        { type: "scatter3d", mode: "lines", x: positive.x, y: positive.y, z: positive.z, hoverinfo: "skip", name: "Positive correlation", line: { color: "#2bc3a4", width: 2 } },
+        { type: "scatter3d", mode: "lines", x: negative.x, y: negative.y, z: negative.z, hoverinfo: "skip", name: "Negative correlation", line: { color: "#ff6b7a", width: 2 } },
+        {
+          type: "scatter3d", mode: "markers+text", name: "Assets",
+          x: nodes.map(item => item.x), y: nodes.map(item => item.y), z: nodes.map(item => item.z),
+          text: nodes.map(item => item.label), textposition: "top center",
+          hovertemplate: "%{text}<extra></extra>",
+          marker: { size: nodeSizes, color: centrality, colorscale: "Blues", opacity: 0.96, line: { color: "#e9f0fa", width: 0.5 }, colorbar: { title: "Dominant loading", thickness: 10 } }
+        }
+      ];
+      const axis = { title: "layout", showgrid: false, zeroline: false, showticklabels: false };
+      window.Plotly.react("network", traces, {
+        paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)",
+        font: { color: "#e9f0fa" }, margin: { l: 0, r: 0, t: 6, b: 0 },
+        legend: { orientation: "h", x: 0, y: 1.02 },
+        scene: { xaxis: axis, yaxis: axis, zaxis: axis, bgcolor: "rgba(0,0,0,0)", aspectmode: "cube" }
+      }, { responsive: true, displaylogo: false });
+      window.Plotly.react("spectrum", [{
+        type: "bar", x: network.eigenvalues.map((_, index) => `lambda ${index + 1}`), y: network.eigenvalues,
+        marker: { color: "#7aa7ff" }, hovertemplate: "%{x}: %{y:.4f}<extra></extra>"
+      }], {
+        paper_bgcolor: "rgba(0,0,0,0)", plot_bgcolor: "rgba(0,0,0,0)", font: { color: "#e9f0fa" },
+        margin: { l: 48, r: 8, t: 6, b: 42 },
+        xaxis: { title: "Component", gridcolor: "#263a55" },
+        yaxis: { title: "Eigenvalue", gridcolor: "#263a55" }
+      }, { responsive: true, displaylogo: false });
+      const ar = network.absorption_ratios || {};
+      text("ar1", fmt(ar["1"]));
+      text("effectiveRank", fmt(network.effective_rank));
+    }
+
+    function populate(snapshot) {
+      if (snapshot?.schema_version !== "orca-monitor-snapshot-v1" || snapshot.executing !== false) {
+        throw new Error("unsupported or unsafe snapshot schema");
+      }
+      if (!Array.isArray(snapshot.networks) || snapshot.networks.length === 0) {
+        throw new Error("snapshot contains no spectral networks");
+      }
+      state.snapshot = snapshot;
+      const estimator = document.getElementById("estimator");
+      const previous = estimator.value;
+      estimator.replaceChildren(...snapshot.networks.map(item => {
+        const option = document.createElement("option");
+        option.value = safeLabel(item.estimator);
+        option.textContent = safeLabel(item.estimator);
+        return option;
+      }));
+      if ([...estimator.options].some(option => option.value === previous)) estimator.value = previous;
+
+      const calibration = String(snapshot.model?.calibration_status || "UNAVAILABLE");
+      const calibrated = calibration === "CALIBRATED" || calibration.startsWith("CALIBRATED_");
+      text("pRallyLabel", calibrated ? "Calibrated rally probability" : "Rally model score (uncalibrated)");
+      text("pCrashLabel", calibrated ? "Calibrated crash probability" : "Crash model score (uncalibrated)");
+      text("regime", snapshot.regime);
+      text("riskMode", snapshot.risk_mode);
+      text("pRally", fmtProb(snapshot.model?.p_rally));
+      text("pCrash", fmtProb(snapshot.model?.p_crash));
+      const validation = snapshot.model?.validation || {};
+      const bcdAuc = typeof validation.bcd_auc === "object" ? validation.bcd_auc?.bcd_auc : validation.bcd_auc;
+      text("bcdAuc", fmt(bcdAuc));
+      text("freshness", snapshot.freshness);
+      text("marketAsOf", snapshot.as_of_market_utc);
+      text("assetCount", `${snapshot.asset_count} / ${snapshot.expected_assets}`);
+      text("modelId", snapshot.model?.model_id || snapshot.model?.status || NA);
+      text("calibration", calibration);
+      text("registry", snapshot.feature_registry_hash?.slice(0, 12) || NA);
+      text("updated", `Updated ${snapshot.generated_at_utc}`);
+      draw();
+    }
+
+    async function refresh() {
+      if (state.refreshPending) return;
+      state.refreshPending = true;
+      try {
+        const response = await fetch("/api/snapshot", { cache: "no-store" });
+        if (!response.ok) throw new Error(`HTTP ${response.status}`);
+        populate(await response.json());
+        document.getElementById("error").hidden = true;
+      } catch (error) {
+        showError(`Snapshot unavailable: ${error instanceof Error ? error.message : String(error)}`);
+      } finally {
+        state.refreshPending = false;
+      }
+    }
+    document.getElementById("estimator").addEventListener("change", draw);
+    document.getElementById("threshold").addEventListener("change", draw);
+    refresh();
+    setInterval(refresh, 30_000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,2 @@
+-r requirements-backtest.txt
+scikit-learn==1.8.0

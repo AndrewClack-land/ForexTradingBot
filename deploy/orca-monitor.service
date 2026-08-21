@@ -1,0 +1,28 @@
+[Unit]
+Description=ORCA cross-asset regime monitor
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/forexbot-orca/orca-monitor.env
+ConditionPathExists=/srv/forexbot-backtest/orca/prices.parquet
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forexbot
+EnvironmentFile=/etc/forexbot-orca/orca-monitor.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/forexbot-orca/venv/bin/python -m monitoring.orca_monitor
+Restart=on-failure
+RestartSec=20
+TimeoutStopSec=15
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+StateDirectory=forexbot-orca
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/forexbot-orca
+UMask=0027
+
+[Install]
+WantedBy=multi-user.target

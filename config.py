@@ -130,6 +130,24 @@ SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH = (
     if _SHADOW_CANDIDATE_CORRELATION_PROFILE_PATH
     else None
 )
+_SHADOW_RF_PROFILE_PATH = os.getenv(
+    "SHADOW_RF_PROFILE_PATH",
+    "",
+).strip()
+SHADOW_RF_PROFILE_PATH = (
+    Path(_SHADOW_RF_PROFILE_PATH)
+    if _SHADOW_RF_PROFILE_PATH
+    else None
+)
+_SHADOW_RF_ORCA_SNAPSHOT_PATH = os.getenv(
+    "SHADOW_RF_ORCA_SNAPSHOT_PATH",
+    "",
+).strip()
+SHADOW_RF_ORCA_SNAPSHOT_PATH = (
+    Path(_SHADOW_RF_ORCA_SNAPSHOT_PATH)
+    if _SHADOW_RF_ORCA_SNAPSHOT_PATH
+    else None
+)
 # Optional hierarchical quality calibration. Consumers must keep it
 # diagnostic-only; the production waterfall remains authoritative.
 _SHADOW_QUALITY_PROFILE_PATH = os.getenv(

@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh the causal ORCA EODHD panel twice daily
+
+[Timer]
+Unit=orca-eodhd.service
+OnCalendar=*-*-* 00:15:00 UTC
+OnCalendar=*-*-* 12:15:00 UTC
+Persistent=true
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

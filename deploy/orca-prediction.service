@@ -1,0 +1,26 @@
+[Unit]
+Description=Publish frozen non-executing ORCA regime prediction
+After=network-online.target
+Wants=network-online.target
+Before=orca-monitor.service
+ConditionPathExists=/etc/forexbot-orca/orca-prediction.env
+ConditionPathExists=/srv/forexbot-backtest/orca/prices.parquet
+ConditionPathExists=/srv/forexbot-backtest/orca/promoted/orca-rf.json
+
+[Service]
+Type=oneshot
+User=ubuntu
+WorkingDirectory=/home/ubuntu/forexbot
+EnvironmentFile=/etc/forexbot-orca/orca-prediction.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/forexbot-orca/venv/bin/python -m monitoring.orca_prediction
+TimeoutStartSec=30min
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateNetwork=true
+ProtectSystem=strict
+ProtectHome=read-only
+StateDirectory=forexbot-orca
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/forexbot-orca
+UMask=0027
