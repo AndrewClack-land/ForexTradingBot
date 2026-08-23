@@ -28,8 +28,16 @@ causal backtesting, attribution semantics, and VPS release discipline.
 | **Premium/Discount 1H** — последний закрытый 15M close внутри диапазона последней закрытой H1-свечи | +2 |
 | **Ложный пробой фрактала 4H** — свеча проколола уровень, но закрылась внутри (разворот) | +2 |
 | **Истинный пробой фрактала 15M** — закрытие за уровнем (продолжение) | +1 |
+| **Ложный пробой фрактала 1H** — прокол уровня с возвратом внутрь | +1 |
+| **Истинный пробой фрактала 1H** — закрытие за уровнем | +1 |
 | **Ордерблок (OB)** на 1H — сторона последнего активного блока | +1 |
 | **Rejection Block (RB)** на 1H — последний валидный неповреждённый блок | +1 |
+
+Две строки по 1H-фракталу происходят из одного сканирования, разведённого по типу
+события, поэтому взаимоисключающи: на одном решении голосует максимум одна из них.
+На запечатанной истории EURUSD 1H одна из пары присутствует примерно на `90%`
+решений при почти равном делении LONG/SHORT — то есть пара ведёт себя скорее как
+постоянно голосующий фактор, чем как редкое подтверждение.
 
 Bias принимается при перевесе голосов ≥ `HTF_SCORE_MARGIN` (по умолчанию 2).
 Строгость регулирует **FVG-режим 1H** (LuxAlgo Instantaneous Mitigation): против
@@ -167,8 +175,16 @@ timeframes (`core/strategy_narrative.py: calc_narrative`):
 | **1H Premium/Discount** — latest closed 15M close inside the latest closed H1 candle range | +2 |
 | **4H fractal false breakout** — wick pierced the level, close back inside (reversal) | +2 |
 | **15M fractal true breakout** — close beyond the level (continuation) | +1 |
+| **1H fractal false breakout** — wick pierced the level, close back inside | +1 |
+| **1H fractal true breakout** — close beyond the level | +1 |
 | **Order Block (OB)** on 1H — side of the most recent active block | +1 |
 | **Rejection Block (RB)** on 1H — most recent valid, unbroken block | +1 |
+
+The two 1H fractal rows come from a single scan routed by kind, so they are
+mutually exclusive: at most one votes on any decision. On the sealed EURUSD 1H
+history one of the pair is present on roughly `90%` of decisions with a near
+even LONG/SHORT split, so the pair behaves more like an always-voting factor
+than a rare confirmation.
 
 Bias is accepted once the vote margin reaches `HTF_SCORE_MARGIN` (default 2).
 Strictness is regulated by the **1H FVG regime** (LuxAlgo Instantaneous Mitigation):

@@ -81,6 +81,8 @@ def test_expired_regime_restores_the_symmetric_base_margin():
         ),
         false_breakout_4h=None,
         true_breakout_15m=None,
+        false_breakout_1h=None,
+        true_breakout_1h=None,
         order_blocks=[],
         rejection_blocks=[],
     )

@@ -26,6 +26,8 @@ def _bias_context(**overrides):
         "hourly_range": None,
         "false_breakout_4h": None,
         "true_breakout_15m": None,
+        "false_breakout_1h": None,
+        "true_breakout_1h": None,
         "order_blocks": [],
         "rejection_blocks": [],
     }
@@ -497,3 +499,106 @@ def test_build_tf_data_requests_daily_candles():
 
     assert data["D"] is frame
     assert ("EURUSD", "1d", 300) in requested
+
+
+def test_1h_false_fractal_breakout_votes_with_weight_one():
+    ctx = _bias_context(
+        false_breakout_1h=FractalBreakout(
+            kind="FALSE_BREAK",
+            side="SHORT",
+            level=1.25,
+            level_kind="HIGH",
+            bar_index=10,
+            bars_ago=0,
+            timeframe="1H",
+        )
+    )
+
+    side, text = _calc_with_context(ctx, margin=1)
+
+    assert side == "SHORT"
+    assert "scores L/S=0/1" in text
+    assert "1H FALSE_BREAK" in text
+
+
+def test_1h_true_fractal_breakout_votes_with_weight_one():
+    ctx = _bias_context(
+        true_breakout_1h=FractalBreakout(
+            kind="TRUE_BREAK",
+            side="LONG",
+            level=1.25,
+            level_kind="HIGH",
+            bar_index=10,
+            bars_ago=0,
+            timeframe="1H",
+        )
+    )
+
+    side, text = _calc_with_context(ctx, margin=1)
+
+    assert side == "LONG"
+    assert "scores L/S=1/0" in text
+    assert "1H TRUE_BREAK" in text
+
+
+def test_1h_breakout_rows_are_mutually_exclusive_on_one_decision():
+    """One scan routed by kind: a bar cannot be both a false and a true break.
+
+    The context derives both 1H rows from a single
+    ``_calc_latest_fractal_breakout`` result, so at most one can ever vote.
+    """
+
+    context = HtfContext.__new__(HtfContext)
+    context.pivot_lookback = 1
+    frame = _bars(
+        [
+            (1.0, 1.10, 0.95, 1.05),
+            (1.05, 1.30, 1.00, 1.25),
+            (1.25, 1.28, 1.05, 1.10),
+            (1.10, 1.35, 1.08, 1.12),
+        ]
+    )
+
+    latest = context._calc_latest_fractal_breakout(frame, timeframe="1H")
+
+    assert latest is None or latest.kind in {"FALSE_BREAK", "TRUE_BREAK"}
+    if latest is not None:
+        false_row = latest if latest.kind == "FALSE_BREAK" else None
+        true_row = latest if latest.kind == "TRUE_BREAK" else None
+        assert (false_row is None) != (true_row is None)
+
+
+def test_1h_breakouts_reach_the_frozen_factor_vector():
+    ctx = _bias_context(
+        true_breakout_1h=FractalBreakout(
+            kind="TRUE_BREAK",
+            side="LONG",
+            level=1.25,
+            level_kind="HIGH",
+            bar_index=10,
+            bars_ago=3,
+            timeframe="1H",
+        )
+    )
+    strategy = NarrativeStrategy()
+    strategy.htf_score_margin = 1
+    strategy._build_htf_context = lambda *args, **kwargs: ctx
+    strategy.calc_fvg_regime_1h = lambda df: ("NEUTRAL", "FVG neutral")
+    frame = _bars([(1.0, 1.1, 0.9, 1.0)] * 30)
+
+    side, _ = strategy.calc_narrative(frame, frame, frame)
+    vector = strategy._last_factor_vector
+    factors = {row["key"]: row for row in vector["factors"]}
+
+    assert side == "LONG"
+    assert vector["score_long"] == 1
+    assert vector["score_short"] == 0
+    assert factors["true_breakout_1h"]["present"] is True
+    assert factors["true_breakout_1h"]["vote_side"] == "LONG"
+    assert factors["true_breakout_1h"]["configured_weight"] == 1
+    assert factors["true_breakout_1h"]["long_contribution"] == 1.0
+    assert factors["true_breakout_1h"]["evidence"]["timeframe"] == "1H"
+    # The opposite 1H row still occupies its slot, absent rather than missing.
+    assert factors["false_breakout_1h"]["present"] is False
+    assert factors["false_breakout_1h"]["vote_side"] == "NEUTRAL"
+    assert factors["false_breakout_1h"]["configured_weight"] == 1

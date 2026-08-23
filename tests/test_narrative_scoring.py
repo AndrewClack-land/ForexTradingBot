@@ -247,6 +247,8 @@ def test_challenger_weights_are_the_agreed_contract():
         "h1_premium_discount": 1,
         "false_breakout_4h": 2,
         "true_breakout_15m": 1,
+        "false_breakout_1h": 1,
+        "true_breakout_1h": 1,
         "order_block_1h": 2,
         "rejection_block_1h": 1,
         "fvg_regime_1h": 1,
@@ -256,10 +258,16 @@ def test_challenger_weights_are_the_agreed_contract():
         "h1_premium_discount": 2,
         "false_breakout_4h": 2,
         "true_breakout_15m": 1,
+        "false_breakout_1h": 1,
+        "true_breakout_1h": 1,
         "order_block_1h": 1,
         "rejection_block_1h": 1,
         "fvg_regime_1h": 0,
     }
+    # The 1H breakout rows are live votes, so both arms carry them at +1 and
+    # the arms still differ only by the FVG row's promotion to a vote.
+    assert sum(legacy.values()) == 9
+    assert sum(contract["weights"].values()) == 10
 
 
 def test_unknown_factor_contract_fails_closed():

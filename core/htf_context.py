@@ -404,12 +404,28 @@ class HtfContext:
         self.rejection_blocks: List[RejectionBlock] = []
         self.false_breakout_4h: Optional[FractalBreakout] = None
         self.true_breakout_15m: Optional[FractalBreakout] = None
+        self.false_breakout_1h: Optional[FractalBreakout] = None
+        self.true_breakout_1h: Optional[FractalBreakout] = None
 
         if self.df_1h is not None and not self.df_1h.empty:
             self.fractals = self._calc_fractals()
             self.hourly_range = self._calc_hourly_range()
             self.order_blocks = self.ob_tracker.build(self.df_1h)
             self.rejection_blocks = self.rb_tracker.build(self.df_1h)
+            # One scan, routed by kind. ``_calc_latest_fractal_breakout``
+            # returns the single most recent interaction of either kind, so
+            # the two 1H factors are mutually exclusive by construction --
+            # exactly like the 4H and 15M rows, which filter the same single
+            # event. They can never both vote on one decision.
+            latest_1h_breakout = self._calc_latest_fractal_breakout(
+                self.df_1h,
+                timeframe="1H",
+            )
+            if latest_1h_breakout is not None:
+                if latest_1h_breakout.kind == "FALSE_BREAK":
+                    self.false_breakout_1h = latest_1h_breakout
+                elif latest_1h_breakout.kind == "TRUE_BREAK":
+                    self.true_breakout_1h = latest_1h_breakout
         if self.df_4h is not None and not self.df_4h.empty:
             latest_4h_breakout = self._calc_latest_fractal_breakout(
                 self.df_4h,
@@ -654,6 +670,12 @@ class HtfContext:
             ),
             "true_breakout_15m": (
                 self.true_breakout_15m.to_dict() if self.true_breakout_15m else None
+            ),
+            "false_breakout_1h": (
+                self.false_breakout_1h.to_dict() if self.false_breakout_1h else None
+            ),
+            "true_breakout_1h": (
+                self.true_breakout_1h.to_dict() if self.true_breakout_1h else None
             ),
         }
 

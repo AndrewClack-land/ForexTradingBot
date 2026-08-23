@@ -249,7 +249,7 @@ def test_weights_are_constrained_regularized_and_canonical():
         for key in REFERENCE_WEIGHTS
     )
     # intercept + one row per factor, including the zero-weight FVG regime
-    assert len(result["coefficients"]) == 7
+    assert len(result["coefficients"]) == 1 + len(REFERENCE_WEIGHTS)
 
 
 def test_oos_outcomes_cannot_change_frozen_model_or_forecast():

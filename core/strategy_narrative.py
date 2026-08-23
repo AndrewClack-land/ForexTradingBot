@@ -813,6 +813,31 @@ class NarrativeStrategy:
                 },
             }
 
+        # 1H fractal breakouts (+1 each). The context routes one scan by kind,
+        # so at most one of these two rows is ever present on a decision.
+        for factor_key, breakout in (
+            ("false_breakout_1h", ctx.false_breakout_1h),
+            ("true_breakout_1h", ctx.true_breakout_1h),
+        ):
+            if breakout is None:
+                continue
+            parts.append(
+                f"1H {breakout.kind} {breakout.level_kind}@{breakout.level:.5f} "
+                f"-> {breakout.side} ({breakout.bars_ago} bars ago)"
+            )
+            votes[factor_key] = {
+                "present": True,
+                "side": breakout.side,
+                "evidence": {
+                    "kind": str(breakout.kind),
+                    "level": float(breakout.level),
+                    "level_kind": str(breakout.level_kind),
+                    "bar_index": int(breakout.bar_index),
+                    "bars_ago": int(breakout.bars_ago),
+                    "timeframe": str(breakout.timeframe),
+                },
+            }
+
         zone_snippets: List[str] = []
         active_order_blocks = [
             ob for ob in (ctx.order_blocks or [])

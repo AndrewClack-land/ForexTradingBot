@@ -26,7 +26,7 @@ from backtest.strategy_runner import (
     verify_release_manifest,
 )
 from backtest.simulator import simulate_split_outcome
-from core.narrative_scoring import build_factor_vector
+from core.narrative_scoring import FACTOR_DEFINITIONS, build_factor_vector
 
 
 def _frame(index, rows):
@@ -181,8 +181,9 @@ def test_runner_emits_structured_factor_attribution_without_changing_trade(
         strategy_factory=_AlwaysEnter,
     )
 
-    assert len(result.candidate_factors) == 6
-    assert len(result.setup_factors) == 6
+    # One row per factor in the live contract, candidates and setups alike.
+    assert len(result.candidate_factors) == len(FACTOR_DEFINITIONS)
+    assert len(result.setup_factors) == len(FACTOR_DEFINITIONS)
     by_factor = {
         row["factor_key"]: row
         for row in result.setup_factors

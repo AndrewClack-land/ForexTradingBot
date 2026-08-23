@@ -34,6 +34,8 @@ _FACTOR_KEYS = (
     "h1_premium_discount",
     "false_breakout_4h",
     "true_breakout_15m",
+    "false_breakout_1h",
+    "true_breakout_1h",
     "order_block_1h",
     "rejection_block_1h",
     "fvg_regime_1h",

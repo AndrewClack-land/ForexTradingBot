@@ -13,7 +13,11 @@ import math
 from typing import Any, Mapping, Optional
 
 
-FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v2"
+# v3 adds the two 1H fractal-breakout rows, so the vector carries eight rows:
+# seven directional votes plus the explicit ``fvg_regime_1h`` regime row.
+# Frozen v1/v2 weight models are five-dimensional and must be refitted rather
+# than reinterpreted against this layout.
+FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v3"
 
 
 @dataclass(frozen=True)
@@ -42,6 +46,16 @@ FACTOR_DEFINITIONS = (
     FactorDefinition(
         "true_breakout_15m",
         "15M true fractal breakout",
+        1,
+    ),
+    FactorDefinition(
+        "false_breakout_1h",
+        "1H false fractal breakout",
+        1,
+    ),
+    FactorDefinition(
+        "true_breakout_1h",
+        "1H true fractal breakout",
         1,
     ),
     FactorDefinition(
@@ -76,6 +90,11 @@ CHALLENGER_FACTOR_WEIGHTS = {
     "h1_premium_discount": 1,
     "false_breakout_4h": 2,
     "true_breakout_15m": 1,
+    # The 1H breakout rows mirror the live contract so this arm keeps
+    # isolating the FVG change alone. It stays one point heavier than live
+    # (10 vs 9) for the same reason it always was: here the FVG row votes.
+    "false_breakout_1h": 1,
+    "true_breakout_1h": 1,
     "order_block_1h": 2,
     "rejection_block_1h": 1,
     "fvg_regime_1h": 1,

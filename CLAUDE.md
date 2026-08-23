@@ -215,15 +215,29 @@ Non-negotiable implementation rules:
 
 ## Current production factor contract
 
-There are exactly five directional votes:
+There are exactly seven directional votes:
 
 | Key | Meaning | Weight |
 | --- | --- | ---: |
 | `h1_premium_discount` | H1 Premium/Discount | +2 |
 | `false_breakout_4h` | false breakout of a 4H fractal | +2 |
 | `true_breakout_15m` | true breakout of a 15M fractal | +1 |
+| `false_breakout_1h` | false breakout of a 1H fractal | +1 |
+| `true_breakout_1h` | true breakout of a 1H fractal | +1 |
 | `order_block_1h` | latest active Order Block 1H | +1 |
 | `rejection_block_1h` | latest valid and unbroken Rejection Block 1H | +1 |
+
+The two 1H breakout rows come from a single
+`HtfContext._calc_latest_fractal_breakout` scan routed by kind, so they are
+mutually exclusive by construction: at most one of them votes on any decision.
+Measured on the sealed EURUSD 1H history, one of the pair is present on roughly
+`90%` of decisions with a near even LONG/SHORT split, so this pair behaves much
+more like an always-voting factor than like a rare confirmation. Weigh that
+when reading any score distribution that predates them.
+
+These two votes were added on user instruction without prior frozen OOS
+evidence. Treat the live weights as unvalidated until a paired WFO against the
+previous five-vote contract has been reviewed.
 
 Important distinctions:
 
@@ -254,17 +268,21 @@ Important distinctions:
   present in `config.py`/`core/strategy_narrative.py` is not authorization to
   enable it. Do not confuse the trigger with the active RB1H score factor.
 
-### Factor contracts and the six-row vector
+### Factor contracts and the eight-row vector
 
-`FACTOR_VECTOR_SCHEMA` is `narrative-factor-vector/v2`. The vector carries six
-rows: the five directional votes above plus an explicit `fvg_regime_1h` row.
-Both named contracts share this one layout so a challenger run stays paired
-with its baseline through the same simulator and report schemas.
+`FACTOR_VECTOR_SCHEMA` is `narrative-factor-vector/v3`. The vector carries
+eight rows: the seven directional votes above plus an explicit `fvg_regime_1h`
+row. Both named contracts share this one layout so a challenger run stays
+paired with its baseline through the same simulator and report schemas.
 
-| Contract | Weights (PD/FB4H/TB15M/OB1H/RB1H/FVG) | FVG margin rule |
+| Contract | Weights (PD/FB4H/TB15M/FB1H/TB1H/OB1H/RB1H/FVG) | FVG margin rule |
 | --- | --- | --- |
-| `v1-fvg-margin` (live default) | `2, 2, 1, 1, 1, 0` | active |
-| `v2-fvg-vote` (challenger) | `1, 2, 1, 2, 1, 1` | disabled |
+| `v1-fvg-margin` (live default) | `2, 2, 1, 1, 1, 1, 1, 0` | active |
+| `v2-fvg-vote` (challenger) | `1, 2, 1, 1, 1, 2, 1, 1` | disabled |
+
+The challenger sums to `10` against the live `9`. That one-point gap is
+inherent to the arm — it promotes the FVG row to a vote — and is not a
+consequence of the 1H rows, which both arms carry at `+1`.
 
 `core/narrative_scoring.py:FACTOR_CONTRACTS` is the single authority; the
 weight override and the margin rule are mutually exclusive by construction,
@@ -282,12 +300,17 @@ Non-negotiable rules:
   sensitivity experiment exactly like `--sessions ALL` does;
 - `optimize-v2` exposes no contract switch and pins `v1-fvg-margin`, because
   its fit is regularized toward the live weights. `REFERENCE_WEIGHTS` and
-  `WEIGHT_SUM` therefore stay `[2, 2, 1, 1, 1, 0]` and `7`. The zero-weight FVG
-  row still participates as a fittable dimension;
+  `WEIGHT_SUM` are derived from `FACTOR_DEFINITIONS`, so they now read
+  `[2, 2, 1, 1, 1, 1, 1, 0]` and `9`. The zero-weight FVG row still
+  participates as a fittable dimension;
 - `rescore_factor_vector` must carry `fvg_margin_enabled` from the frozen
   vector; a challenger vector must never silently regain the margin penalty;
-- frozen v1 weight models and shadow models are five-dimensional and fail
-  closed against the v2 schema. Refit rather than reinterpret them.
+- frozen weight models and shadow models fitted before a schema bump carry
+  the older, narrower dimensionality and fail closed against the current
+  vector. Refit rather than reinterpret them. The live Ridge shadow scorer is
+  the one exception and is safe by construction: `_feature_vector` selects
+  columns by the frozen model's own `names`, so a five-factor model simply
+  never requests the newer rows.
 
 ## Current entry-trigger contract
 
@@ -510,7 +533,7 @@ A valid replacement-weight optimizer requires a new v2 research population:
   baseline bias;
 - fit only inside each training interval;
 - constrain weights to be finite and non-negative;
-- regularize toward the current `[2, 2, 1, 1, 1]` contract;
+- regularize toward the current live contract weights;
 - freeze the fitted model before replaying the next OOS interval;
 - compare against the untouched baseline with the same execution simulator.
 
@@ -544,7 +567,8 @@ A valid replacement-weight optimizer requires a new v2 research population:
   `decision_time < train_end - (entry_ttl + max_holding)` and
   `exit_time < train_end`;
 - fitted weights are deterministic, finite, constrained to `0 <= wi <= 3`,
-  sum to `7`, and are regularized toward `[2, 2, 1, 1, 1]`;
+  sum to `WEIGHT_SUM` (currently `9`), and are regularized toward
+  `REFERENCE_WEIGHTS`, both derived from `FACTOR_DEFINITIONS`;
 - fit readiness is measured by unique `decision_event_id x side` clusters,
   not raw correlated trigger rows; rows inside one cluster share one unit of
   train weight and each model reports raw rows, cluster count and Kish ESS;
@@ -569,14 +593,14 @@ A valid replacement-weight optimizer requires a new v2 research population:
 - the replay uses the existing simulator and operational gates, and every
   setup keeps fixed non-compounding risk
   `initial_capital * risk_fraction <= 1%`.
-- every FIT-fold OOS population is also scored with the untouched reference
-  weights `[2,2,1,1,1]`, zero intercept, and no hard threshold. Challenger and
+- every FIT-fold OOS population is also scored with the untouched
+  `REFERENCE_WEIGHTS`, zero intercept, and no hard threshold. Challenger and
   paired baseline must have identical gate-eligible support and then pass
   through the same chronological simulator, state gates, and fixed risk. This
   pair isolates the weight change; it is not a separate production-policy
   backtest.
 
-The v2 model optimizes the five direction-factor weights only. Trigger rows are
+The v2 model optimizes the direction-factor weights only. Trigger rows are
 preserved for attribution. Trigger-family coefficients are not fitted in this
 version; score orders alternatives and the fixed priority resolves equal-score
 ties.
