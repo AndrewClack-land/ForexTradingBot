@@ -13,7 +13,11 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from core.orca_spectral import OrcaSpectralConfig
+from core.orca_spectral import (
+    ORCA_FX_GOLD_4_PROFILE,
+    OrcaSpectralConfig,
+    OrcaValidationError,
+)
 from monitoring.orca_monitor import (
     ORCA_MONITOR_SCHEMA,
     ORCA_PREDICTION_SCHEMA,
@@ -27,7 +31,10 @@ from monitoring.orca_monitor import (
     compute_prediction_hash,
     compute_snapshot_hash,
     load_price_panel,
+    _parser,
     make_bound_handler,
+    materialize_current_snapshot,
+    resolve_universe_arguments,
 )
 
 
@@ -488,3 +495,191 @@ def test_monitor_imports_no_execution_modules_and_dashboard_is_ascii_safe() -> N
     assert "network.edges" not in dashboard_source
     assert "Loading..." in dashboard_source
     assert "lambda ${index + 1}" in dashboard_source
+
+
+def test_expected_symbols_pins_the_exact_ordered_universe() -> None:
+    prices = _prices()
+    pinned = OrcaMonitorConfig(
+        refresh_seconds=10,
+        stale_after_seconds=200_000,
+        expected_assets=6,
+        minimum_assets=5,
+        expected_symbols=tuple(prices.columns),
+    )
+
+    snapshot = build_monitor_snapshot(
+        prices,
+        generated_at_utc=AS_OF,
+        spectral_config=_spectral_config(),
+        monitor_config=pinned,
+    )
+    assert snapshot["symbols"] == list(prices.columns)
+    assert snapshot["full_universe"] is True
+
+    # A panel with the right asset count but a different universe is rejected
+    # instead of being served as a full universe.
+    renamed = prices.rename(columns={prices.columns[0]: "SWAPPED"})
+    with pytest.raises(ValueError, match="universe/order differs"):
+        build_monitor_snapshot(
+            renamed,
+            generated_at_utc=AS_OF,
+            spectral_config=_spectral_config(),
+            monitor_config=pinned,
+        )
+
+    reordered = prices.loc[:, list(reversed(prices.columns))]
+    with pytest.raises(ValueError, match="universe/order differs"):
+        build_monitor_snapshot(
+            reordered,
+            generated_at_utc=AS_OF,
+            spectral_config=_spectral_config(),
+            monitor_config=pinned,
+        )
+
+
+def test_expected_symbols_are_revalidated_when_a_snapshot_is_served() -> None:
+    prices = _prices()
+    pinned = OrcaMonitorConfig(
+        refresh_seconds=10,
+        stale_after_seconds=200_000,
+        expected_assets=6,
+        minimum_assets=5,
+        expected_symbols=tuple(prices.columns),
+    )
+    snapshot = build_monitor_snapshot(
+        prices,
+        generated_at_utc=AS_OF,
+        spectral_config=_spectral_config(),
+        monitor_config=pinned,
+    )
+
+    served = materialize_current_snapshot(
+        snapshot,
+        current_time_utc=AS_OF,
+        monitor_config=pinned,
+    )
+    assert served["freshness"] == "FRESH"
+
+    stale_universe = dict(snapshot)
+    stale_universe["symbols"] = list(reversed(snapshot["symbols"]))
+    with pytest.raises(ValueError, match="universe/order differs"):
+        materialize_current_snapshot(
+            stale_universe,
+            current_time_utc=AS_OF,
+            monitor_config=pinned,
+        )
+
+
+def test_expected_symbols_must_agree_with_expected_assets() -> None:
+    with pytest.raises(ValueError, match="must match expected_assets"):
+        OrcaMonitorConfig(expected_assets=6, expected_symbols=("A", "B"))
+    with pytest.raises(ValueError, match="must be unique"):
+        OrcaMonitorConfig(
+            expected_assets=2,
+            minimum_assets=2,
+            expected_symbols=("A", "A"),
+        )
+    with pytest.raises(ValueError, match="cannot contain blank"):
+        OrcaMonitorConfig(
+            expected_assets=2,
+            minimum_assets=2,
+            expected_symbols=("A", " "),
+        )
+
+
+def test_blank_expected_symbols_preserve_the_legacy_count_only_contract() -> None:
+    prices = _prices()
+    snapshot = build_monitor_snapshot(
+        prices,
+        generated_at_utc=AS_OF,
+        spectral_config=_spectral_config(),
+        monitor_config=_monitor_config(),
+    )
+    assert snapshot["full_universe"] is True
+    renamed = prices.rename(columns={prices.columns[0]: "SWAPPED"})
+    assert build_monitor_snapshot(
+        renamed,
+        generated_at_utc=AS_OF,
+        spectral_config=_spectral_config(),
+        monitor_config=_monitor_config(),
+    )["asset_count"] == 6
+
+
+def test_universe_profile_resolves_the_paired_spectral_contract() -> None:
+    config, symbols, assets, minimum = resolve_universe_arguments(
+        universe_profile="orca-fx-gold-4-v1",
+        expected_symbols="",
+        expected_assets=None,
+    )
+    assert symbols == ORCA_FX_GOLD_4_PROFILE.symbols
+    assert assets == 4
+    assert minimum == 4
+    # The four-asset profile cannot silently inherit the 24-asset AR5 contract.
+    assert config is not None
+    assert config.absorption_ranks == (1, 2, 3)
+    assert config.universe_profile is ORCA_FX_GOLD_4_PROFILE
+
+
+def test_universe_profile_refuses_conflicting_explicit_arguments() -> None:
+    with pytest.raises(ValueError, match="conflicts with profile"):
+        resolve_universe_arguments(
+            universe_profile="orca-fx-gold-4-v1",
+            expected_symbols="EURUSD GBPUSD USDCAD XAUUSD",
+            expected_assets=None,
+        )
+    with pytest.raises(ValueError, match="conflicts with profile"):
+        resolve_universe_arguments(
+            universe_profile="orca-fx-gold-4-v1",
+            expected_symbols="",
+            expected_assets=24,
+        )
+    with pytest.raises(OrcaValidationError, match="unknown ORCA universe profile"):
+        resolve_universe_arguments(
+            universe_profile="orca-fx-gold-5-v1",
+            expected_symbols="",
+            expected_assets=None,
+        )
+
+
+def test_explicit_symbols_without_a_profile_must_match_the_declared_count() -> None:
+    config, symbols, assets, minimum = resolve_universe_arguments(
+        universe_profile="",
+        expected_symbols="EURUSD, GBPUSD, USDCAD, GOLD",
+        expected_assets=4,
+    )
+    assert config is None
+    assert symbols == ("EURUSD", "GBPUSD", "USDCAD", "GOLD")
+    assert (assets, minimum) == (4, 4)
+
+    with pytest.raises(ValueError, match="must match --expected-assets"):
+        resolve_universe_arguments(
+            universe_profile="",
+            expected_symbols="EURUSD GBPUSD",
+            expected_assets=4,
+        )
+
+
+def test_a_leftover_expected_assets_env_conflicts_with_a_profile(monkeypatch) -> None:
+    monkeypatch.setenv("ORCA_EXPECTED_ASSETS", "24")
+    monkeypatch.setenv("ORCA_UNIVERSE_PROFILE", "orca-fx-gold-4-v1")
+    monkeypatch.setenv("ORCA_PRICES_PATH", "unused.parquet")
+
+    args = _parser().parse_args([])
+    assert args.expected_assets == 24
+    with pytest.raises(ValueError, match="conflicts with profile"):
+        resolve_universe_arguments(
+            universe_profile=args.universe_profile,
+            expected_symbols=args.expected_symbols,
+            expected_assets=args.expected_assets,
+        )
+
+    # Removing the stale variable is what actually enables the profile.
+    monkeypatch.delenv("ORCA_EXPECTED_ASSETS")
+    args = _parser().parse_args([])
+    assert args.expected_assets is None
+    _, symbols, assets, _ = resolve_universe_arguments(
+        universe_profile=args.universe_profile,
+        expected_symbols=args.expected_symbols,
+        expected_assets=args.expected_assets,
+    )
+    assert (symbols, assets) == (ORCA_FX_GOLD_4_PROFILE.symbols, 4)

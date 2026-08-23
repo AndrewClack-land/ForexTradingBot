@@ -321,6 +321,8 @@ git archive --format=tar "$release_commit" \
   core/fxpro_cluster_rejection.py core/fxpro_quote_pressure.py \
   core/htf_context.py \
   core/narrative_scoring.py core/pivot_trigger.py core/vol_regime.py \
+  core/orca_spectral.py \
+  monitoring/__init__.py monitoring/orca_lse_panel.py \
   deploy/build_backtest_release_manifest.py \
   requirements-backtest.txt | \
   sudo tar --extract --file=- --directory="$release_stage/app"
@@ -841,6 +843,81 @@ directory passes `FxProClusterEventDataset` validation. Add
 own dataset validation. Without either optional sidecar, the run remains valid
 for the other triggers and records that trigger as `DATA_UNAVAILABLE`; it
 never manufactures an OHLCV, candle-volume, or MT5 tick-volume substitute.
+
+### ORCA-4 D1 panel from sealed LSE snapshots
+
+ORCA needs one wide D1 close panel. The sealed `fx-2020-2026-v1` snapshot
+already holds EURUSD/GBPUSD/USDCAD with a last D1 close of
+`2026-07-23T21:00:00Z`, and London Strategic Edge catalogues GOLD in the same
+place as `XAU/USD`. The panel is therefore completed by two small imports
+rather than a full re-download, and assembled by
+`monitoring/orca_lse_panel.py`.
+
+The ORCA-4 universe and its column order are a contract:
+`EURUSD, GBPUSD, USDCAD, GOLD`, registered in `core/orca_spectral.py` as
+profile `orca-fx-gold-4-v1`. The profile also carries absorption ranks
+`(1, 2, 3)`, because AR5 is undefined for four assets.
+
+1. **GOLD history.** Install `deploy/lse-gold-import.env.example` as
+   `/etc/forexbot/lse-gold-import.env` and
+   `deploy/forexbot-lse-gold-import.service`. It imports GOLD alone over
+   exactly the sealed FX range, so the inner join loses nothing at the edges.
+2. **Four-symbol tail.** Install `deploy/lse-tail-import.env.example` as
+   `/etc/forexbot/lse-tail-import.env` and
+   `deploy/forexbot-lse-tail-import.service`. It re-reads a short recent
+   window for all four symbols. `LSE_START` must sit inside the sealed history
+   and `LSE_END` past it; move `LSE_END` forward and pick a new
+   `LSE_OUTPUT_DIR` on every re-import. Keep `LSE_DATASET` empty: the run
+   mixes the `fx` and `commodity` datasets.
+3. **Promote** both completed imports out of
+   `/var/lib/forexbot-backtest/incoming/` into
+   `/srv/forexbot-backtest/snapshots/` exactly like any other snapshot.
+4. **Materialize** the panel. The materializer is read-only against every
+   source: it re-verifies each stored manifest, each declared file hash and
+   each source manifest before reading only `bar_close_time` and `close`.
+
+```bash
+set -euo pipefail
+snapshots=/srv/forexbot-backtest/snapshots
+sudo -u forexbot-backtest env \
+  PYTHONPATH=/opt/forexbot-backtest/current/app \
+  /opt/forexbot-backtest/current/venv/bin/python \
+  -m monitoring.orca_lse_panel \
+  --fx-snapshot "$snapshots/fx-2020-2026-v1" \
+  --gold-snapshot "$snapshots/gold-2020-2026-lse-v1" \
+  --tail-snapshot "$snapshots/fxgold-tail-2026-lse-v1" \
+  --output-dir /var/lib/forexbot-backtest/orca-panels/orca4-v1
+```
+
+The tail is spliced only when it shares at least `--minimum-overlap-rows`
+(default 5) D1 bars with the history **and every one of those overlapping bars
+is bit-identical across all four closes**. A single disagreement means the two
+imports disagree about the past, which fails the run instead of being averaged
+or resolved in favour of one source. Only bars strictly after the sealed
+history are appended; nothing is forward-filled or interpolated. A tail that
+adds no newer bar also fails, so a stale panel cannot be republished silently.
+
+The published directory holds `prices.parquet` plus a self-hashed
+`manifest.json` recording both source lineages, the verified overlap window
+and the appended row count. The output directory is created by a single
+rename and an existing one is never replaced.
+
+Copy the published `prices.parquet` to the monitor's read path and point the
+monitor at the profile so the four-asset panel cannot be scored with the
+24-asset spectral contract:
+
+```ini
+ORCA_PRICES_PATH=/srv/forexbot-backtest/orca/prices.parquet
+ORCA_UNIVERSE_PROFILE=orca-fx-gold-4-v1
+```
+
+`ORCA_UNIVERSE_PROFILE` fixes the symbols, the asset count and the absorption
+ranks together. Passing a conflicting `--expected-assets` or
+`--expected-symbols` is an error rather than a silent override. Leaving the
+variable blank keeps the previous count-only behaviour of the 24-asset EODHD
+panel. With a profile set, a panel whose universe or column order drifts is
+rejected at refresh and again when a stored snapshot is served, instead of
+being reported as a full universe.
 
 ### Quantower FxPro tick-cluster diagnostic
 

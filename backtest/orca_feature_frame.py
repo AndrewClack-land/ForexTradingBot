@@ -482,6 +482,7 @@ def _registry(
     traditional_config: TraditionalFeatureConfig,
     dynamics_config: DynamicsConfig,
     benchmark_symbol: str,
+    ordered_universe: Sequence[str],
 ) -> dict[str, Any]:
     body: dict[str, Any] = {
         "schema_version": ORCA_FEATURE_FRAME_SCHEMA,
@@ -489,6 +490,7 @@ def _registry(
         "causal_contract": "closed_D1_at_or_before_row_timestamp",
         "warmup_policy": "NaN_allowed_infinity_forbidden",
         "benchmark_symbol": benchmark_symbol,
+        "ordered_universe": list(ordered_universe),
         "spectral_schema": ORCA_SPECTRAL_SCHEMA,
         "spectral_config_id": spectral_config.config_id,
         "core_spectral_feature_names": list(core_names),
@@ -568,6 +570,7 @@ def build_orca_feature_frame(
         traditional_config=traditional_config,
         dynamics_config=dynamics_config,
         benchmark_symbol=symbol,
+        ordered_universe=tuple(panel.columns),
     )
     result = OrcaFeatureFrame(
         features=features,

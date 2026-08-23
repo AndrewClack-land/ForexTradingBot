@@ -22,13 +22,15 @@ from pathlib import Path
 import tempfile
 import threading
 import time
-from typing import Any, Mapping, Optional, Protocol
+from typing import Any, Mapping, Optional, Protocol, Sequence
 
 import pandas as pd
 
 from core.orca_spectral import (
     OrcaSpectralConfig,
     build_orca_spectral_snapshots,
+    resolve_universe_profile,
+    spectral_config_for_profile,
     spectral_feature_registry_hash,
     spectral_feature_row,
 )
@@ -117,6 +119,7 @@ class OrcaMonitorConfig:
     stale_after_seconds: float = 129_600.0
     expected_assets: int = 24
     minimum_assets: int = 5
+    expected_symbols: tuple[str, ...] = ()
     allowed_model_statuses: tuple[str, ...] = ("OOS_VALIDATED",)
 
     def __post_init__(self) -> None:
@@ -128,6 +131,14 @@ class OrcaMonitorConfig:
             raise ValueError("minimum_assets must be >= 2")
         if self.expected_assets < self.minimum_assets:
             raise ValueError("expected_assets must be >= minimum_assets")
+        symbols = tuple(str(value).strip() for value in self.expected_symbols)
+        if any(not value for value in symbols):
+            raise ValueError("expected_symbols cannot contain blank symbols")
+        if len(set(symbols)) != len(symbols):
+            raise ValueError("expected_symbols must be unique")
+        if symbols and len(symbols) != self.expected_assets:
+            raise ValueError("expected_symbols must match expected_assets")
+        object.__setattr__(self, "expected_symbols", symbols)
         statuses = tuple(str(value).strip() for value in self.allowed_model_statuses)
         if not statuses or any(not value for value in statuses):
             raise ValueError("allowed_model_statuses cannot be empty")
@@ -514,6 +525,29 @@ def _market_freshness(
     return "FRESH"
 
 
+def _require_expected_symbols(
+    symbols: Sequence[Any],
+    *,
+    monitor_config: OrcaMonitorConfig,
+) -> tuple[str, ...]:
+    """Pin the exact ordered universe when the deployment declares one.
+
+    ``expected_assets`` alone only counts columns, so a panel that silently
+    swapped one asset for another would still look full.  A declared symbol
+    tuple makes the universe itself part of the contract; leaving it empty
+    preserves the count-only behaviour of existing deployments.
+    """
+
+    actual = tuple(str(value) for value in symbols)
+    expected = monitor_config.expected_symbols
+    if expected and actual != expected:
+        raise ValueError(
+            "ORCA symbol universe/order differs from the configured contract; "
+            f"expected={expected}, received={actual}"
+        )
+    return actual
+
+
 def _unavailable_regime(reason: str) -> dict[str, Any]:
     return {
         "regime": "UNAVAILABLE",
@@ -567,6 +601,7 @@ def build_monitor_snapshot(
         as_of_utc=generated,
         config=spectral_config or OrcaSpectralConfig(),
     )
+    _require_expected_symbols(bundle.symbols, monitor_config=monitor)
     features = spectral_feature_row(bundle)
     registry_hash = spectral_feature_registry_hash(bundle)
     values_hash = _feature_values_hash(features)
@@ -661,6 +696,10 @@ def materialize_current_snapshot(
     asset_count = int(payload.get("asset_count", -1))
     if expected_assets != monitor_config.expected_assets:
         raise ValueError("snapshot expected-assets contract differs from monitor")
+    raw_symbols = payload.get("symbols")
+    if not isinstance(raw_symbols, list):
+        raise ValueError("snapshot symbols must be an array")
+    _require_expected_symbols(raw_symbols, monitor_config=monitor_config)
     freshness = _market_freshness(
         age_seconds=age_seconds,
         asset_count=asset_count,
@@ -851,6 +890,9 @@ class OrcaMonitorEngine:
             as_of_utc=generated,
             config=self.spectral_config,
         )
+        # Check the universe before the prediction provider is consulted, so a
+        # mismatched panel never reaches the model with an off-contract hash.
+        _require_expected_symbols(bundle.symbols, monitor_config=self.monitor_config)
         registry_hash = spectral_feature_registry_hash(bundle)
         values_hash = _feature_values_hash(spectral_feature_row(bundle))
         prediction: Optional[Mapping[str, Any]] = None
@@ -1013,7 +1055,21 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-assets",
         type=int,
-        default=int(os.getenv("ORCA_EXPECTED_ASSETS", "24")),
+        default=_optional_env_int("ORCA_EXPECTED_ASSETS"),
+        help="exact asset count; defaults to ORCA_EXPECTED_ASSETS or the profile",
+    )
+    parser.add_argument(
+        "--universe-profile",
+        default=os.getenv("ORCA_UNIVERSE_PROFILE", ""),
+        help=(
+            "registered exact-universe profile (for example orca-fx-gold-4-v1); "
+            "blank keeps the legacy count-only contract"
+        ),
+    )
+    parser.add_argument(
+        "--expected-symbols",
+        default=os.getenv("ORCA_EXPECTED_SYMBOLS", ""),
+        help="comma/space-separated exact symbol order; blank means count-only",
     )
     parser.add_argument(
         "--stale-after-seconds",
@@ -1023,19 +1079,96 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+DEFAULT_EXPECTED_ASSETS = 24
+
+
+def _optional_env_int(name: str) -> Optional[int]:
+    """Read an optional integer so an unset variable stays distinguishable.
+
+    A profile declares the asset count itself, so the difference between
+    "not configured" and "configured to 24" has to survive into
+    ``resolve_universe_arguments``; otherwise a leftover
+    ``ORCA_EXPECTED_ASSETS`` would be silently ignored beside a profile.
+    """
+
+    raw = str(os.getenv(name, "")).strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+
+
+def _split_symbols(raw: str) -> tuple[str, ...]:
+    return tuple(value for value in str(raw or "").replace(",", " ").split() if value)
+
+
+def resolve_universe_arguments(
+    *,
+    universe_profile: str,
+    expected_symbols: str,
+    expected_assets: Optional[int],
+) -> tuple[Optional[OrcaSpectralConfig], tuple[str, ...], int, int]:
+    """Resolve the universe contract from a profile or explicit arguments.
+
+    A profile is the authority when given: it fixes the symbols, the count and
+    the absorption ranks together, so an operator cannot pair a four-asset
+    panel with the 24-asset spectral contract.  Explicitly passing a
+    conflicting count or symbol list is an error rather than a silent
+    override.
+    """
+
+    symbols = _split_symbols(expected_symbols)
+    profile_name = str(universe_profile or "").strip()
+    if profile_name:
+        profile = resolve_universe_profile(profile_name)
+        if symbols and symbols != profile.symbols:
+            raise ValueError(
+                f"--expected-symbols conflicts with profile {profile.profile_id}"
+            )
+        if expected_assets is not None and expected_assets != profile.expected_assets:
+            raise ValueError(
+                f"--expected-assets conflicts with profile {profile.profile_id}"
+            )
+        return (
+            spectral_config_for_profile(profile.profile_id),
+            profile.symbols,
+            profile.expected_assets,
+            profile.minimum_assets,
+        )
+
+    assets = DEFAULT_EXPECTED_ASSETS if expected_assets is None else expected_assets
+    if symbols and len(symbols) != assets:
+        raise ValueError("--expected-symbols must match --expected-assets")
+    return None, symbols, assets, min(5, assets)
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = _parser().parse_args(argv)
     root = Path(__file__).resolve().parent
+    (
+        spectral_config,
+        expected_symbols,
+        expected_assets,
+        minimum_assets,
+    ) = resolve_universe_arguments(
+        universe_profile=args.universe_profile,
+        expected_symbols=args.expected_symbols,
+        expected_assets=args.expected_assets,
+    )
     monitor_config = OrcaMonitorConfig(
         refresh_seconds=args.refresh_seconds,
         stale_after_seconds=args.stale_after_seconds,
-        expected_assets=args.expected_assets,
-        minimum_assets=min(5, args.expected_assets),
+        expected_assets=expected_assets,
+        minimum_assets=minimum_assets,
+        expected_symbols=expected_symbols,
     )
     provider = JsonPredictionProvider(args.prediction) if args.prediction else None
     engine = OrcaMonitorEngine(
         prices_path=args.prices,
         snapshot_store=AtomicSnapshotStore(args.snapshot),
+        spectral_config=spectral_config,
         monitor_config=monitor_config,
         prediction_provider=provider,
     )

@@ -26,6 +26,7 @@ import pandas as pd
 
 
 ORCA_SPECTRAL_SCHEMA = "orca-spectral-v1"
+ORCA_UNIVERSE_PROFILE_SCHEMA = "orca-universe-profile-v1"
 BCD_AUC_SCHEMA = "balanced-crisis-detection-auc-v1"
 
 
@@ -75,6 +76,119 @@ def _number_token(value: float) -> str:
 
 
 @dataclass(frozen=True)
+class OrcaUniverseProfile:
+    """Versioned exact-universe contract for a spectral feature family."""
+
+    profile_id: str
+    symbols: tuple[str, ...]
+    absorption_ranks: tuple[int, ...]
+    expected_assets: int
+    minimum_assets: int
+    schema_version: str = ORCA_UNIVERSE_PROFILE_SCHEMA
+
+    def __post_init__(self) -> None:
+        if self.schema_version != ORCA_UNIVERSE_PROFILE_SCHEMA:
+            raise OrcaValidationError(
+                f"schema_version must be {ORCA_UNIVERSE_PROFILE_SCHEMA}"
+            )
+
+        profile_id = self.profile_id.strip() if isinstance(self.profile_id, str) else ""
+        if not profile_id or any(
+            not (character.isalnum() or character in "-._")
+            for character in profile_id
+        ):
+            raise OrcaValidationError(
+                "profile_id must be a non-empty stable identifier"
+            )
+
+        symbols: list[str] = []
+        for raw_symbol in self.symbols:
+            if not isinstance(raw_symbol, str) or not raw_symbol.strip():
+                raise OrcaValidationError(
+                    "profile symbols must be non-empty strings"
+                )
+            symbols.append(raw_symbol.strip())
+        if len(symbols) < 2 or len(set(symbols)) != len(symbols):
+            raise OrcaValidationError(
+                "profile symbols must contain at least two unique assets"
+            )
+
+        expected_assets = _strict_positive_int(
+            self.expected_assets,
+            name="expected_assets",
+        )
+        minimum_assets = _strict_positive_int(
+            self.minimum_assets,
+            name="minimum_assets",
+        )
+        if expected_assets != len(symbols):
+            raise OrcaValidationError(
+                "expected_assets must equal the exact profile symbol count"
+            )
+        if minimum_assets < 2 or minimum_assets > expected_assets:
+            raise OrcaValidationError(
+                "minimum_assets must lie between 2 and expected_assets"
+            )
+
+        ranks = tuple(
+            _strict_positive_int(value, name="absorption_ranks")
+            for value in self.absorption_ranks
+        )
+        if tuple(sorted(set(ranks))) != ranks:
+            raise OrcaValidationError(
+                "absorption_ranks must be unique and strictly increasing"
+            )
+        if ranks[-1] >= minimum_assets:
+            raise OrcaValidationError(
+                "profile absorption ranks must be below minimum_assets; "
+                "a full-rank absorption ratio is identically 1.0"
+            )
+
+        object.__setattr__(self, "profile_id", profile_id)
+        object.__setattr__(self, "symbols", tuple(symbols))
+        object.__setattr__(self, "absorption_ranks", ranks)
+        object.__setattr__(self, "expected_assets", expected_assets)
+        object.__setattr__(self, "minimum_assets", minimum_assets)
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "schema_version": self.schema_version,
+            "profile_id": self.profile_id,
+            "symbols": list(self.symbols),
+            "absorption_ranks": list(self.absorption_ranks),
+            "expected_assets": self.expected_assets,
+            "minimum_assets": self.minimum_assets,
+        }
+
+    @property
+    def contract_hash(self) -> str:
+        canonical = json.dumps(
+            self.to_mapping(),
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("utf-8")
+        return sha256(canonical).hexdigest()
+
+    def validate_symbols(self, symbols: Sequence[str]) -> None:
+        actual = tuple(symbols)
+        if actual != self.symbols:
+            raise OrcaValidationError(
+                f"universe profile {self.profile_id} requires exact ordered "
+                f"symbols {self.symbols}; received {actual}"
+            )
+
+
+ORCA_FX_GOLD_4_PROFILE = OrcaUniverseProfile(
+    profile_id="orca-fx-gold-4-v1",
+    symbols=("EURUSD", "GBPUSD", "USDCAD", "GOLD"),
+    absorption_ranks=(1, 2, 3),
+    expected_assets=4,
+    minimum_assets=4,
+)
+
+
+@dataclass(frozen=True)
 class OrcaSpectralConfig:
     """Versioned feature contract; defaults reproduce declared ORCA scales."""
 
@@ -85,6 +199,7 @@ class OrcaSpectralConfig:
     absorption_ranks: tuple[int, ...] = (1, 3, 5)
     graph_thresholds: tuple[float, ...] = (0.3, 0.5, 0.7)
     numerical_tolerance: float = 1e-10
+    universe_profile: Optional[OrcaUniverseProfile] = None
 
     def __post_init__(self) -> None:
         if self.schema_version != ORCA_SPECTRAL_SCHEMA:
@@ -119,6 +234,16 @@ class OrcaSpectralConfig:
             raise OrcaValidationError(
                 "absorption_ranks must be unique and strictly increasing"
             )
+        profile = self.universe_profile
+        if profile is not None:
+            if not isinstance(profile, OrcaUniverseProfile):
+                raise OrcaValidationError(
+                    "universe_profile must be OrcaUniverseProfile"
+                )
+            if ranks != profile.absorption_ranks:
+                raise OrcaValidationError(
+                    "absorption_ranks must match the universe profile"
+                )
 
         thresholds = tuple(
             _finite_float(value, name="graph_thresholds")
@@ -150,7 +275,7 @@ class OrcaSpectralConfig:
         object.__setattr__(self, "numerical_tolerance", tolerance)
 
     def to_mapping(self) -> dict[str, Any]:
-        return {
+        mapping: dict[str, Any] = {
             "schema_version": self.schema_version,
             "rolling_windows": list(self.rolling_windows),
             "ewm_halflife": self.ewm_halflife,
@@ -159,6 +284,9 @@ class OrcaSpectralConfig:
             "graph_thresholds": list(self.graph_thresholds),
             "numerical_tolerance": self.numerical_tolerance,
         }
+        if self.universe_profile is not None:
+            mapping["universe_profile"] = self.universe_profile.to_mapping()
+        return mapping
 
     @property
     def config_id(self) -> str:
@@ -169,6 +297,51 @@ class OrcaSpectralConfig:
             allow_nan=False,
         ).encode("utf-8")
         return sha256(canonical).hexdigest()
+
+
+ORCA_FX_GOLD_4_SPECTRAL_CONFIG = OrcaSpectralConfig(
+    absorption_ranks=ORCA_FX_GOLD_4_PROFILE.absorption_ranks,
+    universe_profile=ORCA_FX_GOLD_4_PROFILE,
+)
+
+
+ORCA_UNIVERSE_PROFILES: Mapping[str, OrcaUniverseProfile] = MappingProxyType(
+    {ORCA_FX_GOLD_4_PROFILE.profile_id: ORCA_FX_GOLD_4_PROFILE}
+)
+
+_PROFILE_SPECTRAL_CONFIGS: Mapping[str, OrcaSpectralConfig] = MappingProxyType(
+    {ORCA_FX_GOLD_4_PROFILE.profile_id: ORCA_FX_GOLD_4_SPECTRAL_CONFIG}
+)
+
+
+def resolve_universe_profile(name: str) -> OrcaUniverseProfile:
+    """Return a registered exact-universe profile, failing closed on typos."""
+
+    token = str(name or "").strip()
+    profile = ORCA_UNIVERSE_PROFILES.get(token)
+    if profile is None:
+        known = ", ".join(sorted(ORCA_UNIVERSE_PROFILES)) or "<none>"
+        raise OrcaValidationError(
+            f"unknown ORCA universe profile {token!r}; registered profiles: {known}"
+        )
+    return profile
+
+
+def spectral_config_for_profile(name: str) -> OrcaSpectralConfig:
+    """Return the frozen spectral contract paired with a universe profile.
+
+    The pairing is registered rather than derived so a profile can never be
+    combined with absorption ranks it was not validated against.
+    """
+
+    profile = resolve_universe_profile(name)
+    config = _PROFILE_SPECTRAL_CONFIGS.get(profile.profile_id)
+    if config is None:  # pragma: no cover - registry is kept in lockstep
+        raise OrcaValidationError(
+            f"universe profile {profile.profile_id!r} has no registered "
+            "spectral configuration"
+        )
+    return config
 
 
 @dataclass(frozen=True)
@@ -249,6 +422,8 @@ class OrcaSpectralBundle:
     returns_start_utc: datetime
     returns_end_utc: datetime
     snapshots: tuple[SpectralSnapshot, ...]
+    profile_id: Optional[str] = None
+    profile_contract_hash: Optional[str] = None
 
     def snapshot(self, estimator: str) -> SpectralSnapshot:
         for item in self.snapshots:
@@ -404,6 +579,8 @@ def build_correlation_snapshots(
     if not isinstance(config, OrcaSpectralConfig):
         raise OrcaValidationError("config must be OrcaSpectralConfig")
     panel = validate_d1_price_panel(prices, as_of_utc=as_of_utc)
+    if config.universe_profile is not None:
+        config.universe_profile.validate_symbols(tuple(panel.columns))
     returns = simple_returns(panel)
     symbols = tuple(str(column) for column in returns.columns)
     snapshots: list[CorrelationSnapshot] = []
@@ -731,6 +908,16 @@ def build_orca_spectral_snapshots(
         returns_start_utc=min(item.returns_start_utc for item in snapshots),
         returns_end_utc=max(item.returns_end_utc for item in snapshots),
         snapshots=snapshots,
+        profile_id=(
+            config.universe_profile.profile_id
+            if config.universe_profile is not None
+            else None
+        ),
+        profile_contract_hash=(
+            config.universe_profile.contract_hash
+            if config.universe_profile is not None
+            else None
+        ),
     )
 
 
@@ -801,11 +988,21 @@ def spectral_feature_row(bundle: OrcaSpectralBundle) -> dict[str, float]:
 
 
 def spectral_feature_registry_hash(bundle: OrcaSpectralBundle) -> str:
-    """Hash the ordered feature names, deliberately excluding observations."""
+    """Hash feature names and, for explicit profiles, the exact universe."""
 
     names = list(spectral_feature_row(bundle))
+    if (bundle.profile_id is None) != (bundle.profile_contract_hash is None):
+        raise OrcaValidationError("bundle universe profile metadata is incomplete")
+    payload: Any = names
+    if bundle.profile_id is not None:
+        payload = {
+            "feature_names": names,
+            "ordered_universe": list(bundle.symbols),
+            "profile_contract_hash": bundle.profile_contract_hash,
+            "profile_id": bundle.profile_id,
+        }
     encoded = json.dumps(
-        names,
+        payload,
         ensure_ascii=True,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -923,6 +1120,10 @@ def balanced_crisis_detection_auc(
 __all__ = [
     "BCD_AUC_SCHEMA",
     "ORCA_SPECTRAL_SCHEMA",
+    "ORCA_UNIVERSE_PROFILE_SCHEMA",
+    "ORCA_FX_GOLD_4_PROFILE",
+    "ORCA_FX_GOLD_4_SPECTRAL_CONFIG",
+    "ORCA_UNIVERSE_PROFILES",
     "BcdAucResult",
     "CorrelationSnapshot",
     "GraphMetrics",
@@ -930,6 +1131,9 @@ __all__ = [
     "OrcaSpectralBundle",
     "OrcaSpectralConfig",
     "OrcaSpectralError",
+    "OrcaUniverseProfile",
+    "resolve_universe_profile",
+    "spectral_config_for_profile",
     "OrcaValidationError",
     "SignedEdge",
     "SpectralSnapshot",

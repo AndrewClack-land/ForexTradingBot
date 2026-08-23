@@ -1,6 +1,7 @@
 numpy==2.5.1
 pandas==2.3.2
 pyarrow==22.0.0
+scikit-learn==1.8.0
 tzdata==2025.2
 websockets==15.0.1
 lse-data[frames]==0.14.0

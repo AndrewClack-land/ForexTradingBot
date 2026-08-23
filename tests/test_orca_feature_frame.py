@@ -152,6 +152,7 @@ def test_registry_is_ordered_deterministic_and_does_not_claim_exact_206():
     assert left.registry == right.registry
     assert left.registry["feature_names"] == list(left.features.columns)
     assert left.registry["feature_count"] == left.features.shape[1]
+    assert left.registry["ordered_universe"] == list(prices.columns)
     assert len(left.registry["hash"]) == 64
     assert left.registry["paper_exact_206_replication"] is False
     validate_feature_registry(left)
@@ -164,6 +165,18 @@ def test_registry_is_ordered_deterministic_and_does_not_claim_exact_206():
     )
     with pytest.raises(OrcaFeatureFrameError, match="order differs"):
         validate_feature_registry(reordered)
+
+    reordered_prices = prices.loc[:, list(reversed(prices.columns))]
+    reordered_universe = build_orca_feature_frame(
+        reordered_prices,
+        benchmark_symbol="SPY",
+        as_of_utc=_as_of(reordered_prices),
+        spectral_config=_spectral_config(),
+    )
+    assert reordered_universe.registry["ordered_universe"] == list(
+        reversed(prices.columns)
+    )
+    assert reordered_universe.registry["hash"] != left.registry["hash"]
 
 
 def test_traditional_contract_has_expected_causal_values():

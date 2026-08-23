@@ -9,6 +9,8 @@ import pytest
 
 from core.orca_spectral import (
     BCD_AUC_SCHEMA,
+    ORCA_FX_GOLD_4_PROFILE,
+    ORCA_FX_GOLD_4_SPECTRAL_CONFIG,
     ORCA_SPECTRAL_SCHEMA,
     OrcaInsufficientDataError,
     OrcaSpectralConfig,
@@ -16,7 +18,9 @@ from core.orca_spectral import (
     balanced_crisis_detection_auc,
     build_correlation_snapshots,
     build_orca_spectral_snapshots,
+    resolve_universe_profile,
     simple_returns,
+    spectral_config_for_profile,
     spectral_feature_registry_hash,
     spectral_feature_row,
     tie_aware_binary_auc,
@@ -400,3 +404,69 @@ def test_bcd_auc_requires_one_date_aligned_oos_population() -> None:
             [0, 1, 0],
             [0.1, 0.9, 0.2],
         )
+
+
+def test_universe_profile_registry_resolves_and_fails_closed() -> None:
+    profile = resolve_universe_profile("orca-fx-gold-4-v1")
+    assert profile is ORCA_FX_GOLD_4_PROFILE
+    assert profile.symbols == ("EURUSD", "GBPUSD", "USDCAD", "GOLD")
+    assert profile.expected_assets == 4
+    assert profile.minimum_assets == 4
+
+    config = spectral_config_for_profile("orca-fx-gold-4-v1")
+    assert config is ORCA_FX_GOLD_4_SPECTRAL_CONFIG
+    # AR5 is undefined for four assets, so the profile carries its own ranks.
+    assert config.absorption_ranks == (1, 2, 3)
+
+    for unknown in ("", "   ", "orca-fx-gold-4", "ORCA-FX-GOLD-4-V1"):
+        with pytest.raises(OrcaValidationError, match="unknown ORCA universe profile"):
+            resolve_universe_profile(unknown)
+
+
+def test_a_profile_bound_config_pins_the_exact_ordered_universe() -> None:
+    panel = _price_panel(symbols=ORCA_FX_GOLD_4_PROFILE.symbols)
+    config = _config(
+        absorption_ranks=ORCA_FX_GOLD_4_PROFILE.absorption_ranks,
+        universe_profile=ORCA_FX_GOLD_4_PROFILE,
+    )
+
+    bundle = build_orca_spectral_snapshots(panel, as_of_utc=_as_of(panel), config=config)
+    assert bundle.symbols == ORCA_FX_GOLD_4_PROFILE.symbols
+    assert bundle.profile_id == "orca-fx-gold-4-v1"
+    assert bundle.profile_contract_hash == ORCA_FX_GOLD_4_PROFILE.contract_hash
+
+    renamed = panel.rename(columns={"USDCAD": "USDCHF"})
+    with pytest.raises(OrcaValidationError, match="requires exact ordered"):
+        build_orca_spectral_snapshots(
+            renamed,
+            as_of_utc=_as_of(renamed),
+            config=config,
+        )
+
+
+def test_a_profile_bound_registry_hash_covers_the_universe_not_only_names() -> None:
+    panel = _price_panel(symbols=ORCA_FX_GOLD_4_PROFILE.symbols)
+    as_of = _as_of(panel)
+
+    unpinned = build_orca_spectral_snapshots(
+        panel,
+        as_of_utc=as_of,
+        config=_config(absorption_ranks=(1, 2, 3)),
+    )
+    pinned = build_orca_spectral_snapshots(
+        panel,
+        as_of_utc=as_of,
+        config=_config(
+            absorption_ranks=(1, 2, 3),
+            universe_profile=ORCA_FX_GOLD_4_PROFILE,
+        ),
+    )
+
+    assert spectral_feature_row(unpinned) == spectral_feature_row(pinned)
+    # Identical feature values, but only the pinned bundle commits to which
+    # four assets produced them, so the two registries must not collide.
+    assert spectral_feature_registry_hash(unpinned) != spectral_feature_registry_hash(
+        pinned
+    )
+    assert unpinned.profile_id is None
+    assert unpinned.profile_contract_hash is None
