@@ -8,13 +8,19 @@ import pandas as pd
 import pytest
 
 from backtest.data import HistoricalDataset
+from backtest.__main__ import _build_parser
 from backtest.strategy_runner import (
     NarrativeBacktestConfig,
     StrategyBacktestError,
+    _Candidate,
     _EMPTY_CSV_FIELDS,
+    _Period,
+    _PreparedSeries,
     _REQUIRED_RELEASE_FILES,
     _configure_strategy,
     _default_strategy_factory,
+    _execute_candidates,
+    _find_fill,
     _force_close_outcome,
     _metrics_for,
     _sha256_file,
@@ -26,7 +32,11 @@ from backtest.strategy_runner import (
     verify_release_manifest,
 )
 from backtest.simulator import simulate_split_outcome
-from core.narrative_scoring import FACTOR_DEFINITIONS, build_factor_vector
+from core.narrative_scoring import (
+    FACTOR_CONTRACT_NO_H1PD,
+    FACTOR_DEFINITIONS,
+    build_factor_vector,
+)
 
 
 def _frame(index, rows):
@@ -89,6 +99,10 @@ class _AlwaysEnter:
         assert data["15M"].index[-1] == pd.Timestamp(
             "2026-01-01T00:00:00Z"
         )
+        assert data["1M"].index[-1] == pd.Timestamp(
+            "2026-01-01T00:14:00Z"
+        )
+        assert 999.0 not in data["1M"]["high"].to_list()
         factor_vector = build_factor_vector(
             {
                 "h1_premium_discount": {
@@ -273,6 +287,20 @@ def test_required_factor_vector_fails_closed_and_score_mismatch_is_rejected():
         },
         base_margin=1,
     )
+    with pytest.raises(
+        StrategyBacktestError,
+        match="identity does not match",
+    ):
+        _validate_factor_vector(
+            {
+                "signal": "ENTER",
+                "side": "LONG",
+                "factor_vector": vector,
+            },
+            status="ENTER",
+            required=True,
+            factor_contract=FACTOR_CONTRACT_NO_H1PD,
+        )
     vector["score_long"] = 99
     with pytest.raises(StrategyBacktestError, match="do not reproduce"):
         _validate_factor_vector(
@@ -482,11 +510,31 @@ def test_live_strategy_settings_are_explicit_and_rejection_entry_is_off():
     assert config.orderblock_entry_enabled is True
     assert config.orderblock_max_age_bars == 80
     assert config.htf_score_margin == 2
+    assert config.factor_contract == FACTOR_CONTRACT_NO_H1PD
 
     strategy = _configure_strategy(_default_strategy_factory(), config)
     assert strategy.rejection_block_entry_enabled is False
     assert strategy.orderblock_max_age_bars == 80
     assert strategy.htf_score_margin == 2
+    assert strategy.factor_contract == FACTOR_CONTRACT_NO_H1PD
+
+
+def test_strategy_run_cli_defaults_to_the_live_v3_factor_contract():
+    args = _build_parser().parse_args(
+        [
+            "run",
+            "--data",
+            "snapshot",
+            "--symbols",
+            "EURUSD",
+            "--initial-capital",
+            "10000",
+            "--output",
+            "report",
+        ]
+    )
+
+    assert args.factor_contract == FACTOR_CONTRACT_NO_H1PD
 
 
 def test_absorption_trigger_kind_prefers_structured_value_and_reason_fallback():
@@ -537,6 +585,167 @@ def test_trigger_signature_keeps_structured_families_and_events_separate():
 
     assert pivot != order_block
     assert first_event != second_event
+
+
+def _exact_limit_signal(event_id: str = "rb-h1-event") -> dict:
+    return {
+        "signal": "ENTER",
+        "side": "LONG",
+        "entry_min": 100.0,
+        "entry_max": 100.0,
+        "entry_price": 100.0,
+        "stop_price": 90.0,
+        "tp_prices": [110.0, 120.0, 130.0],
+        "trigger_kind": "rejection_block_1h",
+        "trigger_event_id": event_id,
+        "entry_order_type": "LIMIT_RETEST",
+    }
+
+
+def _exact_limit_replay_config() -> NarrativeBacktestConfig:
+    return NarrativeBacktestConfig.build(
+        symbols=["EURUSD"],
+        start="2026-01-01T00:00:00Z",
+        end="2026-01-03T00:00:00Z",
+        initial_capital=10_000,
+        history_limit=1,
+        min_context_bars=1,
+        min_daily_bars=1,
+        entry_ttl="15min",
+        max_holding="15min",
+        allowed_sessions=["ALL"],
+        profile="production-deterministic",
+    )
+
+
+def test_exact_limit_event_is_consumed_by_first_attempt_across_day_and_fold():
+    m1 = _frame(
+        [
+            "2026-01-01T00:16:00Z",
+            "2026-01-01T00:29:00Z",
+            "2026-01-02T00:16:00Z",
+        ],
+        [
+            (98.0, 99.0, 97.0, 98.0),
+            (98.0, 99.0, 97.0, 98.0),
+            (99.0, 101.0, 99.0, 100.0),
+        ],
+    )
+    prepared = {
+        "1m": _PreparedSeries(
+            timeframe="1m",
+            frame=m1,
+            close_times=m1.index + pd.Timedelta(minutes=1),
+        )
+    }
+    signal = _exact_limit_signal()
+    second_decision = pd.Timestamp("2026-01-02T00:15:00Z")
+    would_fill = _find_fill(
+        m1=m1,
+        decision_time=second_decision,
+        period_end=pd.Timestamp("2026-01-02T00:45:00Z"),
+        signal=signal,
+        config=_exact_limit_replay_config(),
+    )
+    assert would_fill[1] == pd.Timestamp("2026-01-02T00:16:00Z")
+
+    candidates = [
+        _Candidate(
+            candidate_id="first-attempt",
+            fold_index=0,
+            symbol="EURUSD",
+            decision_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+            gate="ENTER",
+            gate_reason="allowed",
+            signal=signal,
+        ),
+        _Candidate(
+            candidate_id="second-attempt",
+            fold_index=1,
+            symbol="EURUSD",
+            decision_time=second_decision,
+            gate="ENTER",
+            gate_reason="allowed",
+            signal=signal,
+        ),
+    ]
+    periods = [
+        _Period(
+            fold_index=0,
+            train_start=None,
+            train_end=None,
+            test_start=pd.Timestamp("2026-01-01T00:00:00Z"),
+            test_end=pd.Timestamp("2026-01-01T00:45:00Z"),
+        ),
+        _Period(
+            fold_index=1,
+            train_start=None,
+            train_end=None,
+            test_start=pd.Timestamp("2026-01-02T00:00:00Z"),
+            test_end=pd.Timestamp("2026-01-02T00:45:00Z"),
+        ),
+    ]
+
+    setups, _, executions, counters = _execute_candidates(
+        candidates=candidates,
+        prepared=prepared,
+        periods=periods,
+        config=_exact_limit_replay_config(),
+        policy="stop-first",
+        progress=None,
+    )
+
+    assert setups == []
+    assert [row["disposition"] for row in executions] == [
+        "EXPIRED_ENTRY_RANGE",
+        "BLOCK_DUPLICATE",
+    ]
+    assert counters["fill_expired"] == 1
+    assert counters["blocked_duplicate_exact_event"] == 1
+
+
+def test_exact_limit_entry_tp1_same_bar_is_censored_not_expired():
+    m1 = _frame(
+        ["2026-01-01T00:16:00Z"],
+        [(100.0, 111.0, 99.0, 105.0)],
+    )
+    prepared = {
+        "1m": _PreparedSeries(
+            timeframe="1m",
+            frame=m1,
+            close_times=m1.index + pd.Timedelta(minutes=1),
+        )
+    }
+    candidate = _Candidate(
+        candidate_id="ambiguous-attempt",
+        fold_index=0,
+        symbol="EURUSD",
+        decision_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+        gate="ENTER",
+        gate_reason="allowed",
+        signal=_exact_limit_signal("ambiguous-event"),
+    )
+    period = _Period(
+        fold_index=0,
+        train_start=None,
+        train_end=None,
+        test_start=pd.Timestamp("2026-01-01T00:00:00Z"),
+        test_end=pd.Timestamp("2026-01-01T00:45:00Z"),
+    )
+
+    setups, _, executions, counters = _execute_candidates(
+        candidates=[candidate],
+        prepared=prepared,
+        periods=[period],
+        config=_exact_limit_replay_config(),
+        policy="stop-first",
+        progress=None,
+    )
+
+    assert setups == []
+    assert executions[0]["disposition"] == "CENSORED_INTRABAR"
+    assert counters["fill_censored_intrabar"] == 1
+    assert counters["fill_expired"] == 0
 
 
 def test_forced_close_values_every_remaining_leg_at_the_same_price():

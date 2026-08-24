@@ -85,6 +85,14 @@ PERSISTENT_LIMIT_TTL_MIN = min(
     max(1, _env_int("PERSISTENT_LIMIT_TTL_MIN") or 15),
 )
 PERSISTENT_LIMIT_STATE_PATH = AI_DATA_DIR / "pending_limits.json"
+# Exact H1-RB first-touch events are one-shot across UTC days and process
+# restarts. Keep their durable ledger separate from the pending-order book so
+# corruption in one state domain cannot be mistaken for an empty other domain.
+RB_H1_CONSUMED_EVENTS_PATH = AI_DATA_DIR / "rb_h1_consumed_events.json"
+# Stateful Pine H1 detector ledger (active/broken/retested blocks plus causal
+# H1/M1 watermarks). It prevents the rolling 300-bar fetch from resurrecting
+# old blocks or forgetting first touches after a process restart.
+RB_H1_TRACKER_STATE_PATH = AI_DATA_DIR / "rb_h1_tracker_state.json"
 
 # Strictly diagnostic tick observer. It recovers the terminal tick stream in
 # batches and writes to its own SQLite database; it cannot submit orders.
@@ -243,6 +251,11 @@ REJECTION_BLOCK_ENTRY_ENABLED = False
 REJECTION_BLOCK_H1_ENTRY_ENABLED = os.getenv(
     "REJECTION_BLOCK_H1_ENTRY_ENABLED", "1"
 ).strip().lower() in {"1", "true", "yes", "on"}
+# Immutable detector contract for the live H1 rejection-block path. The
+# version is part of setup identity; changed rules require a new name.
+REJECTION_BLOCK_H1_DETECTOR = os.getenv(
+    "REJECTION_BLOCK_H1_DETECTOR", "pine-v1-causal"
+).strip().lower()
 FXPRO_DOM_CAPTURE_ENABLED = os.getenv(
     "FXPRO_DOM_CAPTURE_ENABLED", "0"
 ).strip().lower() in {"1", "true", "yes", "on"}
@@ -395,14 +408,15 @@ ORDERBLOCK_MAX_AGE_BARS = _env_int("ORDERBLOCK_MAX_AGE_BARS") or 80
 HTF_SCORE_MARGIN = int(os.getenv("HTF_SCORE_MARGIN", "2"))
 
 # Named factor weight/margin contract.
-#   v1-fvg-margin  live contract: five votes [2, 2, 1, 1, 1] and a 1H FVG
-#                  regime that only raises the opposing side's margin.
-#   v2-fvg-vote    challenger: H1 P/D 2->1, Order Block 1H 1->2, and the FVG
-#                  regime promoted to a +1 directional vote with symmetric
-#                  margins.
-# The challenger changes production scoring semantics and must not reach live
-# trading before a frozen paired OOS comparison is reviewed.
-FACTOR_CONTRACT = os.getenv("FACTOR_CONTRACT", "v1-fvg-margin").strip()
+#   v1-fvg-margin             frozen legacy weights; H1 P/D contributes +2.
+#   v2-fvg-vote               research challenger that promotes FVG to a vote.
+#   v3-no-h1pd-fvg-margin     production default: H1 P/D stays diagnostic with
+#                             effective weight 0; legacy FVG margin rule stays.
+# Contract names are immutable model/data boundaries. Never change the weights
+# behind an existing name.
+FACTOR_CONTRACT = os.getenv(
+    "FACTOR_CONTRACT", "v3-no-h1pd-fvg-margin"
+).strip()
 
 # Hard veto on entries whose direction opposes the 1H FVG regime. The score
 # margin only makes such an entry more expensive; the veto refuses it. Paired

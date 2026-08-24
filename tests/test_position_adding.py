@@ -494,6 +494,34 @@ def test_single_tp_signal_is_not_added_to_a_split_idea(monkeypatch):
     assert core._try_position_add("EURUSD", idea, {}, 1.0060) is None
 
 
+def test_limit_retest_signal_is_never_executed_as_market_addon(monkeypatch):
+    idea = _idea(
+        _entry(1, entry=1.0000, stop=0.9950, tickets=[101])
+    )
+    core = _addon_core(FakeRiskExecutor(), idea, monkeypatch)
+    core.strategy = type(
+        "S",
+        (),
+        {
+            "generate_signal": staticmethod(
+                lambda data, symbol="": _sig(
+                    entry_order_type="LIMIT_RETEST",
+                )
+            )
+        },
+    )()
+    monkeypatch.setattr(
+        main.Core,
+        "_execute_entry_signal",
+        lambda self, symbol, sig: pytest.fail(
+            "LIMIT_RETEST add-on must never execute at market"
+        ),
+    )
+
+    assert core._try_position_add("EURUSD", idea, {}, 1.0060) is None
+    assert idea.addons == []
+
+
 def test_no_addon_while_the_idea_is_not_confirmed(monkeypatch):
     idea = _idea(_entry(1, entry=1.0000, stop=0.9950, tickets=[101]))
     core = _addon_core(FakeRiskExecutor(), idea, monkeypatch)

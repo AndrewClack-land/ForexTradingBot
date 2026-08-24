@@ -7,6 +7,7 @@ import pytest
 from core.narrative_scoring import (
     FACTOR_CONTRACT_FVG_VOTE,
     FACTOR_CONTRACT_LEGACY,
+    FACTOR_CONTRACT_NO_H1PD,
     FACTOR_VECTOR_SCHEMA,
     build_factor_vector,
     rescore_factor_vector,
@@ -38,6 +39,7 @@ def test_factor_vector_reproduces_configured_scores_and_absence():
     vector = build_factor_vector(_votes(), base_margin=1)
 
     assert vector["schema"] == FACTOR_VECTOR_SCHEMA
+    assert vector["factor_contract"] == FACTOR_CONTRACT_LEGACY
     assert vector["score_long"] == 3
     assert vector["score_short"] == 2
     assert vector["bias"] == "LONG"
@@ -89,8 +91,10 @@ def test_frozen_vector_can_be_rescored_without_market_data():
             "order_block_1h": 1,
             "rejection_block_1h": 1,
         },
+        factor_contract="research:test-custom-weights",
     )
 
+    assert rescored["factor_contract"] == "research:test-custom-weights"
     assert rescored["score_long"] == 2
     assert rescored["score_short"] == 0
     assert rescored["bias"] == "LONG"
@@ -208,6 +212,7 @@ def test_legacy_contract_keeps_the_fvg_regime_out_of_the_score():
     )
 
     rows = {row["key"]: row for row in vector["factors"]}
+    assert vector["factor_contract"] == FACTOR_CONTRACT_LEGACY
     # The regime is recorded but contributes nothing to either score.
     assert rows["fvg_regime_1h"]["vote_side"] == "SHORT"
     assert rows["fvg_regime_1h"]["effective_weight"] == 0
@@ -230,6 +235,7 @@ def test_fvg_vote_contract_scores_the_regime_and_keeps_margins_symmetric():
     )
 
     rows = {row["key"]: row for row in vector["factors"]}
+    assert vector["factor_contract"] == FACTOR_CONTRACT_FVG_VOTE
     assert rows["fvg_regime_1h"]["effective_weight"] == 1
     # H1 P/D drops to 1, so a disagreeing regime now cancels it exactly.
     assert rows["h1_premium_discount"]["effective_weight"] == 1
@@ -270,9 +276,102 @@ def test_challenger_weights_are_the_agreed_contract():
     assert sum(contract["weights"].values()) == 10
 
 
+def test_no_h1pd_contract_retains_diagnostics_without_a_vote():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_NO_H1PD)
+    vector = build_factor_vector(
+        {
+            "h1_premium_discount": {
+                "present": True,
+                "side": "LONG",
+                "evidence": {"position": "DISCOUNT"},
+            },
+        },
+        base_margin=2,
+        weights=contract["weights"],
+        fvg_margin_enabled=contract["fvg_margin_enabled"],
+    )
+
+    rows = {row["key"]: row for row in vector["factors"]}
+    assert vector["factor_contract"] == FACTOR_CONTRACT_NO_H1PD
+    h1pd = rows["h1_premium_discount"]
+    assert h1pd["present"] is True
+    assert h1pd["vote_side"] == "LONG"
+    assert h1pd["evidence"] == {"position": "DISCOUNT"}
+    assert h1pd["configured_weight"] == 2
+    assert h1pd["effective_weight"] == 0
+    assert h1pd["long_contribution"] == 0
+    assert h1pd["short_contribution"] == 0
+    assert h1pd["selected_side_contribution"] == 0
+    assert h1pd["pivotal_without_factor"] is False
+    assert vector["score_long"] == vector["score_short"] == 0
+    assert vector["bias"] == "NEUTRAL"
+
+
+def test_no_h1pd_contract_bias_is_invariant_to_the_diagnostic_side():
+    contract = resolve_factor_contract(FACTOR_CONTRACT_NO_H1PD)
+
+    def score(h1pd_side: str):
+        return build_factor_vector(
+            {
+                "h1_premium_discount": {
+                    "present": True,
+                    "side": h1pd_side,
+                },
+                "false_breakout_4h": {
+                    "present": True,
+                    "side": "SHORT",
+                },
+            },
+            base_margin=2,
+            weights=contract["weights"],
+            fvg_margin_enabled=contract["fvg_margin_enabled"],
+        )
+
+    long_diagnostic = score("LONG")
+    short_diagnostic = score("SHORT")
+
+    for field in (
+        "bias",
+        "score_long",
+        "score_short",
+        "score_delta_long_minus_short",
+        "margin_long",
+        "margin_short",
+    ):
+        assert long_diagnostic[field] == short_diagnostic[field]
+    assert long_diagnostic["bias"] == "SHORT"
+    assert long_diagnostic["score_long"] == 0
+    assert long_diagnostic["score_short"] == 2
+
+
 def test_unknown_factor_contract_fails_closed():
     with pytest.raises(ValueError, match="unknown factor contract"):
         resolve_factor_contract("v3-guesswork")
+    with pytest.raises(ValueError, match="must not be empty"):
+        resolve_factor_contract("")
+    assert (
+        resolve_factor_contract(None)["name"]
+        == FACTOR_CONTRACT_LEGACY
+    )
+
+
+def test_noncanonical_vector_requires_an_explicit_contract_identity():
+    with pytest.raises(ValueError, match="identity is required"):
+        build_factor_vector(
+            _votes(),
+            base_margin=1,
+            weights={"h1_premium_discount": 0.5},
+        )
+
+    legacy = resolve_factor_contract(FACTOR_CONTRACT_LEGACY)
+    with pytest.raises(ValueError, match="does not match"):
+        build_factor_vector(
+            _votes(),
+            base_margin=1,
+            weights=legacy["weights"],
+            fvg_margin_enabled=legacy["fvg_margin_enabled"],
+            factor_contract=FACTOR_CONTRACT_NO_H1PD,
+        )
 
 
 def test_rescore_preserves_the_margin_rule_of_the_frozen_vector():
@@ -288,6 +387,7 @@ def test_rescore_preserves_the_margin_rule_of_the_frozen_vector():
     rescored = rescore_factor_vector(vector, weights=contract["weights"])
 
     # A frozen challenger vector must not silently regain the margin penalty.
+    assert rescored["factor_contract"] == FACTOR_CONTRACT_FVG_VOTE
     assert rescored["fvg_margin_enabled"] is False
     assert rescored["margin_long"] == rescored["margin_short"] == 2
     assert rescored["score_long"] == vector["score_long"]
@@ -305,7 +405,7 @@ def _veto_stub(bias: str, fvg_side: str):
     strat._last_factor_vector = None
     strat._last_htf_context = None
     strat.rejection_block_h1_entry_enabled = False
-    strat.calc_narrative = lambda *a: (bias, "narrative")
+    strat.calc_narrative = lambda *a, **k: (bias, "narrative")
     strat.calc_fvg_regime_1h = lambda _df: (fvg_side, f"FVG {fvg_side}")
     for name in (
         "trigger_15m_cluster_rejection",

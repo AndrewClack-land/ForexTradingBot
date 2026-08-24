@@ -160,7 +160,7 @@ class _AllSideAllTriggerStrategy:
         type(self).calls[("rejection_block_15m", side)] += 1
         return self._entry(side, "rejection_block_15m", 0.00)
 
-    def trigger_h1_rejection_block(self, _, side):
+    def trigger_h1_rejection_block(self, _, side, ctx=None, symbol=""):
         type(self).calls[("rejection_block_1h", side)] += 1
         entry = self._entry(side, "rejection_block_1h", 0.00)
         entry.tf = "1H"
@@ -521,6 +521,140 @@ def test_entry_ttl_deadline_is_exclusive():
 
     assert deadline_fill is None
     assert causal_fill == pd.Timestamp("2026-01-01T00:29:00Z")
+
+
+def _limit_retest_signal(**overrides):
+    signal = {
+        "side": "LONG",
+        "entry_price": 100.0,
+        "entry_min": 100.0,
+        "entry_max": 100.0,
+        "stop_price": 99.0,
+        "tp_prices": [101.0, 102.0, 103.0],
+        "entry_order_type": "LIMIT_RETEST",
+    }
+    signal.update(overrides)
+    return signal
+
+
+def test_limit_retest_fills_on_m1_range_at_planned_price_not_open():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    m1 = _frame(
+        ["2026-01-01T00:16:00Z"],
+        [(100.7, 100.8, 99.9, 100.4)],
+    )
+
+    position, fill_time, fill_price, reason = (
+        counterfactual_module._find_fill(
+            m1=m1,
+            decision_time=decision_time,
+            period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+            signal=_limit_retest_signal(),
+            config=_config(),
+        )
+    )
+
+    assert position == 0
+    assert fill_time == pd.Timestamp("2026-01-01T00:16:00Z")
+    assert fill_price == pytest.approx(100.0)
+    assert reason == "filled LIMIT_RETEST at planned price"
+
+
+@pytest.mark.parametrize(
+    ("row", "reason_fragment"),
+    [
+        ((99.5, 99.6, 98.9, 99.2), "stop touched before entry"),
+        ((101.1, 101.2, 100.5, 101.0), "TP1 touched before entry"),
+    ],
+)
+def test_limit_retest_invalidates_stop_or_tp1_before_entry(
+    row,
+    reason_fragment,
+):
+    _, fill_time, fill_price, reason = (
+        counterfactual_module._find_fill(
+            m1=_frame(["2026-01-01T00:16:00Z"], [row]),
+            decision_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+            period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+            signal=_limit_retest_signal(),
+            config=_config(),
+        )
+    )
+
+    assert fill_time is None
+    assert fill_price is None
+    assert reason_fragment in reason
+
+
+def test_limit_retest_same_bar_entry_and_stop_is_conservative_fill():
+    position, fill_time, fill_price, reason = (
+        counterfactual_module._find_fill(
+            m1=_frame(
+                ["2026-01-01T00:16:00Z"],
+                [(100.5, 100.6, 98.9, 99.5)],
+            ),
+            decision_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+            period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+            signal=_limit_retest_signal(),
+            config=_config(),
+        )
+    )
+
+    assert position == 0
+    assert fill_time == pd.Timestamp("2026-01-01T00:16:00Z")
+    assert fill_price == pytest.approx(100.0)
+    assert "stop-first" in reason
+
+
+def test_limit_retest_same_bar_entry_and_tp1_without_stop_is_censored():
+    _, fill_time, fill_price, reason = (
+        counterfactual_module._find_fill(
+            m1=_frame(
+                ["2026-01-01T00:16:00Z"],
+                [(100.5, 101.1, 99.9, 100.8)],
+            ),
+            decision_time=pd.Timestamp("2026-01-01T00:15:00Z"),
+            period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+            signal=_limit_retest_signal(),
+            config=_config(),
+        )
+    )
+
+    assert fill_time is None
+    assert fill_price is None
+    assert "ambiguous" in reason
+
+
+def test_limit_retest_signal_specific_ttl_is_exclusive():
+    decision_time = pd.Timestamp("2026-01-01T00:15:00Z")
+    m1 = _frame(
+        [
+            "2026-01-01T00:16:00Z",
+            "2026-01-01T00:17:00Z",
+        ],
+        [
+            (100.7, 100.8, 100.4, 100.5),
+            (100.7, 100.8, 99.9, 100.4),
+        ],
+    )
+
+    _, expired_time, _, _ = counterfactual_module._find_fill(
+        m1=m1,
+        decision_time=decision_time,
+        period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+        signal=_limit_retest_signal(entry_ttl_min=2),
+        config=_config(),
+    )
+    _, filled_time, _, _ = counterfactual_module._find_fill(
+        m1=m1,
+        decision_time=decision_time,
+        period_end=pd.Timestamp("2026-01-01T01:00:00Z"),
+        signal=_limit_retest_signal(entry_ttl_min=3),
+        config=_config(),
+    )
+
+    assert expired_time is None
+    assert filled_time == pd.Timestamp("2026-01-01T00:17:00Z")
 
 
 def test_universe_regenerates_both_sides_and_every_trigger_inside_train():

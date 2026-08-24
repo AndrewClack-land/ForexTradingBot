@@ -13,10 +13,11 @@ import math
 from typing import Any, Mapping, Optional
 
 
-# v3 adds the two 1H fractal-breakout rows, so the vector carries eight rows:
-# seven directional votes plus the explicit ``fvg_regime_1h`` regime row.
-# Frozen v1/v2 weight models are five-dimensional and must be refitted rather
-# than reinterpreted against this layout.
+# v3 adds the two 1H fractal-breakout rows, so the vector carries eight rows.
+# A named contract may set a row's effective weight to zero while retaining
+# its observation for diagnostics. Frozen v1/v2 weight models are
+# five-dimensional and must be refitted rather than reinterpreted against this
+# layout.
 FACTOR_VECTOR_SCHEMA = "narrative-factor-vector/v3"
 
 
@@ -27,11 +28,12 @@ class FactorDefinition:
     configured_weight: int
 
 
-# ``configured_weight`` is the weight of the contract that is actually live.
-# The 1H FVG regime carries a zero weight here because under the live contract
-# it is not a vote at all — it only raises the opposing side's margin. Keeping
-# the row in the schema lets both contracts share one factor vector layout, so
-# a challenger run stays paired with its baseline through the same simulator.
+# ``configured_weight`` is the canonical legacy/reference weight attached to
+# the stable row. ``effective_weight`` is selected by the named contract and is
+# the only value used for scoring. The 1H FVG regime carries a zero reference
+# weight because under the legacy contract it only raises the opposing side's
+# margin. Keeping zero-weight diagnostic rows in the schema lets all contracts
+# share one factor-vector layout.
 FACTOR_DEFINITIONS = (
     FactorDefinition(
         "h1_premium_discount",
@@ -90,8 +92,8 @@ CHALLENGER_FACTOR_WEIGHTS = {
     "h1_premium_discount": 1,
     "false_breakout_4h": 2,
     "true_breakout_15m": 1,
-    # The 1H breakout rows mirror the live contract so this arm keeps
-    # isolating the FVG change alone. It stays one point heavier than live
+    # The 1H breakout rows mirror the frozen legacy reference so this arm keeps
+    # isolating the FVG change alone. It stays one point heavier than legacy
     # (10 vs 9) for the same reason it always was: here the FVG row votes.
     "false_breakout_1h": 1,
     "true_breakout_1h": 1,
@@ -100,8 +102,16 @@ CHALLENGER_FACTOR_WEIGHTS = {
     "fvg_regime_1h": 1,
 }
 
+# Production successor: H1 Premium/Discount remains observable in the frozen
+# factor vector, but cannot contribute to either directional score. All other
+# weights and the legacy FVG margin rule remain unchanged so this contract
+# isolates one policy change.
+NO_H1PD_FACTOR_WEIGHTS = dict(LEGACY_FACTOR_WEIGHTS)
+NO_H1PD_FACTOR_WEIGHTS["h1_premium_discount"] = 0
+
 FACTOR_CONTRACT_LEGACY = "v1-fvg-margin"
 FACTOR_CONTRACT_FVG_VOTE = "v2-fvg-vote"
+FACTOR_CONTRACT_NO_H1PD = "v3-no-h1pd-fvg-margin"
 
 # ``fvg_margin_enabled`` and the FVG weight are deliberately mutually
 # exclusive. As a margin rule the regime can only brake the opposing entry; as
@@ -116,13 +126,25 @@ FACTOR_CONTRACTS = {
         "weights": dict(CHALLENGER_FACTOR_WEIGHTS),
         "fvg_margin_enabled": False,
     },
+    FACTOR_CONTRACT_NO_H1PD: {
+        "weights": dict(NO_H1PD_FACTOR_WEIGHTS),
+        "fvg_margin_enabled": True,
+    },
 }
 
 
 def resolve_factor_contract(name: Optional[str]) -> dict[str, Any]:
     """Return the frozen weight/margin pair for a named factor contract."""
 
-    key = str(name or FACTOR_CONTRACT_LEGACY).strip()
+    # ``None`` retains the legacy API default for historical/offline callers.
+    # An explicitly empty environment/config value is a deployment error and
+    # must not silently reactivate the legacy H1 Premium/Discount vote.
+    if name is None:
+        key = FACTOR_CONTRACT_LEGACY
+    else:
+        key = str(name).strip()
+        if not key:
+            raise ValueError("factor contract must not be empty")
     if key not in FACTOR_CONTRACTS:
         raise ValueError(
             f"unknown factor contract {key!r}; "
@@ -134,6 +156,50 @@ def resolve_factor_contract(name: Optional[str]) -> dict[str, Any]:
         "weights": dict(contract["weights"]),
         "fvg_margin_enabled": bool(contract["fvg_margin_enabled"]),
     }
+
+
+def _factor_contract_identity(
+    *,
+    effective_weights: Mapping[str, float],
+    fvg_margin_enabled: bool,
+    explicit: Optional[str],
+) -> str:
+    """Bind a vector to one named contract or an explicit research identity."""
+
+    normalized_weights = {
+        key: float(value) for key, value in effective_weights.items()
+    }
+    matches = [
+        name
+        for name, contract in FACTOR_CONTRACTS.items()
+        if bool(contract["fvg_margin_enabled"]) == bool(fvg_margin_enabled)
+        and {
+            key: float(value)
+            for key, value in contract["weights"].items()
+        }
+        == normalized_weights
+    ]
+
+    if explicit is not None:
+        identity = str(explicit).strip()
+        if not identity:
+            raise ValueError("factor_contract identity must not be empty")
+        if identity in FACTOR_CONTRACTS and identity not in matches:
+            raise ValueError(
+                "factor_contract identity does not match the supplied "
+                "weights/FVG-margin mode"
+            )
+        return identity
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise ValueError(
+            "factor_contract identity is required for non-canonical weights"
+        )
+    raise ValueError(
+        "factor_contract identity is required because multiple canonical "
+        "contracts match"
+    )
 
 
 _SIDES = {"LONG", "SHORT", "NEUTRAL"}
@@ -167,6 +233,7 @@ def build_factor_vector(
     fvg_side: str = "NEUTRAL",
     weights: Optional[Mapping[str, float]] = None,
     fvg_margin_enabled: bool = True,
+    factor_contract: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build a deterministic factor vector from frozen directional votes.
 
@@ -179,6 +246,10 @@ def build_factor_vector(
     margins while ``fvg_margin_enabled`` is set; under the FVG-vote contract the
     regime enters through the ``fvg_regime_1h`` vote instead and the margins
     stay symmetric.
+
+    Canonical weights plus FVG-margin mode resolve to their immutable named
+    contract automatically. Non-canonical research weights must supply an
+    explicit non-empty ``factor_contract`` identity.
     """
 
     effective_weights = {
@@ -199,6 +270,11 @@ def build_factor_vector(
         raise ValueError(
             f"factor weights must be finite and non-negative: {invalid_weights}"
         )
+    contract_identity = _factor_contract_identity(
+        effective_weights=effective_weights,
+        fvg_margin_enabled=fvg_margin_enabled,
+        explicit=factor_contract,
+    )
     normalized_fvg = _side(fvg_side)
     normalized_margin = max(1, int(base_margin))
     margin_penalty = bool(fvg_margin_enabled)
@@ -269,6 +345,7 @@ def build_factor_vector(
 
     return {
         "schema": FACTOR_VECTOR_SCHEMA,
+        "factor_contract": contract_identity,
         "bias": selected_bias,
         "score_long": score_long,
         "score_short": score_short,
@@ -286,8 +363,13 @@ def rescore_factor_vector(
     factor_vector: Mapping[str, Any],
     *,
     weights: Mapping[str, float],
+    factor_contract: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Re-score frozen votes without re-reading candles or future outcomes."""
+    """Re-score frozen votes without re-reading candles or future outcomes.
+
+    Registered weights auto-resolve their contract. Custom research weights
+    require an explicit ``factor_contract`` identity.
+    """
 
     votes = {
         str(row.get("key")): {
@@ -306,4 +388,5 @@ def rescore_factor_vector(
         fvg_margin_enabled=bool(
             factor_vector.get("fvg_margin_enabled", True)
         ),
+        factor_contract=factor_contract,
     )

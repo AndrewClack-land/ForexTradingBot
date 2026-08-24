@@ -799,14 +799,34 @@ def _materialize_entry(
             if entry.entry_min is not None
             else entry.entry_price
         )
+    stop_kwargs: dict[str, Any] = {
+        "custom_stop": getattr(entry, "stop_override", None),
+        "symbol": symbol,
+    }
+    lock_stop_override = bool(
+        getattr(entry, "lock_stop_override", False)
+    )
+    if lock_stop_override:
+        stop_kwargs["lock_custom_stop"] = True
     stop, targets = strategy.calc_stop_and_tps(
         entry_for_risk,
         side,
         df_1h,
         df_4h,
-        custom_stop=getattr(entry, "stop_override", None),
-        symbol=symbol,
+        **stop_kwargs,
     )
+    stop_atr_ratio = None
+    atr_func = getattr(strategy, "_atr", None)
+    if callable(atr_func):
+        try:
+            stop_atr = float(atr_func(df_1h, 14))
+        except (TypeError, ValueError):
+            stop_atr = float("nan")
+        if math.isfinite(stop_atr) and stop_atr > 0:
+            stop_atr_ratio = round(
+                abs(float(entry_for_risk) - float(stop)) / stop_atr,
+                6,
+            )
     if len(targets) != 3:
         raise StrategyBacktestError(
             f"{symbol}: counterfactual opportunity must have three targets"
@@ -826,6 +846,21 @@ def _materialize_entry(
         ),
         "entry_price": round(entry_for_risk, 6),
         "stop_price": round(float(stop), 6),
+        "structural_stop_price": (
+            round(float(entry.stop_override), 6)
+            if lock_stop_override and entry.stop_override is not None
+            else None
+        ),
+        "stop_mode": (
+            "structural_exact"
+            if lock_stop_override
+            else "atr_bounded"
+        ),
+        "stop_atr_ratio": stop_atr_ratio,
+        "stop_atr_h1": stop_atr_ratio,
+        "lock_stop_override": lock_stop_override,
+        "entry_order_type": getattr(entry, "entry_order_type", None),
+        "entry_ttl_min": getattr(entry, "entry_ttl_min", None),
         "tp_price": round(float(targets[-1]), 6),
         "tp_prices": [round(float(value), 6) for value in targets],
         "risk_percent": f"{float(strategy.risk_per_trade) * 100:.2f}%",
@@ -875,7 +910,11 @@ def _detect_entries(
             detected.append(("rejection_block_15m", entry))
 
         h1_detector = getattr(strategy, "trigger_h1_rejection_block", None)
-        entry = h1_detector(df_1h, side) if callable(h1_detector) else None
+        entry = (
+            h1_detector(df_1h, side, ctx=context)
+            if callable(h1_detector)
+            else None
+        )
         if entry is not None:
             detected.append(("rejection_block_1h", entry))
 
@@ -1045,6 +1084,7 @@ def _generate_symbol_universe(
                 data["4H"],
                 data["1H"],
                 data["15M"],
+                symbol,
             )
             factor_vector = getattr(strategy, "_last_factor_vector", None)
             fvg_side, fvg_text = strategy.calc_fvg_regime_1h(data["1H"])

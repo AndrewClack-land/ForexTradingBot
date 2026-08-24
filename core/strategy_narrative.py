@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Dict, Optional, Literal, Tuple, Any, List
+from typing import Any, Dict, List, Literal, Mapping, Optional, Tuple
 
 import time
 import numpy as np
@@ -16,8 +16,9 @@ from core.fxpro_quote_pressure import (
     LiquidityRejectionThresholds,
     detect_fxpro_quote_pressure_rejection,
 )
-from core.htf_context import HtfContext
+from core.htf_context import HtfContext, PineRejectionBlockTracker
 from core.narrative_scoring import (
+    FACTOR_CONTRACT_NO_H1PD,
     build_factor_vector,
     resolve_factor_contract,
 )
@@ -36,6 +37,10 @@ SINGLE_TP_RR = float(getattr(_cfg, "SINGLE_TP_RR", 1.2))
 REJECTION_BLOCK_H1_ENTRY_ENABLED = bool(
     getattr(_cfg, "REJECTION_BLOCK_H1_ENTRY_ENABLED", False)
 )
+REJECTION_BLOCK_H1_DETECTOR = str(
+    getattr(_cfg, "REJECTION_BLOCK_H1_DETECTOR", "pine-v1-causal")
+).strip().lower()
+SYMBOL_DECIMALS = dict(getattr(_cfg, "SYMBOL_DECIMALS", {}) or {})
 FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED = bool(
     getattr(_cfg, "FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED", False)
 )
@@ -113,7 +118,7 @@ FVG_EVENT_INVALIDATION_MODE = str(
     getattr(_cfg, "FVG_EVENT_INVALIDATION_MODE", "none")
 ).strip().lower()
 FACTOR_CONTRACT = str(
-    getattr(_cfg, "FACTOR_CONTRACT", "v1-fvg-margin")
+    getattr(_cfg, "FACTOR_CONTRACT", FACTOR_CONTRACT_NO_H1PD)
 ).strip()
 FVG_VETO_ENABLED = bool(getattr(_cfg, "FVG_VETO_ENABLED", False))
 
@@ -177,6 +182,13 @@ class CandidateEntry:
     trigger_kind: Optional[str] = None
     trigger_event_id: Optional[str] = None
     trigger_meta: Optional[Dict[str, Any]] = None
+    # Explicit execution semantics. Defaults preserve every legacy trigger:
+    # only structural setups that opt in may bypass the ATR stop bounds or wait
+    # for a future native LIMIT touch. Keep these appended for positional
+    # constructor compatibility.
+    lock_stop_override: bool = False
+    entry_order_type: Optional[str] = None
+    entry_ttl_min: Optional[int] = None
 
 
 @dataclass
@@ -252,10 +264,10 @@ class ActiveTrade:
 class NarrativeStrategy:
     """
     Top-Down:
-      1) Narrative / BIAS: H1 Premium/Discount, 4H/15M fractal
-         breakouts, 1H Order/Rejection Blocks
+      1) Narrative / BIAS: 4H/15M/1H fractal breakouts and 1H
+         Order/Rejection Blocks. H1 Premium/Discount is diagnostic only.
       2) Bias strictness: 1H FVG regime
-      3) SETUP: completed H1 Rejection Block (RB M15 is retired)
+      3) SETUP: causal H1 Rejection Block exact proximal retest
       4) FALLBACK: FxPro/Quantower Cluster Rejection proxy on 15M
       5) FALLBACK2: FxPro Quote Pressure Rejection on 15M
       6) FALLBACK3: H1 Pivots levels + 15M reclaim
@@ -266,6 +278,8 @@ class NarrativeStrategy:
       8) TP: 3 take-profits at fixed R-multiples (1R / 2R / 3R)
     """
 
+    RB_STATE_SCHEMA = "narrative-pine-rb-state/v1"
+
     def __init__(self):
         self.risk_per_trade = 0.01
         self.rr_min = 1.5
@@ -275,6 +289,27 @@ class NarrativeStrategy:
         self.rejection_block_h1_entry_enabled = (
             REJECTION_BLOCK_H1_ENTRY_ENABLED
         )
+        if REJECTION_BLOCK_H1_DETECTOR not in {
+            PineRejectionBlockTracker.VERSION,
+            "legacy",
+            "legacy-v1",
+        }:
+            raise ValueError(
+                "REJECTION_BLOCK_H1_DETECTOR must be "
+                "'pine-v1-causal' or 'legacy'"
+            )
+        self.rejection_block_h1_detector_version = (
+            REJECTION_BLOCK_H1_DETECTOR
+        )
+        # One causal ledger per canonical symbol. It survives rolling H1
+        # windows in-process and has an explicit JSON export/import boundary
+        # for the durable store owned by the runtime.
+        self._pine_rb_trackers: Dict[
+            str,
+            PineRejectionBlockTracker,
+        ] = {}
+        self.rejection_block_h1_state_safe = True
+        self.rejection_block_h1_state_error: Optional[str] = None
         self.cluster_rejection_15m_entry_enabled = (
             FXPRO_CLUSTER_REJECTION_ENTRY_ENABLED
         )
@@ -447,6 +482,130 @@ class NarrativeStrategy:
 
         self._last_htf_context: Optional[HtfContext] = None
         self._last_factor_vector: Optional[Dict[str, Any]] = None
+
+    @staticmethod
+    def _rb_symbol_key(symbol: str) -> str:
+        return str(symbol or "").strip().upper() or "__UNKNOWN__"
+
+    @staticmethod
+    def _rb_min_tick(symbol: str) -> float:
+        symbol_key = str(symbol or "").strip().upper()
+        decimals_raw = SYMBOL_DECIMALS.get(symbol_key)
+        try:
+            decimals = int(decimals_raw)
+        except (TypeError, ValueError):
+            decimals = -1
+        return 10.0 ** (-decimals) if decimals >= 0 else 1e-9
+
+    def _pine_rb_tracker(
+        self,
+        symbol: str,
+    ) -> PineRejectionBlockTracker:
+        key = self._rb_symbol_key(symbol)
+        min_tick = self._rb_min_tick(symbol)
+        tracker = self._pine_rb_trackers.get(key)
+        if tracker is None:
+            tracker = PineRejectionBlockTracker(
+                min_tick=min_tick,
+                symbol=key,
+            )
+            self._pine_rb_trackers[key] = tracker
+        elif not np.isclose(
+            tracker.min_tick,
+            min_tick,
+            rtol=0.0,
+            atol=max(1e-15, min_tick * 1e-12),
+        ):
+            raise ValueError(
+                f"Pine RB min_tick changed for {key}: "
+                f"{tracker.min_tick:g} -> {min_tick:g}"
+            )
+        return tracker
+
+    @property
+    def rejection_block_h1_state_dirty(self) -> bool:
+        return any(
+            tracker.dirty
+            for tracker in self._pine_rb_trackers.values()
+        )
+
+    def mark_rejection_block_h1_state_clean(self) -> None:
+        for tracker in self._pine_rb_trackers.values():
+            tracker.mark_clean()
+
+    def set_rejection_block_h1_state_safe(
+        self,
+        safe: bool,
+        *,
+        reason: Optional[str] = None,
+    ) -> None:
+        self.rejection_block_h1_state_safe = bool(safe)
+        self.rejection_block_h1_state_error = (
+            None
+            if safe
+            else str(reason or "RB durable state is unsafe")
+        )
+
+    def export_rejection_block_h1_state(self) -> Dict[str, Any]:
+        """Return a pure JSON-serializable snapshot; this method does no I/O."""
+
+        return {
+            "schema": self.RB_STATE_SCHEMA,
+            "detector_version": PineRejectionBlockTracker.VERSION,
+            "symbols": {
+                symbol: tracker.export_state()
+                for symbol, tracker in sorted(
+                    self._pine_rb_trackers.items()
+                )
+            },
+        }
+
+    def import_rejection_block_h1_state(
+        self,
+        payload: Mapping[str, Any],
+    ) -> None:
+        """Atomically replace the in-memory RB ledger after full validation."""
+
+        if not isinstance(payload, Mapping):
+            raise ValueError("Narrative RB state must be a mapping")
+        if payload.get("schema") != self.RB_STATE_SCHEMA:
+            raise ValueError("unsupported Narrative RB state schema")
+        if (
+            payload.get("detector_version")
+            != PineRejectionBlockTracker.VERSION
+        ):
+            raise ValueError("Narrative RB detector version mismatch")
+        symbols = payload.get("symbols")
+        if not isinstance(symbols, Mapping):
+            raise ValueError("Narrative RB symbols must be a mapping")
+
+        hydrated: Dict[str, PineRejectionBlockTracker] = {}
+        for raw_symbol, state in symbols.items():
+            if not isinstance(raw_symbol, str):
+                raise ValueError("Narrative RB symbol key must be text")
+            symbol = self._rb_symbol_key(raw_symbol)
+            if symbol != raw_symbol or symbol in hydrated:
+                raise ValueError("invalid or duplicate Narrative RB symbol")
+            tracker = PineRejectionBlockTracker(
+                min_tick=self._rb_min_tick(symbol),
+                symbol=symbol,
+            )
+            tracker.import_state(state)
+            hydrated[symbol] = tracker
+        self._pine_rb_trackers = hydrated
+        self._last_htf_context = None
+
+    def __copy__(self) -> "NarrativeStrategy":
+        """Detach mutable RB ledgers from diagnostic shallow-copy workers."""
+
+        clone = type(self).__new__(type(self))
+        clone.__dict__ = self.__dict__.copy()
+        clone._pine_rb_trackers = {
+            symbol: tracker.clone()
+            for symbol, tracker in self._pine_rb_trackers.items()
+        }
+        clone._last_htf_context = None
+        return clone
 
     # ================== HELPERS ==================
 
@@ -700,6 +859,8 @@ class NarrativeStrategy:
         df_4H: pd.DataFrame,
         df_1H: pd.DataFrame,
         df_15M: pd.DataFrame,
+        symbol: str = "",
+        df_1M: Optional[pd.DataFrame] = None,
     ) -> Optional[HtfContext]:
         if any(
             df is None or df.empty
@@ -707,6 +868,13 @@ class NarrativeStrategy:
         ):
             self._last_htf_context = None
             return None
+        min_tick = self._rb_min_tick(symbol)
+        pine_tracker = (
+            self._pine_rb_tracker(symbol)
+            if self.rejection_block_h1_detector_version
+            == PineRejectionBlockTracker.VERSION
+            else None
+        )
         ctx = HtfContext(
             df_1h=df_1H,
             df_4h=df_4H,
@@ -720,19 +888,105 @@ class NarrativeStrategy:
             rb_wick_ratio=self.htf_rb_wick_ratio,
             rb_intrusion_pct=self.htf_rb_intrusion_pct,
             rb_body_rule=self.htf_rb_body_rule,
+            rb_detector_version=(
+                self.rejection_block_h1_detector_version
+            ),
+            min_tick=min_tick,
+            df_1m=df_1M,
+            pine_rb_tracker=pine_tracker,
+            rb_lifecycle_enabled=(
+                self.rejection_block_h1_state_safe
+            ),
         )
         self._last_htf_context = ctx
         return ctx
+
+    @staticmethod
+    def _rb_timestamp(value: Any) -> Optional[pd.Timestamp]:
+        if value is None:
+            return None
+        try:
+            stamp = pd.Timestamp(value)
+        except (TypeError, ValueError):
+            return None
+        if pd.isna(stamp):
+            return None
+        if stamp.tzinfo is None:
+            stamp = stamp.tz_localize("UTC")
+        else:
+            stamp = stamp.tz_convert("UTC")
+        return stamp
+
+    @classmethod
+    def _rb_recency_key(cls, rb: Any) -> Tuple[int, int, int]:
+        available = cls._rb_timestamp(
+            getattr(rb, "available_time", None)
+        )
+        pivot = cls._rb_timestamp(getattr(rb, "pivot_time", None))
+        try:
+            created = int(getattr(rb, "created_idx", -1))
+        except (TypeError, ValueError):
+            created = -1
+        return (
+            available.value if available is not None else -(2**63),
+            pivot.value if pivot is not None else -(2**63),
+            created,
+        )
+
+    @classmethod
+    def _rb_age_evidence(
+        cls,
+        rb: Any,
+        df_1h: pd.DataFrame,
+    ) -> Dict[str, Any]:
+        pivot = cls._rb_timestamp(getattr(rb, "pivot_time", None))
+        available = cls._rb_timestamp(
+            getattr(rb, "available_time", None)
+        )
+        observed = (
+            cls._rb_timestamp(df_1h.index[-1]) + pd.Timedelta(hours=1)
+            if df_1h is not None
+            and not df_1h.empty
+            and cls._rb_timestamp(df_1h.index[-1]) is not None
+            else None
+        )
+        age_hours = None
+        if observed is not None and available is not None:
+            age_hours = max(
+                0.0,
+                float(
+                    (observed - available).total_seconds()
+                    / 3600.0
+                ),
+            )
+        return {
+            "pivot_time": (
+                pivot.isoformat() if pivot is not None else None
+            ),
+            "available_time": (
+                available.isoformat()
+                if available is not None
+                else None
+            ),
+            "age_hours_since_available": age_hours,
+            # H1 action age. Kept under the legacy key for downstream feature
+            # compatibility, but no longer depends on a rolling-frame index.
+            "age_bars": (
+                int(age_hours) if age_hours is not None else None
+            ),
+        }
 
     def calc_narrative(
         self,
         df_4H: pd.DataFrame,
         df_1H: pd.DataFrame,
         df_15M: pd.DataFrame,
+        symbol: str = "",
+        df_1M: Optional[pd.DataFrame] = None,
     ) -> Tuple[Side, str]:
         """Ensemble-скоринг bias. Голосуют независимые модели:
 
-          H1 Premium/Discount                         +2
+          H1 Premium/Discount                          0 (diagnostic only)
           4H фрактал: ложный пробой (разворот)        +2
           15M фрактал: истинный пробой (продолжение)  +1
           OB 1H                                       +1
@@ -746,7 +1000,13 @@ class NarrativeStrategy:
         недирекционный entry gate в Core._apply_vol_regime_filter: PANIC и
         недостижимый относительно EM1D TP блокируют вход, но не дают L/S-балл.
         """
-        ctx = self._build_htf_context(df_4H, df_1H, df_15M)
+        ctx = self._build_htf_context(
+            df_4H,
+            df_1H,
+            df_15M,
+            symbol,
+            df_1M,
+        )
         if ctx is None:
             self._last_factor_vector = None
             return "NEUTRAL", "Нет данных 4H/1H/15M для Narrative"
@@ -867,13 +1127,22 @@ class NarrativeStrategy:
 
         active_rejection_blocks = [
             rb for rb in (ctx.rejection_blocks or [])
-            if rb.valid and not rb.broken
+            if (
+                self.rejection_block_h1_state_safe
+                and
+                rb.valid
+                and not rb.broken
+                and not bool(
+                    getattr(rb, "baseline_unverified", False)
+                )
+            )
         ]
         if active_rejection_blocks:
             rb = max(
                 active_rejection_blocks,
-                key=lambda item: int(item.created_idx),
+                key=self._rb_recency_key,
             )
+            rb_age = self._rb_age_evidence(rb, df_1H)
             zone_snippets.append(
                 f"RB1H {rb.side} "
                 f"@{min(rb.zone_low, rb.zone_high):.5f}-"
@@ -889,10 +1158,7 @@ class NarrativeStrategy:
                     "wick_ratio": float(rb.wick_ratio),
                     "intrusion_pct": float(rb.intrusion_pct),
                     "created_idx": int(rb.created_idx),
-                    "age_bars": max(
-                        0,
-                        int(len(df_1H) - 1 - int(rb.created_idx)),
-                    ),
+                    **rb_age,
                     "active_count": int(len(active_rejection_blocks)),
                 },
             }
@@ -991,10 +1257,188 @@ class NarrativeStrategy:
         self,
         df_1h: pd.DataFrame,
         side: Side,
+        ctx: Optional[HtfContext] = None,
+        symbol: str = "",
     ) -> Optional[CandidateEntry]:
-        """Detect a completed H1 rejection-block confirmation."""
-        entry = self._trigger_rejection_block(df_1h, side, timeframe="1H")
-        return self._tag_rejection_block_event(entry, df_1h, side, "1H")
+        """Build a causal exact-retest plan from the latest untouched Pine RB."""
+
+        if (
+            df_1h is None
+            or df_1h.empty
+            or side not in {"LONG", "SHORT"}
+            or not self.rejection_block_h1_state_safe
+        ):
+            return None
+        if ctx is None:
+            cached_ctx = getattr(self, "_last_htf_context", None)
+            if (
+                cached_ctx is not None
+                and getattr(cached_ctx, "df_1h", None) is df_1h
+            ):
+                ctx = cached_ctx
+        if ctx is None:
+            try:
+                rejection_blocks = PineRejectionBlockTracker().build(df_1h)
+            except (KeyError, TypeError, ValueError):
+                return None
+        else:
+            rejection_blocks = list(
+                getattr(ctx, "rejection_blocks", ()) or ()
+            )
+
+        current_observed = self._rb_timestamp(df_1h.index[-1])
+        if current_observed is not None:
+            current_observed += pd.Timedelta(hours=1)
+        eligible = []
+        for rb in rejection_blocks:
+            if str(getattr(rb, "side", "")).upper() != side:
+                continue
+            if not bool(getattr(rb, "valid", False)):
+                continue
+            if bool(getattr(rb, "broken", True)):
+                continue
+            if bool(getattr(rb, "retested", True)):
+                continue
+            if bool(getattr(rb, "baseline_unverified", False)):
+                continue
+            if (
+                str(getattr(rb, "detector_version", "")).strip().lower()
+                != PineRejectionBlockTracker.VERSION
+            ):
+                continue
+            try:
+                zone_low, zone_high = sorted(
+                    (
+                        float(getattr(rb, "zone_low")),
+                        float(getattr(rb, "zone_high")),
+                    )
+                )
+            except (TypeError, ValueError):
+                continue
+            try:
+                created_idx = int(getattr(rb, "created_idx", -1))
+            except (TypeError, ValueError):
+                created_idx = -1
+            try:
+                available_raw = getattr(rb, "available_idx", None)
+                available_idx = (
+                    int(available_raw)
+                    if available_raw is not None
+                    else None
+                )
+            except (TypeError, ValueError):
+                available_idx = None
+            pivot_stamp = self._rb_timestamp(
+                getattr(rb, "pivot_time", None)
+            )
+            if (
+                pivot_stamp is None
+                and 0 <= created_idx < len(df_1h)
+            ):
+                pivot_stamp = self._rb_timestamp(
+                    df_1h.index[created_idx]
+                )
+            available_stamp = self._rb_timestamp(
+                getattr(rb, "available_time", None)
+            )
+            if (
+                available_stamp is None
+                and available_idx is not None
+                and 0 <= available_idx < len(df_1h)
+            ):
+                available_stamp = self._rb_timestamp(
+                    df_1h.index[available_idx]
+                )
+                if available_stamp is not None:
+                    available_stamp += pd.Timedelta(hours=1)
+            if (
+                pivot_stamp is None
+                or available_stamp is None
+                or available_stamp <= pivot_stamp
+                or (
+                    current_observed is not None
+                    and available_stamp > current_observed
+                )
+                or not np.isfinite(zone_low)
+                or not np.isfinite(zone_high)
+                or zone_low >= zone_high
+            ):
+                continue
+            eligible.append(
+                (
+                    self._rb_recency_key(rb),
+                    zone_low,
+                    zone_high,
+                    rb,
+                    created_idx,
+                    available_idx,
+                    pivot_stamp.isoformat(),
+                    available_stamp.isoformat(),
+                )
+            )
+
+        if not eligible:
+            return None
+        (
+            _,
+            zone_low,
+            zone_high,
+            rb,
+            created_idx,
+            available_idx,
+            pivot_key,
+            available_time,
+        ) = max(eligible, key=lambda item: item[0])
+        entry_price = zone_high if side == "LONG" else zone_low
+        stop_override = zone_low if side == "LONG" else zone_high
+        context_symbol = str(
+            getattr(getattr(ctx, "rb_tracker", None), "symbol", "")
+            or ""
+        )
+        symbol_key = self._rb_symbol_key(symbol or context_symbol)
+        event_id = (
+            "rb:h1:touch:v1:"
+            f"{symbol_key}:{side}:{pivot_key}"
+        )
+        return CandidateEntry(
+            side=side,
+            entry_price=float(entry_price),
+            entry_min=float(entry_price),
+            entry_max=float(entry_price),
+            tf="1H",
+            reason=(
+                f"RejectionBlock 1H {side} exact proximal retest | "
+                f"detector={PineRejectionBlockTracker.VERSION} | "
+                "persistent block; execution TTL is policy-owned"
+            ),
+            zone_low=float(zone_low),
+            zone_high=float(zone_high),
+            stop_override=float(stop_override),
+            lock_entry_range=True,
+            trigger_kind="rejection_block_1h",
+            trigger_event_id=event_id,
+            trigger_meta={
+                "schema": "rb-h1-exact-retest/v1",
+                "setup_timeframe": "1H",
+                "detector_version": PineRejectionBlockTracker.VERSION,
+                "symbol": symbol_key,
+                "pivot_index": created_idx,
+                "pivot_time": str(
+                    getattr(rb, "pivot_time", None) or pivot_key
+                ),
+                "available_index": available_idx,
+                "available_time": available_time,
+                "entry_boundary": "top" if side == "LONG" else "bottom",
+                "stop_boundary": "bottom" if side == "LONG" else "top",
+                "block_persistent": True,
+                "execution_ttl_source": "policy",
+                "wick_ratio": float(getattr(rb, "wick_ratio", 0.0)),
+                "atr_at_pivot": getattr(rb, "atr_at_pivot", None),
+            },
+            lock_stop_override=True,
+            entry_order_type="LIMIT_RETEST",
+            entry_ttl_min=None,
+        )
     def trigger_h4_rejection_block(
         self,
         df_4h: pd.DataFrame,
@@ -1019,6 +1463,7 @@ class NarrativeStrategy:
             entry,
             trigger_event_id=event_id,
             trigger_meta={
+                **dict(entry.trigger_meta or {}),
                 "setup_timeframe": timeframe,
                 "pivot_index": str(pivot_index),
             },
@@ -1641,6 +2086,7 @@ class NarrativeStrategy:
         df_4H: pd.DataFrame,
         custom_stop: Optional[float] = None,
         symbol: str = "",
+        lock_custom_stop: bool = False,
     ) -> tuple[float, List[float]]:
         atr1 = self._atr(df_1H, 14)
         atr1 = max(float(atr1), 1e-9)
@@ -1649,7 +2095,23 @@ class NarrativeStrategy:
         min_risk = float(self.min_risk_atr_k) * atr1
         max_risk = float(self.max_risk_atr_k) * atr1
 
-        if custom_stop is not None:
+        if lock_custom_stop:
+            if custom_stop is None:
+                raise ValueError(
+                    "lock_custom_stop requires an explicit structural stop"
+                )
+            stop = float(custom_stop)
+            if not np.isfinite(float(entry_price)) or not np.isfinite(stop):
+                raise ValueError("structural entry/stop must be finite")
+            if side == "LONG" and not stop < float(entry_price):
+                raise ValueError("LONG structural stop must be below entry")
+            if side == "SHORT" and not stop > float(entry_price):
+                raise ValueError("SHORT structural stop must be above entry")
+            if side not in {"LONG", "SHORT"}:
+                raise ValueError(
+                    f"unsupported side for structural stop: {side}"
+                )
+        elif custom_stop is not None:
             stop = float(custom_stop)
         else:
             fract_level = self._williams_fractal_stop_level(df_1H, side, ref_price=float(entry_price))
@@ -1659,31 +2121,46 @@ class NarrativeStrategy:
             else:
                 stop = (fract_level - buf) if side == "LONG" else (fract_level + buf)
 
-        if side == "LONG":
-            stop = min(stop, entry_price - 1e-6)
-            stop = min(stop, entry_price - min_risk)
-        else:
-            stop = max(stop, entry_price + 1e-6)
-            stop = max(stop, entry_price + min_risk)
+        if not lock_custom_stop:
+            if side == "LONG":
+                stop = min(stop, entry_price - 1e-6)
+                stop = min(stop, entry_price - min_risk)
+            else:
+                stop = max(stop, entry_price + 1e-6)
+                stop = max(stop, entry_price + min_risk)
 
-        risk = abs(entry_price - stop)
-        if risk > max_risk:
-            stop = (entry_price - max_risk) if side == "LONG" else (entry_price + max_risk)
-        elif risk < min_risk:
-            stop = (entry_price - min_risk) if side == "LONG" else (entry_price + min_risk)
+            risk = abs(entry_price - stop)
+            if risk > max_risk:
+                stop = (
+                    entry_price - max_risk
+                    if side == "LONG"
+                    else entry_price + max_risk
+                )
+            elif risk < min_risk:
+                stop = (
+                    entry_price - min_risk
+                    if side == "LONG"
+                    else entry_price + min_risk
+                )
 
-        if custom_stop is None:
-            candle_floor = self._candle_stop_floor(entry_price, side, df_1H, df_4H, buf=buf)
-            if candle_floor is not None:
-                if side == "SHORT":
-                    stop = max(stop, candle_floor)
-                else:
-                    stop = min(stop, candle_floor)
+            if custom_stop is None:
+                candle_floor = self._candle_stop_floor(
+                    entry_price,
+                    side,
+                    df_1H,
+                    df_4H,
+                    buf=buf,
+                )
+                if candle_floor is not None:
+                    if side == "SHORT":
+                        stop = max(stop, candle_floor)
+                    else:
+                        stop = min(stop, candle_floor)
 
-        if side == "LONG":
-            stop = min(stop, entry_price - 1e-6)
-        else:
-            stop = max(stop, entry_price + 1e-6)
+            if side == "LONG":
+                stop = min(stop, entry_price - 1e-6)
+            else:
+                stop = max(stop, entry_price + 1e-6)
 
         risk = abs(entry_price - stop)
 
@@ -1734,14 +2211,23 @@ class NarrativeStrategy:
                 else entry.entry_price
             )
 
+        stop_kwargs: Dict[str, Any] = {
+            "custom_stop": getattr(entry, "stop_override", None),
+            "symbol": symbol,
+        }
+        lock_stop_override = bool(
+            getattr(entry, "lock_stop_override", False)
+        )
+        if lock_stop_override:
+            stop_kwargs["lock_custom_stop"] = True
         stop, tp_prices = self.calc_stop_and_tps(
             entry_for_risk,
             entry.side,
             df_1H,
             df_4H,
-            custom_stop=getattr(entry, "stop_override", None),
-            symbol=symbol,
+            **stop_kwargs,
         )
+        stop_atr = max(float(self._atr(df_1H, 14)), 1e-9)
         if getattr(self, "single_tp_mode", False):
             # One TP for the entire position: the aggregate R/R equals the
             # single target's R/R by construction, and the same value is the
@@ -1778,6 +2264,27 @@ class NarrativeStrategy:
             ),
             "entry_price": round(float(entry_for_risk), 6),
             "stop_price": round(float(stop), 6),
+            "structural_stop_price": (
+                round(float(entry.stop_override), 6)
+                if lock_stop_override and entry.stop_override is not None
+                else None
+            ),
+            "stop_mode": (
+                "structural_exact"
+                if lock_stop_override
+                else "atr_bounded"
+            ),
+            "stop_atr_ratio": round(
+                abs(float(entry_for_risk) - float(stop)) / stop_atr,
+                6,
+            ),
+            "stop_atr_h1": round(
+                abs(float(entry_for_risk) - float(stop)) / stop_atr,
+                6,
+            ),
+            "lock_stop_override": lock_stop_override,
+            "entry_order_type": getattr(entry, "entry_order_type", None),
+            "entry_ttl_min": getattr(entry, "entry_ttl_min", None),
             "tp_price": round(float(tp_prices[-1]), 6),
             "tp_prices": [round(float(value), 6) for value in tp_prices],
             "rr": rr_text,
@@ -1826,12 +2333,19 @@ class NarrativeStrategy:
         df_4H = data.get("4H")
         df_1H = data.get("1H")
         df_15M = data.get("15M")
+        df_1M = data.get("1M")
 
         if any(d is None or d.empty for d in (df_4H, df_1H, df_15M)):
             self._last_factor_vector = None
             return {"signal": "NO_DATA"}
 
-        side_bias, narrative_text = self.calc_narrative(df_4H, df_1H, df_15M)
+        side_bias, narrative_text = self.calc_narrative(
+            df_4H,
+            df_1H,
+            df_15M,
+            symbol,
+            df_1M=df_1M,
+        )
         factor_vector = self._last_factor_vector
         ctx = self._last_htf_context
         if side_bias == "NEUTRAL":
@@ -1864,7 +2378,12 @@ class NarrativeStrategy:
                 }
 
         entry = (
-            self.trigger_h1_rejection_block(df_1H, side_bias)
+            self.trigger_h1_rejection_block(
+                df_1H,
+                side_bias,
+                ctx=ctx,
+                symbol=symbol,
+            )
             if self.rejection_block_h1_entry_enabled
             else None
         )
@@ -1926,6 +2445,7 @@ class NarrativeStrategy:
         df_4H = data.get("4H")
         df_1H = data.get("1H")
         df_15M = data.get("15M")
+        df_1M = data.get("1M")
         if any(frame is None or frame.empty for frame in (df_4H, df_1H, df_15M)):
             return []
 
@@ -1933,6 +2453,8 @@ class NarrativeStrategy:
             df_4H,
             df_1H,
             df_15M,
+            symbol,
+            df_1M=df_1M,
         )
         if side_bias == "NEUTRAL":
             return []
@@ -1945,7 +2467,12 @@ class NarrativeStrategy:
                 1,
                 "rejection_block_h1",
                 lambda: (
-                    self.trigger_h1_rejection_block(df_1H, side_bias)
+                    self.trigger_h1_rejection_block(
+                        df_1H,
+                        side_bias,
+                        ctx=ctx,
+                        symbol=symbol,
+                    )
                     if self.rejection_block_h1_entry_enabled
                     else None
                 ),

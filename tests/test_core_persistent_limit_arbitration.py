@@ -17,6 +17,7 @@ from core.persistent_limit import (
     PendingLimitPlan,
     PendingLimitState,
 )
+from core.rb_consumed_events import RBConsumedEventStore
 from core.shadow_tick_watcher import QuoteTick
 from core.strategy_narrative import ActiveTrade
 
@@ -114,6 +115,27 @@ def _signal(side: str) -> dict:
     }
 
 
+def _exact_rb_signal(side: str) -> dict:
+    signal = _signal(side)
+    side_key = side.upper()
+    signal.update(
+        {
+            "entry_min": PLANNED_ENTRY,
+            "entry_max": PLANNED_ENTRY,
+            "entry_order_type": "LIMIT_RETEST",
+            "lock_entry_range": True,
+            "lock_stop_override": True,
+            "tf": "1H",
+            "trigger_kind": "rejection_block_1h",
+            "trigger_event_id": (
+                "rb:h1:touch:v1:EURUSD:"
+                f"{side_key.lower()}:2026-08-24T08:00:00+00:00"
+            ),
+        }
+    )
+    return signal
+
+
 def _active_trade(side: str) -> ActiveTrade:
     signal = _signal(side)
     return ActiveTrade(
@@ -133,6 +155,7 @@ def _core(
     side: str,
     quote: QuoteTick | None,
     pending_plan: PendingLimitPlan | None = None,
+    rb_state_path=None,
 ):
     monkeypatch.setattr(main, "PERSISTENT_LIMIT_ENABLED", True)
     monkeypatch.setattr(
@@ -153,6 +176,15 @@ def _core(
         {SYMBOL: pending_plan} if pending_plan is not None else {}
     )
     core._pending_state_safe = True
+    core._rb_consumed_events = RBConsumedEventStore()
+    core._rb_consumed_events_safe = True
+    core._rb_consumed_events_lock = threading.RLock()
+    if rb_state_path is not None:
+        monkeypatch.setattr(
+            main,
+            "RB_H1_CONSUMED_EVENTS_PATH",
+            rb_state_path,
+        )
     core._pending_entry_events = {}
     core._pending_reconcile_error_ts = 0.0
     core._management_lock = threading.RLock()
@@ -242,6 +274,55 @@ def test_approach_side_arms_native_limit_at_exact_planned_entry(
     assert market_calls == []
 
 
+def test_signal_specific_ttl_reaches_native_pending_plan(monkeypatch):
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side="LONG",
+        quote=QuoteTick(1_500, bid=1.1002, ask=1.1003),
+    )
+    signal = _signal("LONG")
+    signal["entry_ttl_min"] = 30
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+
+    result = core.get_signals()[SYMBOL]
+    plan = core.pending_limits[SYMBOL]
+
+    assert result["signal"] == "PENDING_LIMIT"
+    assert plan.expires_at - plan.created_at == pytest.approx(
+        30 * 60,
+        abs=1.0,
+    )
+    assert executor.placements[0]["expires_at"] == pytest.approx(
+        plan.expires_at
+    )
+    assert market_calls == []
+
+
+def test_exact_limit_retest_never_falls_through_when_symbol_not_routed(
+    monkeypatch,
+):
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side="LONG",
+        quote=QuoteTick(1_600, bid=1.0999, ask=1.1000),
+    )
+    signal = _signal("LONG")
+    signal["entry_order_type"] = "LIMIT_RETEST"
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+    monkeypatch.setattr(main, "PERSISTENT_LIMIT_SYMBOLS", frozenset())
+
+    result = core.get_signals()[SYMBOL]
+
+    assert result["signal"] == "WAIT_LIMIT_UNSUPPORTED"
+    assert "cannot fall through to a market entry" in result["info"]
+    assert executor.placements == []
+    assert market_calls == []
+
+
 @pytest.mark.parametrize(
     ("side", "quote"),
     [
@@ -312,6 +393,152 @@ def test_missing_post_gate_causal_quote_fails_closed(
     assert "fail-closed" in result["info"]
     assert market_calls == []
     assert executor.placements == []
+    assert core.pending_limits == {}
+
+
+@pytest.mark.parametrize(
+    ("side", "quote"),
+    [
+        ("LONG", QuoteTick(5_000, bid=1.1002, ask=1.1003)),
+        ("SHORT", QuoteTick(5_000, bid=1.0997, ask=1.0998)),
+    ],
+)
+def test_exact_rb_approach_consumes_before_native_limit_placement(
+    monkeypatch,
+    tmp_path,
+    side,
+    quote,
+):
+    state_path = tmp_path / "rb_consumed.json"
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side=side,
+        quote=quote,
+        rb_state_path=state_path,
+    )
+    signal = _exact_rb_signal(side)
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+    original_place = executor.place_limit_leg
+
+    def assert_reserved_before_place(symbol, **request):
+        assert state_path.exists()
+        assert core._rb_consumed_events.is_consumed(
+            signal["trigger_event_id"]
+        )
+        return original_place(symbol, **request)
+
+    executor.place_limit_leg = assert_reserved_before_place
+
+    result = core.get_signals()[SYMBOL]
+
+    assert result["signal"] == "PENDING_LIMIT"
+    assert len(executor.placements) == 1
+    assert market_calls == []
+    assert core._rb_consumed_events.is_consumed(
+        signal["trigger_event_id"]
+    )
+
+
+@pytest.mark.parametrize(
+    ("side", "quote"),
+    [
+        ("LONG", QuoteTick(6_000, bid=1.0999, ask=1.1000)),
+        ("SHORT", QuoteTick(6_000, bid=1.1000, ask=1.1001)),
+    ],
+)
+def test_exact_rb_first_touch_never_becomes_market_order(
+    monkeypatch,
+    tmp_path,
+    side,
+    quote,
+):
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side=side,
+        quote=quote,
+        rb_state_path=tmp_path / "rb_consumed.json",
+    )
+    signal = _exact_rb_signal(side)
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+
+    first = core.get_signals()[SYMBOL]
+    repeated = core.get_signals()[SYMBOL]
+
+    assert first["signal"] == "WAIT_LIMIT_FIRST_TOUCH"
+    assert repeated["signal"] == "SKIP_CONSUMED_RB_EVENT"
+    assert core._rb_consumed_events.is_consumed(
+        signal["trigger_event_id"]
+    )
+    assert executor.placements == []
+    assert market_calls == []
+    assert core.pending_limits == {}
+
+
+@pytest.mark.parametrize(
+    ("side", "quote"),
+    [
+        ("LONG", QuoteTick(7_000, bid=1.0997, ask=1.0998)),
+        ("SHORT", QuoteTick(7_000, bid=1.1002, ask=1.1003)),
+    ],
+)
+def test_exact_rb_crossed_before_arm_is_consumed_without_market(
+    monkeypatch,
+    tmp_path,
+    side,
+    quote,
+):
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side=side,
+        quote=quote,
+        rb_state_path=tmp_path / "rb_consumed.json",
+    )
+    signal = _exact_rb_signal(side)
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+
+    result = core.get_signals()[SYMBOL]
+
+    assert result["signal"] == "WAIT_LIMIT_INVALIDATED"
+    assert core._rb_consumed_events.is_consumed(
+        signal["trigger_event_id"]
+    )
+    assert executor.placements == []
+    assert market_calls == []
+    assert core.pending_limits == {}
+
+
+def test_exact_rb_ledger_write_failure_sends_no_broker_order(
+    monkeypatch,
+    tmp_path,
+):
+    core, executor, market_calls = _core(
+        monkeypatch,
+        side="LONG",
+        quote=QuoteTick(8_000, bid=1.1002, ask=1.1003),
+        rb_state_path=tmp_path / "rb_consumed.json",
+    )
+    signal = _exact_rb_signal("LONG")
+    core.strategy = SimpleNamespace(
+        generate_signal=lambda _data, *, symbol: dict(signal)
+    )
+
+    def fail_save(_store, _path):
+        raise OSError("simulated disk failure")
+
+    monkeypatch.setattr(RBConsumedEventStore, "save", fail_save)
+
+    result = core.get_signals()[SYMBOL]
+
+    assert result["signal"] == "WAIT_RB_EVENT_STATE"
+    assert core._rb_consumed_events_safe is False
+    assert executor.placements == []
+    assert market_calls == []
     assert core.pending_limits == {}
 
 

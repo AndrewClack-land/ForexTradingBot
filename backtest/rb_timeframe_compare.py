@@ -198,7 +198,12 @@ def compare(snapshot: str, output: str, symbols: Sequence[str], latency: int = 6
                 entry = detector(data[strategy_key], side)
                 if entry is None:
                     raise RuntimeError(f"vector/exact mismatch: {symbol} {trigger} {closed} {side}")
-                bias, narrative = strategy.calc_narrative(data["4H"], data["1H"], data["15M"])
+                bias, narrative = strategy.calc_narrative(
+                    data["4H"],
+                    data["1H"],
+                    data["15M"],
+                    symbol,
+                )
                 signal = _materialize_entry(strategy=strategy, entry=entry, trigger_kind=trigger, data=data,
                     symbol=symbol, narrative=narrative, factor_vector={}, fvg_side="", fvg_text="")
                 decision = closed + pd.Timedelta(int(latency), unit="s")

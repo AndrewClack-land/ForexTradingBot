@@ -40,6 +40,7 @@ from config import (
     PERSISTENT_LIMIT_SYMBOLS,
     PERSISTENT_LIMIT_TTL_MIN,
     PERSISTENT_LIMIT_STATE_PATH,
+    RB_H1_CONSUMED_EVENTS_PATH,
     SHADOW_TICK_WATCHER_ENABLED,
     SHADOW_TICK_WATCHER_POLL_SEC,
     SHADOW_TICK_WATCHER_MAX_BACKFILL_SEC,
@@ -136,6 +137,10 @@ from core.persistent_limit import (
     PendingLimitValidationError,
     load_pending_limits,
     save_pending_limits,
+)
+from core.rb_consumed_events import (
+    RBConsumedEventStore,
+    RBConsumedEventsValidationError,
 )
 from core.shadow_tick_watcher import (
     MT5ReadOnlyFacade,
@@ -246,9 +251,17 @@ class Core:
         self.data_cache = DataCache(self.feed)
         self.data_cache.start()
         self.strategy = NarrativeStrategy()
+        factor_contract = self.strategy._factor_contract()
+        print(
+            "[Narrative] factor_contract="
+            f"{factor_contract['name']} effective_weights="
+            f"{factor_contract['weights']}"
+        )
         print(
             "[RB] M15 entry hard-disabled; H1 entry "
-            f"{'enabled' if self.strategy.rejection_block_h1_entry_enabled else 'disabled'}"
+            f"{'enabled' if self.strategy.rejection_block_h1_entry_enabled else 'disabled'}; "
+            "detector="
+            f"{self.strategy.rejection_block_h1_detector_version}"
         )
         self.scanner = MarketScanner(self.universe)
 
@@ -285,6 +298,29 @@ class Core:
             print(
                 "[Persistent LIMIT] STATE CORRUPT — all new entries blocked "
                 f"until recovery: {exc}"
+            )
+
+        self._rb_consumed_events = RBConsumedEventStore()
+        self._rb_consumed_events_safe = True
+        self._rb_consumed_events_lock = threading.RLock()
+        try:
+            self._rb_consumed_events = RBConsumedEventStore.load(
+                RB_H1_CONSUMED_EVENTS_PATH
+            )
+            if self._pending_state_safe:
+                self._recover_consumed_rb_events_from_pending()
+            print(
+                "[RB Event Ledger] restored consumed_events="
+                f"{len(self._rb_consumed_events)}"
+            )
+        except (RBConsumedEventsValidationError, OSError) as exc:
+            # A corrupt/unwritable RB ledger blocks exact H1-RB entries only.
+            # Other trigger families remain available, while interpreting the
+            # state as empty could duplicate a first-touch trade after restart.
+            self._rb_consumed_events_safe = False
+            print(
+                "[RB Event Ledger] STATE UNSAFE — exact H1-RB entries "
+                f"blocked until recovery: {exc}"
             )
 
         self.ai_cfg = AIConfig()
@@ -967,6 +1003,134 @@ class Core:
             PERSISTENT_LIMIT_STATE_PATH,
         )
 
+    @staticmethod
+    def _is_exact_h1_rb_signal(sig: Dict[str, Any]) -> bool:
+        return (
+            str(sig.get("entry_order_type") or "").strip().upper()
+            == "LIMIT_RETEST"
+            and str(sig.get("trigger_kind") or "").strip().lower()
+            == "rejection_block_1h"
+        )
+
+    @classmethod
+    def _exact_h1_rb_event_id(cls, sig: Dict[str, Any]) -> Optional[str]:
+        if not cls._is_exact_h1_rb_signal(sig):
+            return None
+        event_id = str(sig.get("trigger_event_id") or "").strip()
+        if not event_id:
+            raise RBConsumedEventsValidationError(
+                "exact H1-RB signal is missing trigger_event_id"
+            )
+        return event_id
+
+    def _rb_event_is_consumed(
+        self,
+        symbol: str,
+        sig: Dict[str, Any],
+        *,
+        trigger_signature: str,
+    ) -> bool:
+        event_id = self._exact_h1_rb_event_id(sig)
+        if event_id is None:
+            return False
+        if not getattr(self, "_rb_consumed_events_safe", False):
+            raise RBConsumedEventsValidationError(
+                "consumed H1-RB event ledger is unsafe"
+            )
+        store = getattr(self, "_rb_consumed_events", None)
+        if not isinstance(store, RBConsumedEventStore):
+            raise RBConsumedEventsValidationError(
+                "consumed H1-RB event ledger is unavailable"
+            )
+        existing = store.events.get(event_id)
+        if existing is None:
+            return False
+        if (
+            existing.symbol != str(symbol).upper()
+            or existing.trigger_signature != trigger_signature
+        ):
+            self._rb_consumed_events_safe = False
+            raise RBConsumedEventsValidationError(
+                f"event_id identity collision for {event_id!r}"
+            )
+        return True
+
+    def _consume_exact_h1_rb_event(
+        self,
+        symbol: str,
+        sig: Dict[str, Any],
+        *,
+        trigger_signature: str,
+        reason: str,
+        consumed_at_utc: Optional[datetime] = None,
+        require_new: bool = False,
+    ) -> bool:
+        """Persist a one-shot exact-RB event before any broker side effect."""
+
+        event_id = self._exact_h1_rb_event_id(sig)
+        if event_id is None:
+            return False
+        lock = getattr(self, "_rb_consumed_events_lock", None)
+        if lock is None:
+            raise RBConsumedEventsValidationError(
+                "consumed H1-RB event ledger lock is unavailable"
+            )
+        with lock:
+            already_consumed = self._rb_event_is_consumed(
+                symbol,
+                sig,
+                trigger_signature=trigger_signature,
+            )
+            if already_consumed:
+                if require_new:
+                    raise RBConsumedEventsValidationError(
+                        f"exact H1-RB event already consumed: {event_id}"
+                    )
+                return False
+            updated = self._rb_consumed_events.consume(
+                event_id=event_id,
+                symbol=str(symbol).upper(),
+                trigger_signature=trigger_signature,
+                reason=reason,
+                consumed_at_utc=consumed_at_utc,
+            )
+            try:
+                updated.save(RB_H1_CONSUMED_EVENTS_PATH)
+            except Exception as exc:
+                self._rb_consumed_events_safe = False
+                raise RBConsumedEventsValidationError(
+                    "cannot durably persist consumed H1-RB event"
+                ) from exc
+            self._rb_consumed_events = updated
+        print(
+            f"[RB Event Ledger] consumed {symbol} event={event_id} "
+            f"reason={reason}"
+        )
+        return True
+
+    def _recover_consumed_rb_events_from_pending(self) -> None:
+        """Backfill the ledger from durable pending intent after a crash."""
+
+        updated = self._rb_consumed_events
+        for symbol, plan in sorted(self.pending_limits.items()):
+            sig = dict(plan.signal_payload)
+            event_id = self._exact_h1_rb_event_id(sig)
+            if event_id is None:
+                continue
+            updated = updated.consume(
+                event_id=event_id,
+                symbol=str(symbol).upper(),
+                trigger_signature=str(plan.trigger_signature),
+                reason="startup-pending-plan-recovery",
+                consumed_at_utc=datetime.fromtimestamp(
+                    float(plan.created_at), tz=timezone.utc
+                ),
+            )
+        if updated is self._rb_consumed_events:
+            return
+        updated.save(RB_H1_CONSUMED_EVENTS_PATH)
+        self._rb_consumed_events = updated
+
     def _get_pending_limit_capabilities(
         self,
         symbol: str,
@@ -1154,9 +1318,26 @@ class Core:
         # that happened before the entry decision actually existed.
         quote = self._capture_quote(symbol)
         activation_observed_at = datetime.now(timezone.utc)
+        entry_ttl_min = float(PERSISTENT_LIMIT_TTL_MIN)
+        signal_ttl_raw = sig.get("entry_ttl_min")
+        if signal_ttl_raw is not None:
+            try:
+                entry_ttl_min = float(signal_ttl_raw)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "signal-specific entry_ttl_min must be numeric"
+                ) from exc
+            if (
+                not math.isfinite(entry_ttl_min)
+                or entry_ttl_min < 1.0
+                or entry_ttl_min > 240.0
+            ):
+                raise ValueError(
+                    "signal-specific entry_ttl_min must be within 1..240"
+                )
         expires_at = (
             activation_observed_at
-            + timedelta(minutes=PERSISTENT_LIMIT_TTL_MIN)
+            + timedelta(minutes=entry_ttl_min)
         ).timestamp()
         if watcher is None or not watcher.enabled:
             return None, quote, expires_at, activation_observed_at
@@ -1226,6 +1407,8 @@ class Core:
             deployment_id=deployment_id,
             metadata={
                 "session": self.global_context.get("session"),
+                "entry_order_type": sig.get("entry_order_type"),
+                "entry_ttl_min": entry_ttl_min,
                 "entry_range_widened": bool(
                     sig.get("entry_range_widened")
                 ),
@@ -1234,7 +1417,7 @@ class Core:
         if watcher.register_plan(spec, activation_quote=quote):
             print(
                 f"[Shadow Tick] {symbol} plan={plan_id[:12]} "
-                f"expires={PERSISTENT_LIMIT_TTL_MIN}m"
+                f"expires={entry_ttl_min:g}m"
             )
         watcher.record_scan(
             plan_id,
@@ -1256,7 +1439,7 @@ class Core:
         shadow_plan_id: Optional[str],
         observed_at: datetime,
     ) -> PendingLimitPlan:
-        """Persist intent first, then place exact-price broker LIMIT legs."""
+        """Persist one-shot reservation and intent before broker LIMIT legs."""
         if not self._pending_state_safe:
             raise RuntimeError(
                 "Persistent LIMIT state is unsafe; new entries are blocked"
@@ -1341,6 +1524,17 @@ class Core:
         sig["setup_id"] = plan_id
         sig.setdefault("idea_id", uuid.uuid4().hex)
         sig["entry_index"] = 1
+        # Reserve an exact RB event before the pending book and before the
+        # first order_send. A crash in the following tiny window can sacrifice
+        # one opportunity, but it can never duplicate a first-touch trade.
+        self._consume_exact_h1_rb_event(
+            symbol,
+            sig,
+            trigger_signature=trigger_signature,
+            reason="native-limit-arming",
+            consumed_at_utc=observed_at,
+            require_new=True,
+        )
         plan = PendingLimitPlan.create(
             symbol=symbol,
             signal=sig,
@@ -4344,6 +4538,17 @@ class Core:
         sig = self._attach_shadow_score(symbol, sig)
         if sig.get("signal") != "ENTER" or not sig.get("side"):
             return None
+        if (
+            str(sig.get("entry_order_type") or "").upper()
+            == "LIMIT_RETEST"
+        ):
+            # Add-ons currently have no durable pending-plan lifecycle.  An
+            # exact structural retest must never degrade into a market add.
+            print(
+                f"[Pyramid] {symbol} add-on blocked: "
+                "LIMIT_RETEST requires persistent pending execution"
+            )
+            return None
         # An add-on must open as broker-managed split legs like the entries it
         # joins; a single-TP signal would land in monitor mode inside an
         # otherwise split idea.
@@ -4441,6 +4646,28 @@ class Core:
                 "new risk is fail-closed"
             )
             return True
+
+        if self._is_exact_h1_rb_signal(sig):
+            try:
+                consumed = self._rb_event_is_consumed(
+                    symbol,
+                    sig,
+                    trigger_signature=trig_sig,
+                )
+            except RBConsumedEventsValidationError as exc:
+                sig["signal"] = "WAIT_RB_EVENT_STATE"
+                sig["info"] = (
+                    "Exact H1-RB one-shot state is unavailable; "
+                    f"entry is fail-closed ({exc})"
+                )
+                return True
+            if consumed:
+                sig["signal"] = "SKIP_CONSUMED_RB_EVENT"
+                sig["info"] = (
+                    "Exact H1-RB first-touch event was already consumed "
+                    "and cannot be re-armed"
+                )
+                return True
 
         # Skip if this symbol is in cooldown (failed execution or stop-out)
         cooldown_until = self._entry_cooldowns.get(symbol, 0.0)
@@ -5335,11 +5562,27 @@ class Core:
                     if shadow_plan_id:
                         sig.setdefault("setup_id", shadow_plan_id)
 
-                    if (
+                    requires_exact_limit = (
+                        str(sig.get("entry_order_type") or "").upper()
+                        == "LIMIT_RETEST"
+                    )
+                    persistent_limit_routed = (
                         PERSISTENT_LIMIT_ENABLED
                         and symbol.upper() in PERSISTENT_LIMIT_SYMBOLS
                         and self.mt5_executor
-                    ):
+                    )
+                    if requires_exact_limit and not persistent_limit_routed:
+                        sig["signal"] = "WAIT_LIMIT_UNSUPPORTED"
+                        sig["info"] = (
+                            "LIMIT_RETEST cannot fall through to a market "
+                            "entry; persistent native LIMIT is unavailable "
+                            "for this symbol"
+                        )
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        continue
+
+                    if persistent_limit_routed:
                         if entry_quote is None:
                             sig["signal"] = "WAIT_LIMIT_QUOTE"
                             sig["info"] = (
@@ -5418,6 +5661,15 @@ class Core:
                                         shadow_plan_id=shadow_plan_id,
                                         observed_at=pending_observed_at,
                                     )
+                            except RBConsumedEventsValidationError as exc:
+                                sig["signal"] = "WAIT_RB_EVENT_STATE"
+                                sig["info"] = (
+                                    "Exact H1-RB one-shot reservation failed; "
+                                    f"no broker order was sent ({exc})"
+                                )
+                                results[symbol] = sig
+                                self._log_signal(symbol, sig)
+                                continue
                             except RiskCapacityError as exc:
                                 sig["signal"] = "WAIT_RISK_ENTRY"
                                 sig["info"] = str(exc)
@@ -5510,7 +5762,53 @@ class Core:
                             self._log_signal(symbol, sig)
                             continue
 
+                        if strict_touch and requires_exact_limit:
+                            try:
+                                self._consume_exact_h1_rb_event(
+                                    symbol,
+                                    sig,
+                                    trigger_signature=trig_sig,
+                                    reason="first-touch-observed-before-arm",
+                                    consumed_at_utc=pending_observed_at,
+                                )
+                            except Exception as exc:
+                                sig["signal"] = "WAIT_RB_EVENT_STATE"
+                                sig["info"] = (
+                                    "Exact H1-RB touch could not be "
+                                    f"persisted; entry is fail-closed ({exc})"
+                                )
+                            else:
+                                sig["signal"] = "WAIT_LIMIT_FIRST_TOUCH"
+                                sig["info"] = (
+                                    "First exact retest was already present "
+                                    "at decision time; no marketable LIMIT or "
+                                    "market fallback is allowed"
+                                )
+                            results[symbol] = sig
+                            self._log_signal(symbol, sig)
+                            continue
+
                         if not strict_touch:
+                            if requires_exact_limit:
+                                try:
+                                    self._consume_exact_h1_rb_event(
+                                        symbol,
+                                        sig,
+                                        trigger_signature=trig_sig,
+                                        reason=(
+                                            "entry-crossed-before-native-limit"
+                                        ),
+                                        consumed_at_utc=pending_observed_at,
+                                    )
+                                except Exception as exc:
+                                    sig["signal"] = "WAIT_RB_EVENT_STATE"
+                                    sig["info"] = (
+                                        "Exact H1-RB invalidation could not "
+                                        f"be persisted; fail-closed ({exc})"
+                                    )
+                                    results[symbol] = sig
+                                    self._log_signal(symbol, sig)
+                                    continue
                             sig["signal"] = "WAIT_LIMIT_INVALIDATED"
                             sig["info"] = (
                                 "Price already crossed beyond the "
@@ -5537,6 +5835,19 @@ class Core:
                             results[symbol] = sig
                             self._log_signal(symbol, sig)
                             continue
+
+                    if requires_exact_limit:
+                        # Structural invariant: LIMIT_RETEST is never converted
+                        # to a market order, even if future routing branches are
+                        # changed without handling every quote disposition.
+                        sig["signal"] = "WAIT_LIMIT_NO_MARKET_FALLBACK"
+                        sig["info"] = (
+                            "Exact-retest signal reached no safe native-LIMIT "
+                            "disposition; market entry is forbidden"
+                        )
+                        results[symbol] = sig
+                        self._log_signal(symbol, sig)
+                        continue
 
                     try:
                         new_trade = self._execute_entry_signal(symbol, sig)

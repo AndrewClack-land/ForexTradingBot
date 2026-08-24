@@ -29,8 +29,9 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 
+from core.htf_context import PineRejectionBlockTracker
 from core.narrative_scoring import (
-    FACTOR_CONTRACT_LEGACY,
+    FACTOR_CONTRACT_NO_H1PD,
     FACTOR_VECTOR_SCHEMA,
     FACTOR_WEIGHTS,
     build_factor_vector,
@@ -574,6 +575,9 @@ class NarrativeBacktestConfig:
     # Research-only OOS permission for the live H1 RB detector. This is
     # intentionally independent from the retired M15 RB switch above.
     rejection_block_h1_oos_enabled: bool = False
+    rejection_block_h1_detector_version: str = (
+        PineRejectionBlockTracker.VERSION
+    )
     orderblock_entry_enabled: bool = True
     orderblock_touch_atr_k: float = 0.15
     orderblock_touch_min_abs: float = 0.0005
@@ -581,7 +585,7 @@ class NarrativeBacktestConfig:
     htf_score_margin: int = 2
     fvg_regime_max_age_bars: int = 0
     fvg_event_invalidation_mode: str = "none"
-    factor_contract: str = FACTOR_CONTRACT_LEGACY
+    factor_contract: str = FACTOR_CONTRACT_NO_H1PD
     fvg_veto_enabled: bool = False
     release_commit: Optional[str] = None
     release_manifest_sha256: Optional[str] = None
@@ -616,6 +620,9 @@ class NarrativeBacktestConfig:
         post_loss_cooldown: Any = "60min",
         rejection_block_entry_enabled: bool = False,
         rejection_block_h1_oos_enabled: bool = False,
+        rejection_block_h1_detector_version: str = (
+            PineRejectionBlockTracker.VERSION
+        ),
         orderblock_entry_enabled: bool = True,
         orderblock_touch_atr_k: float = 0.15,
         orderblock_touch_min_abs: float = 0.0005,
@@ -623,7 +630,7 @@ class NarrativeBacktestConfig:
         htf_score_margin: int = 2,
         fvg_regime_max_age_bars: int = 0,
         fvg_event_invalidation_mode: str = "none",
-        factor_contract: str = FACTOR_CONTRACT_LEGACY,
+        factor_contract: str = FACTOR_CONTRACT_NO_H1PD,
         fvg_veto_enabled: bool = False,
         release_commit: Optional[str] = None,
         release_manifest_sha256: Optional[str] = None,
@@ -729,6 +736,14 @@ class NarrativeBacktestConfig:
                 "fvg_event_invalidation_mode must be none, zone_break, "
                 "structure_change, or zone_or_structure"
             )
+        normalized_rb_detector = str(
+            rejection_block_h1_detector_version
+        ).strip().lower()
+        if normalized_rb_detector != PineRejectionBlockTracker.VERSION:
+            raise StrategyBacktestError(
+                "rejection_block_h1_detector_version must be "
+                f"{PineRejectionBlockTracker.VERSION!r}"
+            )
         numeric_settings = {
             "vol_max_r": float(vol_max_r),
             "em_tp_ratio": float(em_tp_ratio),
@@ -818,6 +833,7 @@ class NarrativeBacktestConfig:
             rejection_block_h1_oos_enabled=bool(
                 rejection_block_h1_oos_enabled
             ),
+            rejection_block_h1_detector_version=normalized_rb_detector,
             orderblock_entry_enabled=bool(orderblock_entry_enabled),
             orderblock_touch_atr_k=numeric_settings[
                 "orderblock_touch_atr_k"
@@ -872,6 +888,9 @@ class NarrativeBacktestConfig:
                 ),
                 "rejection_block_h1_oos_enabled": (
                     self.rejection_block_h1_oos_enabled
+                ),
+                "rejection_block_h1_detector_version": (
+                    self.rejection_block_h1_detector_version
                 ),
                 "orderblock_entry_enabled": self.orderblock_entry_enabled,
                 "orderblock_touch_atr_k": self.orderblock_touch_atr_k,
@@ -1181,6 +1200,9 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
     strategy.rejection_block_h1_entry_enabled = (
         config.rejection_block_h1_oos_enabled
     )
+    strategy.rejection_block_h1_detector_version = (
+        config.rejection_block_h1_detector_version
+    )
     strategy.orderblock_entry_enabled = config.orderblock_entry_enabled
     strategy.orderblock_touch_atr_k = config.orderblock_touch_atr_k
     strategy.orderblock_touch_min_abs = config.orderblock_touch_min_abs
@@ -1202,6 +1224,9 @@ def _configure_strategy(strategy: Any, config: NarrativeBacktestConfig) -> Any:
         ),
         "rejection_block_h1_entry_enabled": (
             config.rejection_block_h1_oos_enabled
+        ),
+        "rejection_block_h1_detector_version": (
+            config.rejection_block_h1_detector_version
         ),
         "orderblock_entry_enabled": config.orderblock_entry_enabled,
         "orderblock_touch_atr_k": config.orderblock_touch_atr_k,
@@ -1239,6 +1264,13 @@ def _strategy_data(
         )
         for timeframe in ("1d", "4h", "1h", "15m")
     }
+    # The stateful first-touch trackers may inspect intrahour history, but only
+    # M1 bars whose close is known at the decision timestamp are exposed.
+    # M1 depth is deliberately not part of the HTF minimum-context gate.
+    data["1M"] = prepared["1m"].asof(
+        decision_time,
+        limit=config.history_limit,
+    )
     if any(
         len(data[key]) < config.min_context_bars
         for key in ("4H", "1H", "15M")
@@ -1477,6 +1509,11 @@ def _validate_factor_vector(
         actual_keys = set(actual_key_list)
         if vector.get("schema") != FACTOR_VECTOR_SCHEMA:
             raise StrategyBacktestError("unexpected factor-vector schema")
+        if vector.get("factor_contract") != contract["name"]:
+            raise StrategyBacktestError(
+                "factor vector identity does not match the "
+                f"{contract['name']} contract"
+            )
         if (
             len(factors) != len(FACTOR_WEIGHTS)
             or len(actual_key_list) != len(actual_keys)
@@ -1495,7 +1532,8 @@ def _validate_factor_vector(
         }
         if configured != FACTOR_WEIGHTS:
             raise StrategyBacktestError(
-                "factor vector configured weights do not match production"
+                "factor vector configured weights do not match the "
+                "legacy/reference definitions"
             )
         effective = {
             str(row.get("key")): float(row.get("effective_weight") or 0.0)
@@ -1551,6 +1589,7 @@ def _validate_factor_vector(
                 fvg_side=str(vector.get("fvg_side") or "NEUTRAL"),
                 weights=contract["weights"],
                 fvg_margin_enabled=contract["fvg_margin_enabled"],
+                factor_contract=contract["name"],
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise StrategyBacktestError(
@@ -1561,7 +1600,7 @@ def _validate_factor_vector(
             if actual != expected:
                 raise StrategyBacktestError(
                     f"factor-vector derived field {field} does not match "
-                    "production scoring"
+                    "the selected contract"
                 )
 
         def require_number(field: str, actual: Any, expected: Any) -> None:
@@ -1583,7 +1622,7 @@ def _validate_factor_vector(
             ):
                 raise StrategyBacktestError(
                     f"factor-vector derived field {field} does not match "
-                    "production scoring"
+                    "the selected contract"
                 )
 
         for field in ("bias", "fvg_side"):
@@ -1859,7 +1898,21 @@ def _find_fill(
     signal: Mapping[str, Any],
     config: NarrativeBacktestConfig,
 ) -> tuple[Optional[int], Optional[pd.Timestamp], Optional[float], str]:
-    deadline = min(decision_time + config.entry_ttl, period_end)
+    entry_ttl = config.entry_ttl
+    signal_ttl_raw = signal.get("entry_ttl_min")
+    if signal_ttl_raw is not None:
+        try:
+            signal_ttl_min = float(signal_ttl_raw)
+        except (TypeError, ValueError):
+            return None, None, None, "invalid signal-specific entry TTL"
+        if (
+            not math.isfinite(signal_ttl_min)
+            or signal_ttl_min < 1.0
+            or signal_ttl_min > 240.0
+        ):
+            return None, None, None, "invalid signal-specific entry TTL"
+        entry_ttl = pd.Timedelta(minutes=signal_ttl_min)
+    deadline = min(decision_time + entry_ttl, period_end)
     # The M15 signal only exists after its close.  The M1 candle stamped at
     # exactly that close has already opened, so its open/high/low cannot be
     # used as an executable post-signal price.
@@ -1876,6 +1929,10 @@ def _find_fill(
         return None, None, None, "invalid entry range"
 
     side = str(signal.get("side") or "").upper()
+    entry_order_type = str(
+        signal.get("entry_order_type") or ""
+    ).upper()
+    is_limit_retest = entry_order_type == "LIMIT_RETEST"
     stop = float(signal.get("stop_price") or 0.0)
     planned = float(signal.get("entry_price") or 0.0)
     targets = [
@@ -1887,10 +1944,71 @@ def _find_fill(
         return None, None, None, "invalid side/entry/stop"
     if len(targets) != 3:
         return None, None, None, "strategy must provide exactly three targets"
+    if is_limit_retest and not lower <= planned <= upper:
+        return None, None, None, "invalid LIMIT_RETEST planned-entry geometry"
+    if is_limit_retest:
+        target_valid = (
+            stop < planned
+            and all(planned < target for target in targets)
+            if side == "LONG"
+            else stop > planned
+            and all(planned > target for target in targets)
+        )
+        if not target_valid:
+            return None, None, None, "invalid LIMIT_RETEST stop/target geometry"
 
     invalid_geometry_seen = False
     for position in range(left, right):
         row = m1.iloc[position]
+        if is_limit_retest:
+            low = float(row["low"])
+            high = float(row["high"])
+            touched_entry = low <= planned <= high
+            touched_stop = (
+                low <= stop if side == "LONG" else high >= stop
+            )
+            touched_tp1 = (
+                high >= targets[0]
+                if side == "LONG"
+                else low <= targets[0]
+            )
+            if touched_entry and touched_stop:
+                return (
+                    position,
+                    pd.Timestamp(m1.index[position]),
+                    planned,
+                    "filled LIMIT_RETEST; entry and stop share M1 bar, stop-first",
+                )
+            if touched_entry:
+                if touched_tp1:
+                    return (
+                        None,
+                        None,
+                        None,
+                        "ambiguous LIMIT_RETEST entry and TP1 in one M1 bar",
+                    )
+                return (
+                    position,
+                    pd.Timestamp(m1.index[position]),
+                    planned,
+                    "filled LIMIT_RETEST at planned price",
+                )
+            if touched_stop:
+                return (
+                    None,
+                    None,
+                    None,
+                    "LIMIT_RETEST invalidated: stop touched before entry",
+                )
+            if touched_tp1:
+                return (
+                    None,
+                    None,
+                    None,
+                    "LIMIT_RETEST invalidated: TP1 touched before entry",
+                )
+            continue
+
         price = float(row["open"])
         if price < lower or price > upper:
             continue
@@ -1904,7 +2022,11 @@ def _find_fill(
             continue
         return position, pd.Timestamp(m1.index[position]), price, "filled"
     reason = (
-        "in-range M1 open had invalid stop/target geometry"
+        (
+            "LIMIT_RETEST touch had invalid stop/target geometry"
+            if is_limit_retest
+            else "in-range M1 open had invalid stop/target geometry"
+        )
         if invalid_geometry_seen
         else "entry range expired"
     )
@@ -2027,6 +2149,10 @@ def _execute_candidates(
     current_day: Any = None
     entries_today = 0
     trigger_signatures: set[str] = set()
+    # Exact structural retests are single-attempt events in live execution.
+    # Unlike the generic daily signature guard, this reservation survives UTC
+    # day and walk-forward fold boundaries for the whole replay.
+    consumed_exact_events: set[tuple[str, str]] = set()
     filled_ranked_decisions: set[tuple[int, pd.Timestamp]] = set()
     production_gates = config.profile == "production-deterministic"
     for period in periods:
@@ -2150,6 +2276,37 @@ def _execute_candidates(
                 )
                 continue
 
+            entry_order_type = str(
+                candidate.signal.get("entry_order_type") or ""
+            ).upper()
+            trigger_event_id = str(
+                candidate.signal.get("trigger_event_id") or ""
+            ).strip()
+            exact_event_key = (
+                str(candidate.symbol).upper(),
+                trigger_event_id,
+            )
+            if (
+                entry_order_type == "LIMIT_RETEST"
+                and trigger_event_id
+                and exact_event_key in consumed_exact_events
+            ):
+                counters["blocked_duplicate_exact_event"] += 1
+                executions.append(
+                    _execution_row(
+                        candidate=candidate,
+                        policy=policy,
+                        disposition="BLOCK_DUPLICATE",
+                        reason=(
+                            "LIMIT_RETEST trigger event was already consumed "
+                            "by an earlier entry attempt"
+                        ),
+                    )
+                )
+                continue
+            if entry_order_type == "LIMIT_RETEST" and trigger_event_id:
+                consumed_exact_events.add(exact_event_key)
+
             replay_end = (
                 config.end
                 if carry_positions_across_folds
@@ -2169,13 +2326,19 @@ def _execute_candidates(
                 config=config,
             )
             if fill_position is None or entry_time is None or entry is None:
-                counters["fill_expired"] += 1
                 counters[f"fill_reason_{fill_reason}"] += 1
-                disposition = (
-                    "REJECT_INVALID_GEOMETRY"
-                    if "invalid" in fill_reason
-                    else "EXPIRED_ENTRY_RANGE"
-                )
+                if fill_reason == (
+                    "ambiguous LIMIT_RETEST entry and TP1 in one M1 bar"
+                ):
+                    counters["fill_censored_intrabar"] += 1
+                    disposition = "CENSORED_INTRABAR"
+                else:
+                    counters["fill_expired"] += 1
+                    disposition = (
+                        "REJECT_INVALID_GEOMETRY"
+                        if "invalid" in fill_reason
+                        else "EXPIRED_ENTRY_RANGE"
+                    )
                 executions.append(
                     _execution_row(
                         candidate=candidate,

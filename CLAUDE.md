@@ -215,11 +215,13 @@ Non-negotiable implementation rules:
 
 ## Current production factor contract
 
-There are exactly seven directional votes:
+The factor vector has seven directional observations. Under the production
+`v3-no-h1pd-fvg-margin` contract, six may contribute to direction and H1
+Premium/Discount is diagnostic only:
 
 | Key | Meaning | Weight |
 | --- | --- | ---: |
-| `h1_premium_discount` | H1 Premium/Discount | +2 |
+| `h1_premium_discount` | H1 Premium/Discount (diagnostic only) | 0 |
 | `false_breakout_4h` | false breakout of a 4H fractal | +2 |
 | `true_breakout_15m` | true breakout of a 15M fractal | +1 |
 | `false_breakout_1h` | false breakout of a 1H fractal | +1 |
@@ -259,52 +261,59 @@ Important distinctions:
   `margin_short = 2 + int(fvg_side == "LONG")`.
 - Bias is LONG when `score_long >= score_short + margin_long`, SHORT when the
   symmetric condition holds, and NEUTRAL otherwise.
-- H1 Premium/Discount uses the latest closed M15 close inside the latest
-  completed H1 candle range.
-- `rejection_block_1h` is a score factor. The separate 15M rejection-block
-  entry trigger is required to remain quarantined with
-  `REJECTION_BLOCK_ENTRY_ENABLED=0` in the production environment and is
-  disabled by default in the backtest. The permissive fallback currently
-  present in `config.py`/`core/strategy_narrative.py` is not authorization to
-  enable it. Do not confuse the trigger with the active RB1H score factor.
+- H1 Premium/Discount remains computed from the latest closed M15 close inside
+  the latest completed H1 candle range, but its production effective weight is
+  zero. It must not change LONG/SHORT scores or bias.
+- `rejection_block_1h` is both a score observation and a separate entry
+  trigger. The retired M15 rejection-block path is hard-disabled by code and
+  `REJECTION_BLOCK_ENTRY_ENABLED=0` remains an audit marker.
 
 ### Factor contracts and the eight-row vector
 
 `FACTOR_VECTOR_SCHEMA` is `narrative-factor-vector/v3`. The vector carries
-eight rows: the seven directional votes above plus an explicit `fvg_regime_1h`
-row. Both named contracts share this one layout so a challenger run stays
-paired with its baseline through the same simulator and report schemas.
+eight rows: the seven directional observations above plus an explicit
+`fvg_regime_1h` row, plus the immutable `factor_contract` identity that
+produced its effective weights and FVG-margin mode. All named contracts share
+this one layout so a run stays paired with its baseline through the same
+simulator and report schemas.
 
 | Contract | Weights (PD/FB4H/TB15M/FB1H/TB1H/OB1H/RB1H/FVG) | FVG margin rule |
 | --- | --- | --- |
-| `v1-fvg-margin` (live default) | `2, 2, 1, 1, 1, 1, 1, 0` | active |
+| `v1-fvg-margin` (frozen legacy) | `2, 2, 1, 1, 1, 1, 1, 0` | active |
 | `v2-fvg-vote` (challenger) | `1, 2, 1, 1, 1, 2, 1, 1` | disabled |
+| `v3-no-h1pd-fvg-margin` (live) | `0, 2, 1, 1, 1, 1, 1, 0` | active |
 
-The challenger sums to `10` against the live `9`. That one-point gap is
+The challenger sums to `10` against frozen legacy v1's `9`; live v3 sums to
+`7`. That challenger/legacy one-point gap is
 inherent to the arm — it promotes the FVG row to a vote — and is not a
 consequence of the 1H rows, which both arms carry at `+1`.
 
 `core/narrative_scoring.py:FACTOR_CONTRACTS` is the single authority; the
 weight override and the margin rule are mutually exclusive by construction,
 because enabling both would move the threshold by two points for a factor that
-never abstains. `resolve_factor_contract` fails closed on an unknown name.
+never abstains. `resolve_factor_contract` fails closed on an unknown or
+explicitly empty name; `None` remains the legacy compatibility default for
+historical API callers.
 
 Non-negotiable rules:
 
-- `FACTOR_DEFINITIONS[*].configured_weight` always describes the **live**
-  contract. A challenger is expressed only as an `effective_weight` override,
-  so a frozen vector records which arm produced it;
-- `FACTOR_CONTRACT` defaults to `v1-fvg-margin` in `config.py`. The challenger
-  is a research arm and must not reach live trading before a frozen paired OOS
-  comparison is reviewed. Selecting it in a `backtest run` marks a non-parity
-  sensitivity experiment exactly like `--sessions ALL` does;
-- `optimize-v2` exposes no contract switch and pins `v1-fvg-margin`, because
-  its fit is regularized toward the live weights. `REFERENCE_WEIGHTS` and
-  `WEIGHT_SUM` are derived from `FACTOR_DEFINITIONS`, so they now read
+- `FACTOR_DEFINITIONS[*].configured_weight` is the immutable legacy/reference
+  weight. Only the selected contract's `effective_weight` contributes to a
+  score, and every frozen vector records the contract that produced it;
+- `FACTOR_CONTRACT` defaults to `v3-no-h1pd-fvg-margin` in `config.py`.
+  Ordinary `backtest run` and `NarrativeBacktestConfig` use the same v3
+  default. Selecting another contract marks a non-parity sensitivity experiment
+  exactly like `--sessions ALL` does;
+- `optimize-v2` exposes no contract switch and remains pinned to the frozen
+  legacy `v1-fvg-margin` reference. It is not a production-parity evaluator
+  for v3 until that boundary is changed explicitly. `REFERENCE_WEIGHTS` and
+  `WEIGHT_SUM` are derived from `FACTOR_DEFINITIONS`, so they read
   `[2, 2, 1, 1, 1, 1, 1, 0]` and `9`. The zero-weight FVG row still
   participates as a fittable dimension;
 - `rescore_factor_vector` must carry `fvg_margin_enabled` from the frozen
-  vector; a challenger vector must never silently regain the margin penalty;
+  vector; a challenger vector must never silently regain the margin penalty.
+  Canonical weights/margin mode auto-resolve their registered identity, while
+  non-canonical research weights require an explicit non-empty identity;
 - frozen weight models and shadow models fitted before a schema bump carry
   the older, narrower dimensionality and fail closed against the current
   vector. Refit rather than reinterpret them. The live Ridge shadow scorer is
@@ -316,13 +325,30 @@ Non-negotiable rules:
 
 Production trigger priority is:
 
-1. quarantined 15M Rejection Block, only if separately enabled;
+1. causal H1 Rejection Block exact retest, only if separately enabled;
 2. FxPro Cluster Rejection 15M, only with a causally available sealed cluster
    event and the independent live flag enabled;
 3. FxPro Quote Pressure Rejection 15M, only with a causally available finalized
    DOM event and its independent live flag enabled;
 4. H1 Pivot Reclaim on 15M;
 5. 1H Order Block touch.
+
+The H1 RB detector contract is `pine-v1-causal`: a 3-left/3-right pivot becomes
+available only at the close of its third right-hand H1 bar; wick/body must be
+at least 2; same-side accepted blocks must be separated by at least 0.5 Wilder
+ATR(14); there is no time expiry; and a strict close through the distal edge
+breaks the block. Retests begin only after the registration bar. LONG enters
+at the proximal top with stop at the distal bottom; SHORT enters at the
+proximal bottom with stop at the distal top. The full block is retained as the
+zone, entry range is locked to that one price, and the structural stop bypasses
+the generic ATR clamp. Execution is `LIMIT_RETEST` under the configured
+persistent-limit TTL. Backtests use M1 high/low and stop-first treatment when
+entry and stop share one M1 bar; entry plus TP1 without stop is censored as
+the `CENSORED_INTRABAR` disposition. The strategy payload contains only M1
+bars closed by the decision timestamp. Once an exact `trigger_event_id`
+passes all gates and reaches its first fill attempt, that event is reserved
+for the entire replay: expiry, UTC day rollover, and walk-forward fold changes
+must never create a second attempt.
 
 Turtle Soup is retired from the production call path. Do not add a re-enable
 flag, fallback call, or implicit compatibility path. The legacy pure detector

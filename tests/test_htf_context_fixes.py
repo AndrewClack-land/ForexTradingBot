@@ -184,12 +184,14 @@ def test_narrative_freezes_exact_structured_factor_vector():
     side, _ = strategy.calc_narrative(frame, frame, frame)
     vector = strategy._last_factor_vector
 
-    assert side == "LONG"
+    assert side == "SHORT"
     assert vector is not None
-    assert vector["score_long"] == 4
+    assert vector["score_long"] == 2
     assert vector["score_short"] == 3
     factors = {row["key"]: row for row in vector["factors"]}
     assert factors["h1_premium_discount"]["evidence"]["position"] == "DISCOUNT"
+    assert factors["h1_premium_discount"]["effective_weight"] == 0
+    assert factors["h1_premium_discount"]["long_contribution"] == 0
     assert factors["false_breakout_4h"]["evidence"]["bars_ago"] == 2
     assert factors["order_block_1h"]["evidence"]["created_idx"] == 20
     assert factors["rejection_block_1h"]["evidence"]["created_idx"] == 21
@@ -212,7 +214,16 @@ def test_no_trend_and_no_trigger_keep_structured_factor_vector():
             low=1.0,
             close=1.05,
             position="DISCOUNT",
-        )
+        ),
+        false_breakout_4h=FractalBreakout(
+            kind="FALSE_BREAK",
+            side="LONG",
+            level=1.2,
+            level_kind="LOW",
+            bar_index=7,
+            bars_ago=0,
+            timeframe="4H",
+        ),
     )
     directional.calc_fvg_regime_1h = lambda df: (
         "NEUTRAL",
@@ -256,7 +267,7 @@ def test_h1_premium_discount_uses_latest_m15_close():
     assert premium.hourly_range.bias == "SHORT"
 
 
-def test_h1_premium_discount_votes_with_weight_two():
+def test_h1_premium_discount_is_diagnostic_only_in_live_contract():
     ctx = _bias_context(
         hourly_range=HourlyRange(
             high=110.0,
@@ -268,8 +279,8 @@ def test_h1_premium_discount_votes_with_weight_two():
 
     side, text = _calc_with_context(ctx, margin=2)
 
-    assert side == "LONG"
-    assert "scores L/S=2/0" in text
+    assert side == "NEUTRAL"
+    assert "L/S=0/0" in text
     assert "H1PD" in text
 
 

@@ -13,6 +13,7 @@ from typing import Any, Mapping, Optional, Sequence
 from core.narrative_scoring import (
     FACTOR_CONTRACT_FVG_VOTE,
     FACTOR_CONTRACT_LEGACY,
+    FACTOR_CONTRACT_NO_H1PD,
 )
 
 from .data import DataValidationError, HistoricalDataset
@@ -193,6 +194,14 @@ def _build_parser() -> argparse.ArgumentParser:
         help="enable the quarantined 15m rejection-block entry",
     )
     strategy_run.add_argument(
+        "--enable-rejection-block-h1-oos",
+        action="store_true",
+        help=(
+            "research-only: enable the causal pine-v1 H1 exact-retest "
+            "trigger; independent of the retired M15 RB switch"
+        ),
+    )
+    strategy_run.add_argument(
         "--disable-orderblock-entry",
         action="store_true",
     )
@@ -230,15 +239,24 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     strategy_run.add_argument(
         "--factor-contract",
-        choices=(FACTOR_CONTRACT_LEGACY, FACTOR_CONTRACT_FVG_VOTE),
-        default=FACTOR_CONTRACT_LEGACY,
+        choices=(
+            FACTOR_CONTRACT_LEGACY,
+            FACTOR_CONTRACT_FVG_VOTE,
+            FACTOR_CONTRACT_NO_H1PD,
+        ),
+        default=FACTOR_CONTRACT_NO_H1PD,
         help=(
             "factor weight/margin contract. "
-            f"{FACTOR_CONTRACT_LEGACY} is the live contract: five votes "
-            "[2, 2, 1, 1, 1] with the 1H FVG regime raising only the opposing "
+            f"{FACTOR_CONTRACT_LEGACY} is the frozen legacy contract: "
+            "H1 P/D has weight 2; "
+            "[2, 2, 1, 1, 1, 1, 1, 0] with the 1H FVG regime raising only the opposing "
             f"margin. {FACTOR_CONTRACT_FVG_VOTE} is the challenger: H1 P/D "
             "2->1, Order Block 1H 1->2, FVG regime promoted to a +1 vote with "
-            "symmetric margins. A challenger run is a non-parity research arm"
+            "symmetric margins. "
+            f"{FACTOR_CONTRACT_NO_H1PD} is the live successor: H1 P/D remains "
+            "diagnostic with weight zero and the legacy FVG margin remains. "
+            "Any contract other than the live successor is a non-parity "
+            "research arm"
         ),
     )
     strategy_run.add_argument(
@@ -758,6 +776,9 @@ def _strategy_run(args: argparse.Namespace) -> int:
         max_setups_per_symbol_day=args.max_setups_per_symbol_day,
         post_loss_cooldown=args.post_loss_cooldown,
         rejection_block_entry_enabled=args.enable_rejection_block_entry,
+        rejection_block_h1_oos_enabled=(
+            args.enable_rejection_block_h1_oos
+        ),
         orderblock_entry_enabled=not args.disable_orderblock_entry,
         orderblock_max_age_bars=args.orderblock_max_age_bars,
         htf_score_margin=args.htf_score_margin,
@@ -920,6 +941,9 @@ def _counterfactual_run(args: argparse.Namespace) -> int:
         htf_score_margin=args.htf_score_margin,
         fvg_regime_max_age_bars=args.fvg_regime_max_age_bars,
         fvg_event_invalidation_mode=args.fvg_event_invalidation_mode,
+        # optimize-v2 remains a frozen legacy population/model contract even
+        # though ordinary strategy runs now default to production v3.
+        factor_contract=FACTOR_CONTRACT_LEGACY,
         release_commit=release_commit,
         release_manifest_sha256=release_manifest_sha256,
         environment_lock_sha256=environment_lock_sha256,

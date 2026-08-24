@@ -23,15 +23,24 @@ causal backtesting, attribution semantics, and VPS release discipline.
 Направление определяется ансамблем независимых моделей (ensemble learning) по нескольким
 таймфреймам (`core/strategy_narrative.py: calc_narrative`):
 
+Живой контракт весов — `v3-no-h1pd-fvg-margin` (`FACTOR_CONTRACT` в `config.py`,
+единственный источник истины — `core/narrative_scoring.py: FACTOR_CONTRACTS`):
+
 | Модель | Вклад |
 | --- | --- |
-| **Premium/Discount 1H** — последний закрытый 15M close внутри диапазона последней закрытой H1-свечи | +2 |
+| **Premium/Discount 1H** — последний закрытый 15M close внутри диапазона последней закрытой H1-свечи | 0 (только диагностика) |
 | **Ложный пробой фрактала 4H** — свеча проколола уровень, но закрылась внутри (разворот) | +2 |
 | **Истинный пробой фрактала 15M** — закрытие за уровнем (продолжение) | +1 |
 | **Ложный пробой фрактала 1H** — прокол уровня с возвратом внутрь | +1 |
 | **Истинный пробой фрактала 1H** — закрытие за уровнем | +1 |
 | **Ордерблок (OB)** на 1H — сторона последнего активного блока | +1 |
 | **Rejection Block (RB)** на 1H — последний валидный неповреждённый блок | +1 |
+
+Premium/Discount 1H по-прежнему вычисляется и попадает в факторный вектор, но его
+production-вес равен нулю: он не меняет счёт LONG/SHORT и не меняет bias. Сумма
+живых весов — `7`. Замороженные `v1-fvg-margin` (`9`) и челленджер `v2-fvg-vote`
+(`10`) остаются исследовательскими арками; выбор любого из них — это
+non-parity эксперимент.
 
 Две строки по 1H-фракталу происходят из одного сканирования, разведённого по типу
 события, поэтому взаимоисключающи: на одном решении голосует максимум одна из них.
@@ -64,13 +73,32 @@ Bias принимается при перевесе голосов ≥ `HTF_SCOR
 
 Проверяются по очереди; первый сработавший формирует ENTER:
 
-1. **15M Rejection Block** — только при отдельном разрешении;
+1. **Rejection Block 1H, точный ретест** — детектор `pine-v1-causal`: пивот
+   3-влево/3-вправо становится доступен только на закрытии третьего правого
+   H1-бара, wick/body ≥ 2, однонаправленные блоки разводятся минимум на
+   0.5 Wilder ATR(14), срока жизни нет, строгое закрытие за дальним краем
+   ломает блок. LONG входит по проксимальному верху со стопом на дальнем низе,
+   SHORT — зеркально; диапазон входа заперт на одной цене, структурный стоп
+   обходит общий ATR-кламп, исполнение — `LIMIT_RETEST`. Включается отдельно;
 2. **FxPro Cluster Rejection 15M** — отклонение цены от края M15-кластера
    Quantower/FxPro при выраженном TickDirection Buy/Sell-дисбалансе;
 3. **FxPro Quote Pressure Rejection 15M** — отклонение цены при давлении котировок
    и восстановлении защитной стороны брокерского DOM;
 4. **H1 Pivot Reclaim на 15M**;
 5. **Касание Order Block 1H**.
+
+Прежний путь входа по 15M Rejection Block жёстко отключён в коде;
+`REJECTION_BLOCK_ENTRY_ENABLED=0` остаётся только аудит-маркером.
+
+Состояние RB-блоков ведётся инкрементально (`core/htf_context.py:
+PineRejectionBlockTracker`) и переживает перезапуск через
+`core/rb_tracker_state_store.py`, а однократность входа гарантирует
+`core/rb_consumed_events.py`. Пачка новых H1-баров — рестарт, разрыв фида,
+переход через выходные — проигрывается строго в хронологическом порядке,
+бар за баром: пробой в позднем баре больше не может отменить касание,
+которое произошло раньше. Внутри одного бара правило не изменилось —
+подтверждённое закрытие за дальним краем сильнее касания того же бара
+и сильнее M1-касаний внутри него.
 
 Turtle Soup удалён из production-цепочки. Cluster Rejection и Quote Pressure
 по умолчанию выключены для входов и работают fail-closed. Кластерные Buy/Sell —
@@ -170,15 +198,25 @@ Runs 24/5 on a Linux VPS (MT5 terminal under Wine), trades GOLD, EURUSD, GBPUSD,
 Direction comes from an ensemble of independent models on selected
 timeframes (`core/strategy_narrative.py: calc_narrative`):
 
+The live weight contract is `v3-no-h1pd-fvg-margin` (`FACTOR_CONTRACT` in
+`config.py`; `core/narrative_scoring.py: FACTOR_CONTRACTS` is the single
+authority):
+
 | Model | Weight |
 | --- | --- |
-| **1H Premium/Discount** — latest closed 15M close inside the latest closed H1 candle range | +2 |
+| **1H Premium/Discount** — latest closed 15M close inside the latest closed H1 candle range | 0 (diagnostic only) |
 | **4H fractal false breakout** — wick pierced the level, close back inside (reversal) | +2 |
 | **15M fractal true breakout** — close beyond the level (continuation) | +1 |
 | **1H fractal false breakout** — wick pierced the level, close back inside | +1 |
 | **1H fractal true breakout** — close beyond the level | +1 |
 | **Order Block (OB)** on 1H — side of the most recent active block | +1 |
 | **Rejection Block (RB)** on 1H — most recent valid, unbroken block | +1 |
+
+1H Premium/Discount is still computed and still recorded in the factor vector,
+but its production weight is zero: it must not move the LONG/SHORT scores or
+the bias. The live weights sum to `7`. Frozen `v1-fvg-margin` (`9`) and the
+`v2-fvg-vote` challenger (`10`) remain research arms; selecting either marks a
+non-parity experiment.
 
 The two 1H fractal rows come from a single scan routed by kind, so they are
 mutually exclusive: at most one votes on any decision. On the sealed EURUSD 1H
@@ -211,13 +249,33 @@ votes, but PANIC blocks entry and Expected Move checks whether TP1 is reachable.
 
 Checked in order; the first one that fires produces an ENTER signal:
 
-1. **15M Rejection Block** — only when separately enabled;
+1. **1H Rejection Block exact retest** — the `pine-v1-causal` detector: a
+   3-left/3-right pivot becomes available only at the close of its third
+   right-hand H1 bar, wick/body must be at least 2, same-side blocks are
+   separated by at least 0.5 Wilder ATR(14), there is no time expiry, and a
+   strict close through the distal edge breaks the block. LONG enters at the
+   proximal top with the stop at the distal bottom, SHORT mirrors it; the entry
+   range is locked to that one price, the structural stop bypasses the generic
+   ATR clamp, and execution is `LIMIT_RETEST`. Enabled separately;
 2. **FxPro Cluster Rejection 15M** — rejection from an M15 cluster edge under a
    strong Quantower/FxPro TickDirection Buy/Sell imbalance;
 3. **FxPro Quote Pressure Rejection 15M** — price rejection under quote pressure
    with replenishment of the protective side of the broker DOM;
 4. **H1 Pivot Reclaim on 15M**;
 5. **1H Order Block touch**.
+
+The former 15M Rejection Block entry path is hard-disabled in code;
+`REJECTION_BLOCK_ENTRY_ENABLED=0` survives only as an audit marker.
+
+RB block state is tracked incrementally (`core/htf_context.py:
+PineRejectionBlockTracker`), survives restarts through
+`core/rb_tracker_state_store.py`, and is kept one-shot by
+`core/rb_consumed_events.py`. A batch of new H1 bars — restart, feed gap,
+weekend rollover — is replayed strictly in chronological order, bar by bar, so
+a break in a later bar can no longer cancel a touch that already happened in an
+earlier one. Inside a single bar the rule is unchanged: a confirmed close
+through the distal edge outranks that same bar's touch and the M1 touches
+within it.
 
 Turtle Soup is retired. Cluster Rejection and Quote Pressure default OFF for
 entries and fail closed. Cluster Buy/Sell values are reconstructed by Quantower

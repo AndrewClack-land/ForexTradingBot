@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
 
 from core.strategy_narrative import CandidateEntry, NarrativeStrategy
@@ -253,17 +255,48 @@ def test_h1_detector_tags_timeframe_and_stable_event():
     )
     frame = pd.DataFrame(rows, index=index)
     strategy = NarrativeStrategy()
+    ctx = SimpleNamespace(
+        rejection_blocks=[
+            SimpleNamespace(
+                side="LONG",
+                zone_low=0.90,
+                zone_high=1.02,
+                created_idx=7,
+                available_idx=8,
+                pivot_time=str(index[7]),
+                available_time=str(index[8]),
+                wick_ratio=2.5,
+                atr_at_pivot=0.03,
+                detector_version="pine-v1-causal",
+                valid=True,
+                broken=False,
+                retested=False,
+            )
+        ]
+    )
 
-    entry = strategy.trigger_h1_rejection_block(frame, "LONG")
+    entry = strategy.trigger_h1_rejection_block(
+        frame,
+        "LONG",
+        ctx=ctx,
+        symbol="EURUSD",
+    )
 
     assert entry is not None
     assert entry.tf == "1H"
     assert entry.trigger_kind == "rejection_block_1h"
-    assert entry.trigger_event_id == f"rb:1h:long:{index[-2]}"
-    assert entry.trigger_meta == {
-        "setup_timeframe": "1H",
-        "pivot_index": str(index[-2]),
-    }
+    assert entry.trigger_event_id == (
+        f"rb:h1:touch:v1:EURUSD:LONG:"
+        f"{pd.Timestamp(index[7]).isoformat()}"
+    )
+    assert entry.entry_price == 1.02
+    assert entry.entry_min == entry.entry_max == 1.02
+    assert entry.stop_override == 0.90
+    assert entry.lock_entry_range is True
+    assert entry.lock_stop_override is True
+    assert entry.entry_order_type == "LIMIT_RETEST"
+    assert entry.trigger_meta["schema"] == "rb-h1-exact-retest/v1"
+    assert entry.trigger_meta["pivot_index"] == 7
 
 def test_h4_detector_tags_timeframe_and_stable_event():
     index = pd.date_range("2026-01-01", periods=9, freq="4h", tz="UTC")
